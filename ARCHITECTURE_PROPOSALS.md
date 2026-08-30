@@ -46,7 +46,87 @@ to change)
 
 ## [2026-08-30] Slice 3 Architecture: Cassandra Transactional Outbox, Schema, Consistency Levels, and Kafka Ingestion & DLQ Pipelines
 
-**Status:** Pending
+**Status:** Requires revision (Claude Code, 2026-08-30) — do not implement yet.
+The core outbox pattern (write with `published: false`, publish, flip the
+flag) correctly closes the original crash-window bug from PLAN.md §2.2. But
+tracing through concurrent access reveals a race this proposal doesn't close.
+One required fix, plus two smaller required clarifications, below.
+
+**Required fix — the `applied == false, published == false` branch races.**
+Walk through two requests for the *same* idempotency key arriving close
+together (a genuine duplicate submission, or a client retry firing before the
+original request has finished — both realistic). Both do the LWT insert;
+exactly one gets `applied == true` (call it A) and proceeds toward publishing.
+The other (B) gets `applied == false`, reads the row, sees `published ==
+false` — and under this proposal's logic, treats that as "a previous attempt
+crashed, I should resume it" and proceeds to publish too. But A hasn't
+crashed — it's still in flight. Now two goroutines can both call the Kafka
+producer for the same event. This is exactly the "silently dropped OR
+duplicated" failure PLAN.md §2.2 exists to prevent, just relocated from the
+Cassandra layer (already fixed) to the Kafka-publish layer (not yet).
+
+A boolean can't distinguish "nobody is publishing this right now" from
+"someone is publishing this right now" — that needs a third state and its own
+conditional guard, the same tool already used for the dedup insert. Concretely:
+replace `published boolean` with a `status` column (`PENDING` / `PUBLISHING`
+/ `PUBLISHED`), and require any actor — the original request, a racing
+duplicate request, or the background sweeper — to win
+`UPDATE pharos.event_outbox SET status = 'PUBLISHING' WHERE idempotency_key = ?
+IF status = 'PENDING'` before it's allowed to call the Kafka producer at all.
+Only the winner publishes and then sets `status = 'PUBLISHED'`; every other
+actor just reads the current status and returns/no-ops. This is correct
+regardless of how many Central Ingestion instances are ever running — unlike
+an in-process mutex, which would only be safe as long as Central Ingestion
+stays a single instance, and would silently stop being safe the moment that
+changes without anyone noticing. Since this whole design is already built on
+Cassandra LWTs, one more conditional update is consistent with the rest of
+the pattern, not new complexity. (A per-key in-process lock is fine to *add*
+on top purely to avoid two same-process goroutines both round-tripping to
+Cassandra for the same key — but it cannot be the actual correctness
+mechanism, since the retry-after-crash case can genuinely involve a fresh
+process with no memory of prior locks.)
+
+If a `PUBLISHING` claim holder itself crashes before ever setting
+`PUBLISHED`, the row is now stuck — write down explicitly how the sweeper
+reclaims a stale `PUBLISHING` row (e.g., a lease/claimed-at timestamp with a
+timeout past which the sweeper is allowed to re-claim it) rather than leaving
+that as an unstated gap.
+
+**Required clarification 1 — DLQ path needs the same treatment.** The
+`dead_letter_events` schema already has a `kafka_published boolean` column,
+but the proposal never says how a `kafka_published == false` row gets
+resumed. Right now that's the exact same two-independent-durable-writes shape
+as the bug already fixed for the accept path (Cassandra write succeeds, Kafka
+publish crashes, nothing ever retries it) — just moved to the rejection path
+instead of removed. Apply the same status-column-plus-claim treatment here,
+symmetrically, not a special case.
+
+**Required clarification 2 — confirm raw payload storage.** State explicitly
+that the `payload` column in both `event_outbox` and `dead_letter_events`
+stores the *raw JSON bytes* Central Ingestion received (the
+`json.RawMessage` from Slice 2's fix), not a re-serialized `model.AdverseEvent`
+struct. Slice 2 specifically fixed a struct-round-trip data-loss bug — worth
+saying outright here so it isn't quietly reintroduced when this table gets
+written to.
+
+**What's already right, no changes needed:** consistency levels
+(`LOCAL_SERIAL` for the Paxos phase is the correct term; `LOCAL_QUORUM`
+falling back to `ONE` at RF=1 is technically redundant since they're
+equivalent at RF=1, but harmless — not worth changing), the `pending_outbox`
+time-bucketed index table to avoid scanning on a low-cardinality boolean
+(good Cassandra modeling instinct), `site_id` Kafka partitioning, and the
+choice of `segmentio/kafka-go` over a cgo client. The verification plan
+(crash-window resumption, sequential duplicate, concurrent race, DLQ
+durability) is the right set of tests — once the concurrent-race scenario is
+retested against the fixed design, make sure it asserts *exactly one Kafka
+publish actually occurred*, not just that exactly one `applied == true`
+resulted from the insert — those are different claims and the second one is
+the one that matters.
+
+Revise this proposal with the fix above, then re-submit for review before
+writing implementation code — this is exactly the kind of subtly-wrong-under-
+concurrency design PLAN.md §2.2 warned about, and it's cheaper to fix on paper
+now than after tests get written against the racy version.
 
 **What in PLAN.md this touches:** §2.2 (Exactly-once processing semantics & transactional outbox), §2.3 (Dead-letter queues), §2.4 (Kafka partitioning by site_id), §3 (Planned stack).
 

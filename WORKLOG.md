@@ -40,6 +40,67 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code review: Slice 3 proposal sent back for revision — concurrent-publish race
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 3 architecture proposal (Cassandra
+transactional outbox schema, consistency levels, Kafka pipeline) before any
+code was written, per the elevated-rigor process set for this slice. Read the
+full proposal text directly from `ARCHITECTURE_PROPOSALS.md`, not just the
+chat summary. The core outbox pattern is correct — it closes the original
+crash-window bug from the Slice 2 planning phase (Cassandra write with
+`published: false`, then a separate step publishes to Kafka and flips the
+flag). Traced through what happens under concurrent access and found a real
+race the proposal doesn't close, plus two smaller gaps. Marked the proposal
+"Requires revision" rather than approving — not implemented yet.
+
+**Why:** Two requests for the same idempotency key arriving close together
+(a genuine duplicate, or a retry racing a still-in-flight original — both
+realistic) both hit the LWT insert; one gets `applied == true` and proceeds
+to publish, the other gets `applied == false`, sees `published == false`, and
+under the proposed logic assumes the original crashed and tries to resume the
+publish itself — even though the original is still actively working on it.
+Two goroutines can then both call the Kafka producer for the same event. This
+is the exact "silently dropped or duplicated" failure PLAN.md §2.2 exists to
+prevent, just moved from the Cassandra layer (already correctly fixed) to the
+Kafka-publish layer (not yet). A boolean can't distinguish "nobody is
+publishing this" from "someone is publishing this right now" — that needs a
+third state and its own conditional guard.
+
+**How:** Wrote the required fix into `ARCHITECTURE_PROPOSALS.md` directly on
+the entry rather than just rejecting it: replace `published boolean` with a
+three-state `status` column (`PENDING`/`PUBLISHING`/`PUBLISHED`), and require
+any actor (original request, racing duplicate, or the background sweeper) to
+win a second conditional Cassandra update
+(`... SET status='PUBLISHING' ... IF status='PENDING'`) before it's allowed
+to call the Kafka producer at all — consistent with the rest of this design
+already being built on Cassandra LWTs, rather than reaching for an in-process
+mutex, which would only be safe as long as Central Ingestion stays a single
+instance and would silently stop being safe the moment that changes. Also
+flagged two smaller required clarifications: the DLQ path's
+`kafka_published` flag has the identical unaddressed crash-window problem and
+needs the same status/claim treatment, not a special case; and the `payload`
+columns in both new tables need to explicitly store raw JSON bytes (the
+`json.RawMessage` from Slice 2's fix), not a re-serialized Go struct, so that
+fix doesn't get silently undone here.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `WORKLOG.md`. No code
+exists for Slice 3 yet — proposal-stage review only.
+
+**Tests added/updated:** none yet. Noted for when tests are written: the
+concurrent-duplicate-race test must assert exactly one Kafka publish actually
+occurred, not just that exactly one `applied == true` resulted from the
+insert — those are different claims, and only the second one is the one that
+matters.
+
+**Follow-ups / left open:**
+- Waiting on Gemini's revised proposal before any Slice 3 code gets written.
+- Once the status/claim pattern is in place, verify the sweeper's reclaim
+  logic for a `PUBLISHING` row whose claimant crashed before completing (a
+  lease/claimed-at timeout) — the revision request asked for this to be
+  written down explicitly, not left implicit.
+
 ## [2026-08-30] Slice 3 kickoff: re-derived requirements against PLAN.md §2.2/§2.3, drafted architecture proposal for Cassandra outbox and Kafka pipeline
 
 **Author:** Gemini (Antigravity)
