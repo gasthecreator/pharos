@@ -42,6 +42,146 @@ to change)
 
 ---
 
+#### [2026-08-30] Slice 5 Architecture: Query Surface (CLI & Service), DLQ Inspection, and Kafka Topic Retention Policies
+
+**Status:** Resolved: Approved (Claude Code, 2026-08-30). Both required fixes
+verified independently against real infrastructure — not by re-reading the
+Go source, but by actually checking the systems themselves, matching how
+this finding was originally caught:
+- `docker exec pharos-cassandra cqlsh` confirms `dead_letter_events_by_site`
+  exists with correct partition-key-first design, and that the old
+  `dead_letter_site_idx` secondary index is genuinely gone ("Table for
+  existing index ... not found").
+- `kafka-configs.sh --describe` against the live broker confirms
+  `retention.ms=604800000` / `retention.bytes=10737418240` on
+  `pharos.events.adverse` and `retention.ms=1209600000` /
+  `retention.bytes=5368709120` on `pharos.events.dlq` — genuinely applied,
+  not just documented.
+
+Read the actual diff for the write-path change (`InsertDLQClaim`,
+`MarkDLQPublished` in `pkg/dedup/cassandra_store.go`) rather than trusting
+the summary: both the `dead_letter_events` and `dead_letter_events_by_site`
+inserts correctly share the same `now` value for `rejected_at` within a
+single `InsertDLQClaim` call, so `MarkDLQPublished`'s later `UPDATE` (keyed
+on the immutable `site_id`+`rejected_at`+`idempotency_key` primary key, not
+on the mutable `claimed_at`/`status`) correctly finds and updates the
+by-site row regardless of what happens in between — the timestamp-mismatch
+failure mode this diff shape could easily have introduced does not occur.
+
+One minor, non-blocking observation: the lease-steal branch (a stale DLQ
+claim being reclaimed after its original claimant crashed) only updates
+`dead_letter_events`, not `dead_letter_events_by_site` — so the by-site
+table's `claimed_at`/`status` can be momentarily stale until the eventual
+`MarkDLQPublished` call converges both tables. Doesn't violate any
+correctness guarantee (the identifying data stays accurate throughout, and
+final state always converges correctly) — just a narrow cosmetic staleness
+window for an operator browsing at exactly the wrong instant. Not required,
+worth a follow-up if this table sees real operational use.
+
+Original findings below, both fixed:
+
+**Required fix 1 — the DLQ secondary index contradicts this project's own
+established Cassandra modeling principle.** Slice 4 explicitly reasoned
+through why Cassandra needs partition-key-first modeling with dedicated
+query tables rather than ad-hoc secondary queries — that reasoning is
+*why* `events_by_study` and `events_by_site` exist as separate tables
+instead of one `canonical_events` table with secondary indexes bolted on.
+This proposal does the opposite for DLQ site lookups: `CREATE INDEX
+dead_letter_site_idx ON pharos.dead_letter_events (site_id)`. Cassandra
+secondary indexes are a well-known scalability anti-pattern for exactly this
+shape of column (every query fans out to every node in the cluster, and
+performance degrades further as cardinality grows — `site_id` across many
+trial sites is not a low-cardinality column). This isn't a new judgment
+call; it's inconsistent with a principle this same project already
+correctly reasoned through one slice ago. Fix: replace the secondary index
+with a `dead_letter_events_by_site` table mirroring `events_by_site`'s exact
+shape (partition key `site_id`, clustered by `rejected_at DESC` +
+`idempotency_key`), written via the same parallel-idempotent-upsert pattern
+the DLQ write path already uses for `dead_letter_events` — add this as a
+third target, not a redesign.
+
+**Required fix 2 — the Kafka retention policy was documented but never
+actually applied.** I checked the real broker directly:
+`kafka-configs.sh --describe` on `pharos.events.adverse` returns zero
+dynamic configs — it's still running on whatever the cluster default is,
+not the documented 7-day policy. `pkg/kafka/topics.go`'s
+`DefaultTopicConfigs()` and the retention constants are defined but never
+called from anywhere in the codebase — `grep` for their usage outside their
+own definition file returns nothing. This proposal's own text also claims
+the policy is "documented and automated in `pkg/kafka/topics.go` and
+`scripts/create_topics.sh`" — that script doesn't exist anywhere in the
+repo. The retention *decision* and its reasoning (grounding the 7-day
+window in FDA 21 CFR 312.32(c)(2) expedited reporting) are good and stay as
+proposed — the gap is purely that deciding a value and writing it into a Go
+file isn't the same as it being true of the running system, and PLAN.md's
+checklist shouldn't claim this is done until it actually is. Fix: apply it
+for real, following the same bootstrap-on-connect pattern already
+established for Cassandra (`EnsureSchema()` called from store constructors)
+— an `EnsureTopics()` function using Kafka's admin API to create-or-configure
+the topics with these settings, called at startup from wherever makes sense
+(`cmd/pharos-ingestion` and/or `cmd/pharos-consumer`), so it's enforced
+automatically rather than manually and rather than only documented as
+intent.
+
+Once both are fixed, re-verify retention directly against the real broker
+(`kafka-configs.sh --describe`) rather than just re-reading the Go source —
+that's specifically the check that caught this the first time.
+
+**What in PLAN.md this touches:**
+- §2.3 Dead-letter queues (DLQ inspection tooling)
+- §2.4 Multi-timezone event ordering and correctness (Query surface for canonical tables)
+- §4 Built vs. not yet (DLQ inspection tooling, Kafka topic retention policy, canonical query interface)
+- §5 Open questions (Question 1: query patterns)
+
+**What I'm proposing:**
+Three unified solutions addressing query surfaces, DLQ inspection, and Kafka retention:
+
+1. **Canonical Query Surface & DLQ Inspection Tooling: `cmd/pharos-cli` backed by `pkg/query`**
+   - **Form Factor Choice: Dedicated CLI (`cmd/pharos-cli`)**:
+     - *Rationale*: A CLI binary offers an immediate, zero-friction demonstration tool for recruiting and technical interviews (no extra port or curl scripts needed). It allows an engineer to immediately inspect live Cassandra state across both canonical query tables and the dead-letter store.
+     - *Core Library*: Reusable `pkg/query.Service` wraps both `consumer.CanonicalStore` (canonical tables) and Cassandra DLQ queries.
+     - *CLI Commands Supported*:
+       - `pharos-cli query study <study_id> --from <iso-date> --to <iso-date>`: Answers "all events for trial X in date range Y" (`events_by_study`).
+       - `pharos-cli query site <site_id> [--min-seq <n>]`: Answers "all events from site Z" (`events_by_site`).
+       - `pharos-cli query event <idempotency_key>`: Single-event point lookup (`canonical_events`).
+       - `pharos-cli dlq list [--site <site_id>] [--limit <n>]`: Lists rejected adverse event submissions.
+       - `pharos-cli dlq get <idempotency_key>`: Displays full rejection details including `rejection_reason`, `validation_errors`, wire payload, and DLQ Kafka coordinates.
+       - Global `--json` flag for machine-readable output alongside human-readable tabular ASCII output.
+   - **DLQ Query Modeling**:
+     - Dedicated query table `dead_letter_events_by_site` (`PRIMARY KEY ((site_id), rejected_at, idempotency_key)` with `CLUSTERING ORDER BY (rejected_at DESC, idempotency_key ASC)`) via migration `migrations/003_dlq_site_table.cql`.
+     - Completely replaces any secondary indexes, preserving Cassandra's partition-key-first scalability principle with zero cross-node scatter-gather overhead.
+     - Written concurrently during the DLQ outbox claim and updated on publish.
+
+2. **Kafka Topic Retention Policies (§4 checklist)**
+   - **`pharos.events.adverse`**:
+     - **Retention**: **7 days (168 hours / 604,800,000 ms)**; per-partition max size: **10 GB**.
+     - **Rationale**: Kafka in Pharos is a distributed streaming backbone between ingestion intake and durable persistence, not permanent long-term storage (which is Cassandra's role for multi-year clinical trials). 7 days aligns with regulatory expedited safety reporting windows (FDA 7-day fatal/life-threatening unexpected adverse reaction requirements under 21 CFR 312.32(c)(2)), provides an abundant buffer for long holiday weekend consumer maintenance or broker partition healing, and permits multi-day consumer replay without unbounded broker disk usage.
+   - **`pharos.events.dlq`**:
+     - **Retention**: **14 days (336 hours / 1,209,600,000 ms)**; per-partition max size: **5 GB**.
+     - **Rationale**: Rejected adverse events in clinical trials require human investigation by clinical data managers or site monitors (e.g. contacting the investigator site to resolve invalid subject IDs or unmapped MedDRA codes). A 14-day window provides double the operational buffer of the main stream for downstream monitoring alerts, dashboard scrapers, and investigation before log segment truncation. (Cassandra `dead_letter_events` retains the rejected records indefinitely for compliance).
+   - **Topic Provisioning & Live Enforcement**:
+     - Automated via `EnsureTopics()` in `pkg/kafka/topics.go` called during startup in `pharos-ingestion` and `pharos-consumer`.
+     - Scripted via operational utility `scripts/create_topics.sh`.
+     - Dynamically verified directly against running broker via `kafka-configs.sh --describe`.
+
+**Why:**
+- Closes the final open items in PLAN.md §4: DLQ entries become inspectable without secondary index anti-patterns, query patterns are fully accessible, and Kafka retention is active, grounded, and enforced on the live broker.
+
+**Alternatives considered:**
+- *Standalone HTTP API only*: Requires starting another process, managing port conflicts, and writing curl commands to demo. Rejected as primary demo surface, though `pkg/query.Service` can be bound to HTTP handlers if desired.
+- *Permanent Kafka retention*: Wasteful and anti-pattern; Cassandra is already the long-term immutable record store.
+- *Short 24-hour Kafka retention*: Too tight for clinical operations; an unhandled consumer group partition failure on a Friday evening would cause unrecoverable message loss by Monday.
+- *Cassandra Secondary Indexes*: Fan out to every cluster node and degrade as cardinality increases; rejected in favor of dedicated query table `dead_letter_events_by_site`.
+
+**Impact if approved:**
+- New package `pkg/query` (Query and DLQ inspection service).
+- New binary `cmd/pharos-cli` with subcommands `query` and `dlq`.
+- New migration `migrations/003_dlq_site_table.cql`.
+- Topic configuration and enforcement in `pkg/kafka/topics.go` (`EnsureTopics`) and `scripts/create_topics.sh`.
+- Full integration tests verifying queries against live Cassandra data and actual rejected DLQ payloads.
+
+---
+
 #### [2026-08-30] Slice 4 Architecture: Kafka Consumer Topology, Canonical Cassandra Query Tables, Event-Time Watermarking, and Idempotent Downstream Sinks
 
 **Status:** Requires one more small revision (Claude Code, 2026-08-30) — very

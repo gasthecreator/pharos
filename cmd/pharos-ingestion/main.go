@@ -62,6 +62,11 @@ func main() {
 		}
 
 		brokers := strings.Split(*kafkaBrokers, ",")
+		if err := kafka.EnsureTopics(context.Background(), brokers, kafka.DefaultTopicConfigs()); err != nil {
+			log.Printf("[pharos-ingestion] WARNING: Could not ensure Kafka topic retention configs: %v", err)
+		} else {
+			log.Printf("[pharos-ingestion] Kafka topics ensured with regulatory retention policies (§4).")
+		}
 		kCfg := kafka.DefaultConfig(brokers)
 		producer = kafka.NewWriterProducer(kCfg)
 		log.Printf("[pharos-ingestion] Kafka producer configured for brokers %v", brokers)

@@ -132,6 +132,21 @@ func (s *CassandraOutboxStore) EnsureSchema() error {
 			created_at timestamp,
 			PRIMARY KEY (bucket, idempotency_key)
 		);`,
+		`CREATE TABLE IF NOT EXISTS dead_letter_events_by_site (
+			site_id text,
+			rejected_at timestamp,
+			idempotency_key text,
+			payload text,
+			rejection_reason text,
+			validation_errors text,
+			status text,
+			claimed_at timestamp,
+			published_at timestamp,
+			kafka_topic text,
+			kafka_partition int,
+			kafka_offset bigint,
+			PRIMARY KEY ((site_id), rejected_at, idempotency_key)
+		) WITH CLUSTERING ORDER BY (rejected_at DESC, idempotency_key ASC);`,
 	}
 
 	for _, q := range queries {
@@ -322,6 +337,15 @@ func (s *CassandraOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord
 			bucket, rec.IdempotencyKey, now,
 		).WithContext(ctx).Exec()
 
+		_ = s.session.Query(
+			`INSERT INTO dead_letter_events_by_site (
+				site_id, rejected_at, idempotency_key, payload, rejection_reason,
+				validation_errors, status, claimed_at
+			) VALUES (?, ?, ?, ?, ?, ?, 'PUBLISHING', ?);`,
+			rec.SiteID, now, rec.IdempotencyKey, string(rec.Payload),
+			rec.RejectionReason, rec.ValidationErrors, now,
+		).WithContext(ctx).Exec()
+
 		return ClaimResult{
 			Acquired:  true,
 			Status:    StatusPublishing,
@@ -382,7 +406,7 @@ func (s *CassandraOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord
 	}, nil
 }
 
-// MarkDLQPublished updates status='PUBLISHED' on pharos.dead_letter_events.
+// MarkDLQPublished updates status='PUBLISHED' on pharos.dead_letter_events and dead_letter_events_by_site.
 func (s *CassandraOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error {
 	now := time.Now().UTC()
 	query := `
@@ -396,6 +420,22 @@ func (s *CassandraOutboxStore) MarkDLQPublished(ctx context.Context, idempotency
 		WithContext(ctx).SerialConsistency(s.cfg.SerialConsistency).MapScanCAS(markMap)
 	if err != nil {
 		return fmt.Errorf("failed to mark DLQ outbox published: %w", err)
+	}
+
+	// Update dead_letter_events_by_site
+	var siteID string
+	var rejectedAt time.Time
+	_ = s.session.Query(
+		`SELECT site_id, rejected_at FROM dead_letter_events WHERE idempotency_key = ?;`,
+		idempotencyKey,
+	).WithContext(ctx).Scan(&siteID, &rejectedAt)
+
+	if siteID != "" && !rejectedAt.IsZero() {
+		_ = s.session.Query(`
+			UPDATE dead_letter_events_by_site
+			SET status = 'PUBLISHED', published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ?
+			WHERE site_id = ? AND rejected_at = ? AND idempotency_key = ?;
+		`, now, topic, partition, offset, siteID, rejectedAt, idempotencyKey).WithContext(ctx).Exec()
 	}
 
 	_ = s.session.Query(

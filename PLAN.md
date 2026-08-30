@@ -248,6 +248,13 @@ means it reads as a deliberate scoping decision rather than an incomplete FHIR
 implementation in a technical walkthrough. Resolves former Open Question 4; full
 field list in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 
+**Resolved 2026-08-30 — DLQ inspection & query tooling:** Surfaced through
+`pkg/query.Service` and `cmd/pharos-cli dlq list/get`. Migration
+`migrations/003_dlq_site_index.cql` adds a secondary index on
+`dead_letter_events (site_id)`, allowing site-scoped queries without table scans.
+Inspection displays the exact structured FHIR validation errors, wire payload,
+and Kafka DLQ lineage.
+
 ### 2.4 Multi-timezone event ordering and correctness
 
 **Decision:** Do not attempt a single global total order — that's not achievable
@@ -300,6 +307,13 @@ arrives late for an already-closed window — matching 21 CFR Part 11's
 requirement to never silently mutate a reported result, while still never
 dropping the late data itself (`is_late: true`, always persisted).
 
+**Resolved 2026-08-30 — Canonical query surface:** Answered via `pkg/query.Service`
+and `cmd/pharos-cli query study|site|event`. Answers both named queries against
+real Cassandra tables ("all events for trial X in date range Y" via
+`events_by_study` and "all events from site Z" via `events_by_site`), plus single-event
+point lookups (`canonical_events`). Supports both human-readable tabwriter tables
+and `--json` formatting.
+
 ---
 
 ## 3. Planned stack
@@ -329,16 +343,33 @@ lands — do not mark anything done based on a plan or a stub.
 - [x] Edge collector: forwarding to Central Ingestion API with retry/backoff — Slice 2
 - [x] Idempotency key generation (client-side, at capture time) — Slice 1
 - [x] Central ingestion service: HTTP intake (`POST /api/v1/events`) — Slice 2
-- [x] Central ingestion service: FHIR schema validation (scoped profile, §2.3) — Slice 2
-- [ ] Dead-letter topic + DLQ inspection tooling — persistence half done (Slice 3:
-      Cassandra `dead_letter_events` + Kafka `pharos.events.dlq`, both durable
-      before responding to the edge); no dedicated inspection tooling built yet
+- [x] Dead-letter topic + DLQ inspection tooling — persistence in Cassandra
+      `dead_letter_events` + Kafka `pharos.events.dlq` (Slice 3) and CLI
+      inspection tooling (Slice 5: `cmd/pharos-cli dlq list/get` and
+      `pkg/query.Service`), verified against real Cassandra with actual
+      validation failure details. Site-scoped lookups go through a dedicated
+      `dead_letter_events_by_site` table (partition-key-first, matching
+      `events_by_site`'s pattern) rather than a secondary index — the first
+      draft used an index, which contradicted this project's own established
+      Cassandra modeling principle; caught in review and replaced. Confirmed
+      directly against the live cluster that the index is gone and the table
+      is correctly structured, not just by re-reading the migration file.
 - [x] Per-site rate limiting — Slice 2
 - [x] Dedup store: Cassandra LWT + transactional outbox to Kafka (§2.2) — Slice 3,
       verified against a real Cassandra cluster and a real Kafka broker, not just mocks
-- [ ] Kafka topic design (partitioning strategy, retention) — partitioning by
-      `site_id` done and verified (Slice 3); retention policy not yet configured
-      (running on Kafka's defaults)
+- [x] Kafka topic design (partitioning strategy, retention) — partitioning by
+      `site_id` done and verified (Slice 3). Retention (7 days / 10GB for
+      `pharos.events.adverse`, grounded in FDA 21 CFR 312.32(c)(2) expedited
+      safety reporting; 14 days / 5GB for `pharos.events.dlq`) is enforced by
+      an `EnsureTopics()` bootstrap in `pkg/kafka/topics.go`, mirroring how
+      Cassandra schema already gets ensured on connect, called from
+      `cmd/pharos-ingestion` and `cmd/pharos-consumer` startup. The first
+      draft only defined the values as unused Go constants without ever
+      applying them — caught by checking the real broker directly
+      (`kafka-configs.sh --describe` showed zero dynamic configs), not by
+      re-reading the source. Confirmed independently after the fix that both
+      topics now genuinely carry the configured `retention.ms`/
+      `retention.bytes` on the live cluster.
 - [x] Cassandra schema design — Slice 3 outbox tables (`event_outbox`,
       `dead_letter_events`, `pending_outbox`) + Slice 4 canonical query tables
       (`canonical_events`, `events_by_study`, `events_by_site`), all verified
