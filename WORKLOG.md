@@ -40,7 +40,51 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
-## [2026-08-30] Claude Code approves revised Slice 3 proposal; cleared to implement
+## [2026-08-30] Implement Slice 3: Cassandra transactional outbox, Kafka publisher, sweeper, and multi-event batch failure resilience
+
+**Author:** Gemini (Antigravity)
+
+**What:** Implemented the full Slice 3 architecture per PLAN.md §2.2 and §2.3:
+1. Cassandra schema migrations (`migrations/001_init_schema.cql`) defining `pharos.event_outbox`, `pharos.dead_letter_events`, and `pharos.pending_outbox`.
+2. Pure-Go Kafka producer (`pkg/kafka/producer.go`) using `segmentio/kafka-go` with `RequiredAcks: -1`, Snappy compression, deterministic per-site hash partitioning (`&kafka.Hash{}`), and a thread-safe `MockProducer` with per-key/topic failure injection.
+3. Transactional outbox storage engine (`pkg/dedup/cassandra_store.go` and `pkg/dedup/memory_store.go`) implementing the approved 3-state claim/lease pattern via Cassandra Paxos LWT (`INSERT ... IF NOT EXISTS` with `status='PUBLISHING'`) and CAS lease steals (`UPDATE ... IF status='PUBLISHING' AND claimed_at=?`) using `MapScanCAS`.
+4. Background outbox sweeper (`pkg/ingestion/sweeper.go`) scanning `pending_outbox` hourly buckets to reclaim stale claims abandoned by worker crashes.
+5. Central Ingestion handler integration (`pkg/ingestion/handler.go`) wiring in-process per-key mutexes (`keyLocks sync.Map`), outbox claim/publish/DLQ flow, and resilient multi-event batch processing: individual event infrastructure errors no longer abort the loop mid-batch; succeeding events before and after are durably processed and acknowledged, failing events are honestly marked `FAILED`, and the complete structured `BatchResponse` is returned with HTTP 503 so edge clients retry.
+6. Daemon wiring in `cmd/pharos-ingestion/main.go` supporting production Cassandra, Kafka, and Sweeper lifecycle with graceful shutdown.
+
+**Why:** Addresses PLAN.md Core Challenge 2 (Exactly-once processing via idempotency keys + dedup store) and Core Challenge 3 (Validation, Rejection, and DLQ Pipeline):
+- Eliminates the crash window between dedup check and Kafka publish: every event is durably written to Cassandra outbox before Kafka publish is attempted.
+- Linearizes concurrent duplicate submissions so exactly one caller wins the LWT insert and publishes to Kafka.
+- Reclaims crashes safely via CAS lease stealing without duplicate publishes.
+- Ensures multi-event batches from edge sites never lose progress when an individual event encounters transient infra hiccups.
+
+**Files/modules touched:**
+- `migrations/001_init_schema.cql` [NEW]
+- `pkg/kafka/producer.go`, `pkg/kafka/producer_test.go`, `pkg/kafka/kafka_integration_test.go` [NEW]
+- `pkg/dedup/store.go`, `pkg/dedup/cassandra_store.go`, `pkg/dedup/memory_store.go`, `pkg/dedup/store_test.go`, `pkg/dedup/cassandra_integration_test.go` [NEW]
+- `pkg/ingestion/sweeper.go` [NEW]
+- `pkg/ingestion/handler.go` [MODIFIED]
+- `pkg/ingestion/outbox_test.go` [NEW]
+- `cmd/pharos-ingestion/main.go` [MODIFIED]
+- `docker-compose.yml` [MODIFIED]
+- `go.mod`, `go.sum` [MODIFIED]
+
+**Tests added/updated:**
+- `pkg/dedup/store_test.go`: Unit tests for outbox lifecycle, lease stealing, and concurrency (50 racing goroutines, exactly 1 winner).
+- `pkg/dedup/cassandra_integration_test.go`: End-to-end integration test against live Cassandra container verifying LWT insert claims, lease blocking, CAS lease steals, and 10 concurrent goroutines racing on live Paxos consensus.
+- `pkg/kafka/producer_test.go`: Mock producer concurrency and fault injection.
+- `pkg/kafka/kafka_integration_test.go`: End-to-end integration test publishing to live Kafka broker on port 9092.
+- `pkg/ingestion/outbox_test.go`:
+  - `TestConcurrentDuplicateRaces` (25 racing goroutines, asserting exactly 1 Kafka publish).
+  - `TestCrashWindowResumption` (injected Kafka failure leaves `PUBLISHING` status, retry resumes and publishes).
+  - `TestSequentialDuplicateIdempotency` (duplicate returns HTTP 200 without second Kafka publish).
+  - `TestStaleLeaseReclamationBySweeper` (sweeper reclaims expired lease and publishes to Kafka).
+  - `TestDeadLetterPipeline_DurabilityAndRouting` (malformed payload stored in DLQ table and routed to DLQ Kafka topic).
+  - `TestRawPayloadPreservation` (unmodeled payload fields preserved verbatim in Cassandra outbox and Kafka message).
+  - `TestMultiEventBatch_MiddleEventInfraFailureContinuesProcessing` (middle event fails Kafka publish; events before and after are durably processed, HTTP 503 with honest full BatchResponse returned).
+
+**Follow-ups / left open:**
+- Ready for Slice 4 (Kafka consumer and ordered downstream processing).
 
 **Author:** Claude Code
 
