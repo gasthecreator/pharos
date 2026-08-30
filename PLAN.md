@@ -343,20 +343,30 @@ lands — do not mark anything done based on a plan or a stub.
 - [x] Edge collector: forwarding to Central Ingestion API with retry/backoff — Slice 2
 - [x] Idempotency key generation (client-side, at capture time) — Slice 1
 - [x] Central ingestion service: HTTP intake (`POST /api/v1/events`) — Slice 2
-- [x] Dead-letter topic + DLQ inspection tooling — persistence in Cassandra
-      `dead_letter_events` + Kafka `pharos.events.dlq` (Slice 3); dedicated
-      inspection tooling built in Slice 5 (`cmd/pharos-cli dlq list/get` and
-      `pkg/query.Service`) with secondary index on `dead_letter_events (site_id)`,
-      verified against real Cassandra with actual validation failure details.
+- [ ] Dead-letter topic + DLQ inspection tooling — persistence in Cassandra
+      `dead_letter_events` + Kafka `pharos.events.dlq` (Slice 3) and CLI
+      inspection tooling (Slice 5: `cmd/pharos-cli dlq list/get` and
+      `pkg/query.Service`) both work and are verified against real Cassandra
+      with actual validation failure details. Not checking this off yet:
+      Slice 5's site-lookup uses a Cassandra secondary index, which
+      contradicts the partition-key-first modeling principle §2.4 already
+      established for the canonical tables one slice ago — sent back for a
+      proper `dead_letter_events_by_site` table instead. See
+      [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 - [x] Per-site rate limiting — Slice 2
 - [x] Dedup store: Cassandra LWT + transactional outbox to Kafka (§2.2) — Slice 3,
       verified against a real Cassandra cluster and a real Kafka broker, not just mocks
-- [x] Kafka topic design (partitioning strategy, retention) — partitioning by
-      `site_id` done and verified (Slice 3); retention policies configured and
-      grounded in pharmacovigilance standards (Slice 5): 7 days (168h) / 10GB for
-      `pharos.events.adverse` (FDA 7-day expedited safety reporting under 21 CFR
-      312.32(c)(2)), 14 days (336h) / 5GB for `pharos.events.dlq` (investigational
-      site data management runway). See `pkg/kafka/topics.go` and ARCHITECTURE_PROPOSALS.md.
+- [ ] Kafka topic design (partitioning strategy, retention) — partitioning by
+      `site_id` done and verified (Slice 3). Retention policy is *decided*
+      (Slice 5: 7 days / 10GB for `pharos.events.adverse`, grounded in FDA
+      21 CFR 312.32(c)(2) expedited safety reporting; 14 days / 5GB for
+      `pharos.events.dlq`) but not yet checked off — verified directly
+      against the real broker (`kafka-configs.sh --describe`) that it was
+      only defined as unused Go constants in `pkg/kafka/topics.go`, never
+      actually applied to the running topics. Sent back to apply it for
+      real via an `EnsureTopics()`-style bootstrap, matching how Cassandra
+      schema already gets ensured on connect. See
+      [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 - [x] Cassandra schema design — Slice 3 outbox tables (`event_outbox`,
       `dead_letter_events`, `pending_outbox`) + Slice 4 canonical query tables
       (`canonical_events`, `events_by_study`, `events_by_site`), all verified

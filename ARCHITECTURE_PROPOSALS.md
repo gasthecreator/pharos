@@ -44,7 +44,62 @@ to change)
 
 #### [2026-08-30] Slice 5 Architecture: Query Surface (CLI & Service), DLQ Inspection, and Kafka Topic Retention Policies
 
-**Status:** Pending
+**Status:** Requires revision (Claude Code, 2026-08-30) — do not merge yet.
+The query CLI and `pkg/query.Service` design is approved as-is — genuinely
+useful, and the real-infra DLQ test that submits an actually-invalid FHIR
+payload through the real handler and reads back the real rejection reason
+("actuality must be 'actual': got \"invalid_not_actual\"") is exactly the
+right way to prove this, not a happy-path fixture. Two required fixes below,
+both the same pattern: something claimed done that isn't actually true when
+checked against reality, which is exactly the standard every prior slice in
+this project has been held to.
+
+**Required fix 1 — the DLQ secondary index contradicts this project's own
+established Cassandra modeling principle.** Slice 4 explicitly reasoned
+through why Cassandra needs partition-key-first modeling with dedicated
+query tables rather than ad-hoc secondary queries — that reasoning is
+*why* `events_by_study` and `events_by_site` exist as separate tables
+instead of one `canonical_events` table with secondary indexes bolted on.
+This proposal does the opposite for DLQ site lookups: `CREATE INDEX
+dead_letter_site_idx ON pharos.dead_letter_events (site_id)`. Cassandra
+secondary indexes are a well-known scalability anti-pattern for exactly this
+shape of column (every query fans out to every node in the cluster, and
+performance degrades further as cardinality grows — `site_id` across many
+trial sites is not a low-cardinality column). This isn't a new judgment
+call; it's inconsistent with a principle this same project already
+correctly reasoned through one slice ago. Fix: replace the secondary index
+with a `dead_letter_events_by_site` table mirroring `events_by_site`'s exact
+shape (partition key `site_id`, clustered by `rejected_at DESC` +
+`idempotency_key`), written via the same parallel-idempotent-upsert pattern
+the DLQ write path already uses for `dead_letter_events` — add this as a
+third target, not a redesign.
+
+**Required fix 2 — the Kafka retention policy was documented but never
+actually applied.** I checked the real broker directly:
+`kafka-configs.sh --describe` on `pharos.events.adverse` returns zero
+dynamic configs — it's still running on whatever the cluster default is,
+not the documented 7-day policy. `pkg/kafka/topics.go`'s
+`DefaultTopicConfigs()` and the retention constants are defined but never
+called from anywhere in the codebase — `grep` for their usage outside their
+own definition file returns nothing. This proposal's own text also claims
+the policy is "documented and automated in `pkg/kafka/topics.go` and
+`scripts/create_topics.sh`" — that script doesn't exist anywhere in the
+repo. The retention *decision* and its reasoning (grounding the 7-day
+window in FDA 21 CFR 312.32(c)(2) expedited reporting) are good and stay as
+proposed — the gap is purely that deciding a value and writing it into a Go
+file isn't the same as it being true of the running system, and PLAN.md's
+checklist shouldn't claim this is done until it actually is. Fix: apply it
+for real, following the same bootstrap-on-connect pattern already
+established for Cassandra (`EnsureSchema()` called from store constructors)
+— an `EnsureTopics()` function using Kafka's admin API to create-or-configure
+the topics with these settings, called at startup from wherever makes sense
+(`cmd/pharos-ingestion` and/or `cmd/pharos-consumer`), so it's enforced
+automatically rather than manually and rather than only documented as
+intent.
+
+Once both are fixed, re-verify retention directly against the real broker
+(`kafka-configs.sh --describe`) rather than just re-reading the Go source —
+that's specifically the check that caught this the first time.
 
 **What in PLAN.md this touches:**
 - §2.3 Dead-letter queues (DLQ inspection tooling)

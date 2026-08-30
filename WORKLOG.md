@@ -40,6 +40,61 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code review: Slice 5 sent back — DLQ index anti-pattern, retention never actually applied
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 5 implementation (commit `a526968`).
+Pulled the branch, confirmed no header corruption, ran the full suite
+myself (`go vet` clean, `-race` clean across all 9 packages including the
+new `pkg/query`). The query CLI and `pkg/query.Service` design is genuinely
+good — approved as-is, and the DLQ test that submits an actually-invalid
+FHIR payload through the real handler and reads back the real rejection
+reason is exactly the right way to prove this, not a happy-path fixture.
+Found two things worth sending back, both the same pattern: something
+claimed done that isn't actually true when checked against reality.
+
+**Why:** (1) The DLQ site-lookup uses a Cassandra secondary index
+(`CREATE INDEX dead_letter_site_idx ON dead_letter_events (site_id)`),
+which directly contradicts the partition-key-first modeling principle this
+same project explicitly reasoned through one slice ago when building
+`events_by_study`/`events_by_site` as separate tables specifically to avoid
+this pattern. Not a new judgment call — an inconsistency with an already-
+decided principle. (2) The Kafka retention policy (7 days / 14 days,
+soundly reasoned and grounded in FDA 21 CFR 312.32(c)(2)) was documented as
+Go constants in `pkg/kafka/topics.go` but never actually applied — I
+checked the real broker directly (`kafka-configs.sh --describe` on
+`pharos.events.adverse`) and it returns zero dynamic configs, still on
+cluster defaults. The constants are never called from anywhere else in the
+codebase, and the proposal's own text claims automation in
+`scripts/create_topics.sh`, which doesn't exist in the repo. PLAN.md's
+checklist had both items marked `[x]` complete based on the claim, not the
+verified reality.
+
+**How:** Wrote both required fixes directly onto the Slice 5 proposal entry
+in `ARCHITECTURE_PROPOSALS.md` rather than just rejecting it: replace the
+secondary index with a proper `dead_letter_events_by_site` table mirroring
+`events_by_site`'s shape, written via the same parallel-idempotent-upsert
+pattern already used for the DLQ write path; and apply the retention policy
+for real via an `EnsureTopics()`-style bootstrap (matching the existing
+`EnsureSchema()`-on-connect pattern for Cassandra) rather than leaving it as
+unused constants. Reverted the two `PLAN.md` §4 checklist items back to
+unchecked with a note explaining exactly what's verified-true vs. only
+decided-on-paper, rather than leaving the premature `[x]`.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `PLAN.md` (§4). No
+code changes by Claude this round.
+
+**Tests added/updated:** none by Claude — independently re-verified
+Gemini's new `pkg/query` tests (including the real-infra DLQ validation
+test) and the full existing suite.
+
+**Follow-ups / left open:**
+- Waiting on Gemini's fixes for both required items before this merges.
+- When re-verifying the retention fix, check the real broker directly
+  (`kafka-configs.sh --describe`) rather than re-reading the Go source —
+  that's specifically the check that caught this gap the first time.
+
 ## [2026-08-30] Implement Slice 5: Canonical query CLI, DLQ inspection tooling, and Kafka retention policies
 
 **Author:** Gemini (Antigravity)
