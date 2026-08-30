@@ -350,13 +350,22 @@ lands — do not mark anything done based on a plan or a stub.
       deduplicated late-arrival audit trail. Verified against real
       Cassandra/Kafka, including the exact partition-reawakening-with-
       backlog scenario that broke the first two design attempts.
-- [ ] Fault-injection test suite (network partition simulation) — not yet a
-      dedicated test; this is explicitly Claude's responsibility per §6, still owed
+- [x] Fault-injection test suite (network partition simulation) — `pkg/faultinjection`,
+      Claude's own work per §6. Real edge + real Central Ingestion + real
+      Cassandra + real Kafka: a site loses connectivity entirely (buffers
+      locally, zero loss), then the partition heals *asymmetrically* (Central
+      Ingestion fully processes a request but the response never reaches the
+      edge, forcing a retry of an already-completed write) — proves the
+      claim/lease outbox makes that retry a safe no-op, not just that data
+      survives an outage
 - [x] Fault-injection test suite (duplicate delivery) — covered by Slice 3's
       `TestConcurrentDuplicateRaces`, `TestSequentialDuplicateIdempotency`,
       `TestCassandraOutboxStore_RealIntegration`'s concurrent-race case
-- [ ] Fault-injection test suite (out-of-order delivery) — not yet a dedicated
-      test; still owed
+- [x] Fault-injection test suite (out-of-order delivery) — `pkg/faultinjection`,
+      Claude's own work per §6. Submits one site's events to Central Ingestion
+      in scrambled local_seq order, drains through the real consumer, and
+      verifies `events_by_site` returns them correctly ordered by the schema's
+      clustering key regardless of arrival order
 - [x] Fault-injection test suite (malformed FHIR payloads → DLQ) — covered by
       Slice 3's `TestDeadLetterPipeline_DurabilityAndRouting` and related handler tests
 - [ ] Observability (metrics on lag, dedup hit rate, DLQ volume) — in-memory
