@@ -27,8 +27,8 @@ type EventResult struct {
 
 // BatchRequest represents the wire format for submitting a batch of events to Central Ingestion.
 type BatchRequest struct {
-	SiteID string               `json:"site_id,omitempty"`
-	Events []model.AdverseEvent `json:"events"`
+	SiteID string            `json:"site_id,omitempty"`
+	Events []json.RawMessage `json:"events"`
 }
 
 // BatchResponse represents the structured response returned by Central Ingestion.
@@ -87,25 +87,25 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Parse batch request (support envelope or direct array)
-	var events []model.AdverseEvent
+	// 1. Parse batch request (support envelope or direct array of raw event messages)
+	var rawEvents []json.RawMessage
 	var siteID string
 
 	// Attempt envelope parse: {"site_id": "...", "events": [...]}
 	var envelope BatchRequest
 	if err := json.Unmarshal(bodyBytes, &envelope); err == nil && len(envelope.Events) > 0 {
-		events = envelope.Events
+		rawEvents = envelope.Events
 		siteID = strings.TrimSpace(envelope.SiteID)
 	} else {
 		// Attempt direct array parse: [{...}, {...}]
-		var arrayEvents []model.AdverseEvent
+		var arrayEvents []json.RawMessage
 		if err := json.Unmarshal(bodyBytes, &arrayEvents); err == nil && len(arrayEvents) > 0 {
-			events = arrayEvents
+			rawEvents = arrayEvents
 		} else {
 			// Also check if single event was sent: {...}
-			var singleEvent model.AdverseEvent
-			if err := json.Unmarshal(bodyBytes, &singleEvent); err == nil && singleEvent.ResourceType != "" {
-				events = []model.AdverseEvent{singleEvent}
+			var singleRaw json.RawMessage
+			if err := json.Unmarshal(bodyBytes, &singleRaw); err == nil && len(singleRaw) > 0 && singleRaw[0] == '{' {
+				rawEvents = []json.RawMessage{singleRaw}
 			} else {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadRequest)
@@ -119,11 +119,14 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	if siteID == "" {
 		siteID = strings.TrimSpace(r.Header.Get("X-Site-ID"))
 	}
-	if siteID == "" && len(events) > 0 {
-		siteID = events[0].SiteID()
-		if siteID == "" {
-			if key, err := events[0].GetIdempotencyKey(); err == nil {
-				siteID = key.SiteID
+	if siteID == "" && len(rawEvents) > 0 {
+		var firstEvent model.AdverseEvent
+		if err := json.Unmarshal(rawEvents[0], &firstEvent); err == nil {
+			siteID = firstEvent.SiteID()
+			if siteID == "" {
+				if key, err := firstEvent.GetIdempotencyKey(); err == nil {
+					siteID = key.SiteID
+				}
 			}
 		}
 	}
@@ -167,16 +170,43 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Validate each event against scoped FHIR profile (§2.3)
-	results := make([]EventResult, len(events))
+	results := make([]EventResult, len(rawEvents))
 	acceptedCount := 0
 	rejectedCount := 0
 
-	for i := range events {
-		ev := &events[i]
-		key, keyErr := ev.GetIdempotencyKey()
+	for i, raw := range rawEvents {
+		var ev model.AdverseEvent
+		unmarshalErr := json.Unmarshal(raw, &ev)
+
+		// Extract idempotency key
 		keyStr := ""
-		if keyErr == nil {
-			keyStr = key.String()
+		if unmarshalErr == nil {
+			if key, keyErr := ev.GetIdempotencyKey(); keyErr == nil {
+				keyStr = key.String()
+			}
+		} else {
+			// Try partial extraction from identifier field
+			var partial struct {
+				Identifier []model.Identifier `json:"identifier"`
+			}
+			if err := json.Unmarshal(raw, &partial); err == nil {
+				for _, ident := range partial.Identifier {
+					if ident.System == model.IdempotencyKeySystem {
+						keyStr = ident.Value
+						break
+					}
+				}
+			}
+		}
+
+		if unmarshalErr != nil {
+			rejectedCount++
+			results[i] = EventResult{
+				IdempotencyKey: keyStr,
+				Status:         StatusRejected,
+				Error:          "malformed event payload: " + unmarshalErr.Error(),
+			}
+			continue
 		}
 
 		valErr := ev.Validate()
@@ -200,7 +230,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&h.rejectedEvents, uint64(rejectedCount))
 
 	resp := BatchResponse{
-		Total:    len(events),
+		Total:    len(rawEvents),
 		Accepted: acceptedCount,
 		Rejected: rejectedCount,
 		Results:  results,

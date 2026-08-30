@@ -373,3 +373,51 @@ func TestSQLiteStore_FIFOOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestSQLiteStore_MarkRejected(t *testing.T) {
+	ctx := context.Background()
+	store, _ := setupTestStore(t)
+	siteID := "SITE-REJ-STORE"
+
+	rec1, err := store.Enqueue(ctx, siteID, newTestEvent(siteID))
+	if err != nil {
+		t.Fatalf("enqueue 1 failed: %v", err)
+	}
+	rec2, err := store.Enqueue(ctx, siteID, newTestEvent(siteID))
+	if err != nil {
+		t.Fatalf("enqueue 2 failed: %v", err)
+	}
+
+	// Mark rec1 acknowledged, rec2 rejected
+	if err := store.MarkAcknowledged(ctx, []int64{rec1.ID}); err != nil {
+		t.Fatalf("MarkAcknowledged failed: %v", err)
+	}
+	if err := store.MarkRejected(ctx, []int64{rec2.ID}, "FHIR schema validation failed: missing subject"); err != nil {
+		t.Fatalf("MarkRejected failed: %v", err)
+	}
+
+	// Verify rejected record is terminal and not fetched by FetchPending
+	pending, err := store.FetchPending(ctx, 10)
+	if err != nil {
+		t.Fatalf("FetchPending failed: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Errorf("expected 0 pending records, got %d", len(pending))
+	}
+
+	// Verify stats
+	stats, err := store.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.AcknowledgedCount != 1 {
+		t.Errorf("expected 1 acknowledged, got %d", stats.AcknowledgedCount)
+	}
+	if stats.RejectedCount != 1 {
+		t.Errorf("expected 1 rejected, got %d", stats.RejectedCount)
+	}
+	if stats.PendingCount != 0 {
+		t.Errorf("expected 0 pending, got %d", stats.PendingCount)
+	}
+}
+

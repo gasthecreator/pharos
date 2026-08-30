@@ -291,6 +291,35 @@ func (s *SQLiteStore) MarkAcknowledged(ctx context.Context, ids []int64) error {
 	return err
 }
 
+// MarkRejected transitions records to REJECTED when Central Ingestion permanently rejects them.
+func (s *SQLiteStore) MarkRejected(ctx context.Context, ids []int64, errReason string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids)+2)
+	args[0] = errReason
+	args[1] = time.Now().UTC()
+
+	for i, id := range ids {
+		placeholders[i] = "?"
+		args[i+2] = id
+	}
+
+	query := fmt.Sprintf(`
+		UPDATE queued_events
+		SET status = '%s', last_error = ?, updated_at = ?
+		WHERE id IN (%s)
+	`, StatusRejected, strings.Join(placeholders, ","))
+
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
+}
+
 // MarkFailed transitions a record to FAILED with exponential backoff timestamp and error message.
 func (s *SQLiteStore) MarkFailed(ctx context.Context, id int64, errReason string, retryAfter time.Duration) error {
 	s.mu.Lock()
@@ -332,6 +361,7 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (QueueStats, error) {
 			COALESCE(SUM(CASE WHEN status = 'IN_FLIGHT' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN status = 'ACKNOWLEDGED' THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END), 0),
 			COALESCE(MAX(local_seq), 0)
 		FROM queued_events;
 	`
@@ -340,6 +370,7 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (QueueStats, error) {
 		&stats.InFlightCount,
 		&stats.AcknowledgedCount,
 		&stats.FailedCount,
+		&stats.RejectedCount,
 		&stats.MaxSequence,
 	)
 	if err != nil {

@@ -40,6 +40,35 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-29] Slice 2 review fixes: raw byte forwarding without struct round-tripping, distinct StatusRejected for rejections
+
+**Author:** Gemini (Antigravity)
+
+**What:** Addressed two correctness and data integrity items identified during PR #2 review:
+1. Replaced struct round-tripping in the edge forwarder with direct raw-byte forwarding using `json.RawMessage` in the wire format (`ingestion.BatchRequest`). Eliminates data loss from fallback empty events on unmarshal failures and prevents stripping unmodeled fields from adverse event payloads (§2.1).
+2. Added distinct terminal `RecordStatus` (`StatusRejected`) in `pkg/edge/store.go` and `SQLiteStore.MarkRejected`. Updated `forwarder.go` to correlate per-event outcomes by `idempotency_key` (instead of array index) on HTTP 207 and HTTP 422 responses, marking rejected events as `StatusRejected` rather than conflating them with `StatusAcknowledged` (§2.2, §2.3).
+3. Added architecture proposal clarifying that Central Ingestion rate limiting meters HTTP batch requests rather than individual events, resulting in an effective event capacity of `tokens * BatchSize`.
+
+**Why:**
+- Data preservation (§2.1): Forwarder must never mutate or substitute captured data on disk; forwarding the exact captured bytes ensures high-fidelity transmission.
+- Accurate local audit trail (§2.3): The edge store must truthfully represent delivery outcomes. Marking permanently rejected events as `REJECTED` preserves diagnostic errors on disk without infinite retry loops, separate from successfully delivered `ACKNOWLEDGED` events.
+
+**Files/modules touched:**
+- `pkg/edge/store.go`
+- `pkg/edge/sqlite_store.go`, `pkg/edge/sqlite_store_test.go`
+- `pkg/edge/forwarder.go`, `pkg/edge/forwarder_test.go`
+- `pkg/ingestion/handler.go`, `pkg/ingestion/handler_test.go`
+- `ARCHITECTURE_PROPOSALS.md`
+- `WORKLOG.md`
+
+**Tests added/updated:**
+- `TestForwarder_PreservesRawPayloadBytes`: confirms unmodeled fields are retained and forwarded verbatim.
+- `TestForwarder_207MixedBatchCorrelation`: verifies mixed batches correlate by `idempotency_key`, resulting in distinct `ACKNOWLEDGED` and `REJECTED` states.
+- `TestForwarder_422FullBatchRejection`: verifies 422 responses transition all records to `StatusRejected`.
+- `TestSQLiteStore_MarkRejected`: verifies SQLite transitions records to `REJECTED`, sets `last_error`, excludes them from `FetchPending`, and tracks `RejectedCount` in stats.
+- `TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON`: verifies central intake accepts payloads with extra fields and cleanly rejects non-event JSON.
+- All 25 tests pass under `-race -count=1`.
+
 ## [2026-08-29] Slice 2 built: Edge HTTP capture, forwarder with exponential backoff + jitter, and Central Ingestion rate limiting + FHIR validation
 
 **Author:** Gemini (Antigravity)

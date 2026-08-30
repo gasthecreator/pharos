@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gasthecreator/pharos/pkg/ingestion"
-	"github.com/gasthecreator/pharos/pkg/model"
 )
 
 // HTTPClient interface allows mocking the network layer in tests.
@@ -95,18 +94,11 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	}
 
 	recordIDs := make([]int64, len(records))
-	events := make([]model.AdverseEvent, len(records))
+	rawEvents := make([]json.RawMessage, len(records))
 
 	for i, r := range records {
 		recordIDs[i] = r.ID
-		var ev model.AdverseEvent
-		if err := json.Unmarshal(r.Payload, &ev); err != nil {
-			// If payload cannot be unmarshaled, create fallback event with ID
-			ev = model.AdverseEvent{
-				ResourceType: model.ResourceTypeAdverseEvent,
-			}
-		}
-		events[i] = ev
+		rawEvents[i] = json.RawMessage(r.Payload)
 	}
 
 	// 1. Mark in flight to prevent concurrent workers from claiming the same records
@@ -114,10 +106,10 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 		return 0, fmt.Errorf("failed to mark records in flight: %w", err)
 	}
 
-	// 2. Assemble batch request
+	// 2. Assemble batch request directly with raw payload bytes (zero round-trip data loss)
 	batchReq := ingestion.BatchRequest{
 		SiteID: f.cfg.SiteID,
-		Events: events,
+		Events: rawEvents,
 	}
 
 	reqBytes, err := json.Marshal(batchReq)
@@ -148,25 +140,57 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 	// 4. Handle response status codes
 	switch {
-	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusMultiStatus:
-		// Batch processed (all valid or mixed valid/invalid)
+	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusMultiStatus || resp.StatusCode == http.StatusUnprocessableEntity:
 		var batchResp ingestion.BatchResponse
 		_ = json.Unmarshal(respBytes, &batchResp)
 
-		// Mark all processed events acknowledged
-		// Ingestion has accepted valid events or recorded validation errors for DLQ routing
-		if err := f.store.MarkAcknowledged(ctx, recordIDs); err != nil {
-			return 0, fmt.Errorf("failed to mark records acknowledged: %w", err)
+		// Map results by idempotency_key to correlate per-event outcomes (§2.2, §2.3)
+		resultsByKey := make(map[string]ingestion.EventResult, len(batchResp.Results))
+		for _, res := range batchResp.Results {
+			if res.IdempotencyKey != "" {
+				resultsByKey[res.IdempotencyKey] = res
+			}
 		}
-		return len(records), nil
 
-	case resp.StatusCode == http.StatusUnprocessableEntity:
-		// All events in batch failed FHIR validation (§2.3)
-		// Central Ingestion has inspected and rejected them with structured errors.
-		// To prevent infinite retry poison-pill looping at the edge, mark acknowledged.
-		if err := f.store.MarkAcknowledged(ctx, recordIDs); err != nil {
-			return 0, fmt.Errorf("failed to mark rejected records acknowledged: %w", err)
+		var ackIDs []int64
+		rejectedByReason := make(map[string][]int64)
+
+		for _, r := range records {
+			res, found := resultsByKey[r.IdempotencyKey]
+			if found && res.Status == ingestion.StatusRejected {
+				reason := res.Error
+				if reason == "" {
+					reason = "rejected by central ingestion"
+				}
+				rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
+			} else if found && res.Status == ingestion.StatusAccepted {
+				ackIDs = append(ackIDs, r.ID)
+			} else {
+				// Fallback if not found in results map
+				if resp.StatusCode == http.StatusUnprocessableEntity {
+					reason := batchResp.Error
+					if reason == "" {
+						reason = "batch rejected by central ingestion (HTTP 422)"
+					}
+					rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
+				} else {
+					ackIDs = append(ackIDs, r.ID)
+				}
+			}
 		}
+
+		if len(ackIDs) > 0 {
+			if err := f.store.MarkAcknowledged(ctx, ackIDs); err != nil {
+				return 0, fmt.Errorf("failed to mark records acknowledged: %w", err)
+			}
+		}
+
+		for reason, rejIDs := range rejectedByReason {
+			if err := f.store.MarkRejected(ctx, rejIDs, reason); err != nil {
+				return 0, fmt.Errorf("failed to mark records rejected: %w", err)
+			}
+		}
+
 		return len(records), nil
 
 	case resp.StatusCode == http.StatusTooManyRequests:

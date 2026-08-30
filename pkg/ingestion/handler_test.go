@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,6 +48,15 @@ func validEvent(siteID string, seq uint64) model.AdverseEvent {
 	}
 }
 
+func toRaw(events ...model.AdverseEvent) []json.RawMessage {
+	raw := make([]json.RawMessage, len(events))
+	for i, ev := range events {
+		b, _ := json.Marshal(ev)
+		raw[i] = json.RawMessage(b)
+	}
+	return raw
+}
+
 func TestHandler_AllValidBatch(t *testing.T) {
 	limiter := ratelimit.NewTokenBucketLimiter(10, 1)
 	h := NewHandler(limiter)
@@ -57,7 +67,7 @@ func TestHandler_AllValidBatch(t *testing.T) {
 		validEvent(siteID, 2),
 	}
 
-	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: events})
+	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: toRaw(events...)})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", bytes.NewReader(reqBody))
 	rec := httptest.NewRecorder()
 
@@ -92,7 +102,7 @@ func TestHandler_ValidationRejectionStructuredErrors(t *testing.T) {
 	malformed.Subject.Reference = "" // missing subject
 	malformed.Severity = model.CodeableConcept{Text: "unknown-level"} // invalid severity
 
-	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: []model.AdverseEvent{malformed}})
+	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: toRaw(malformed)})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", bytes.NewReader(reqBody))
 	rec := httptest.NewRecorder()
 
@@ -137,7 +147,7 @@ func TestHandler_PartialValidationBatch(t *testing.T) {
 	malformed := validEvent(siteID, 2)
 	malformed.Date = time.Time{} // missing date
 
-	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: []model.AdverseEvent{valid, malformed}})
+	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: toRaw(valid, malformed)})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", bytes.NewReader(reqBody))
 	rec := httptest.NewRecorder()
 
@@ -170,7 +180,7 @@ func TestHandler_RateLimitingAndHeaders(t *testing.T) {
 
 	reqBody, _ := json.Marshal(BatchRequest{
 		SiteID: siteID,
-		Events: []model.AdverseEvent{validEvent(siteID, 1)},
+		Events: toRaw(validEvent(siteID, 1)),
 	})
 
 	// 1st request: OK
@@ -236,3 +246,72 @@ func TestHandler_MissingSiteID(t *testing.T) {
 		t.Fatalf("expected HTTP 400 for empty events and missing siteID, got %d", rec.Code)
 	}
 }
+
+func TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON(t *testing.T) {
+	h := NewHandler(nil)
+	siteID := "SITE-CUSTOM-01"
+
+	// Event 1: Valid FHIR + custom unmodeled field ("custom_device_id": "scanner-442")
+	validWithExtra := []byte(`{
+		"resourceType": "AdverseEvent",
+		"identifier": [{"system": "urn:pharos:idempotency-key", "value": "SITE-CUSTOM-01:101"}],
+		"actuality": "actual",
+		"subject": {"reference": "Patient/SUBJ-99"},
+		"event": {"text": "Dizziness"},
+		"date": "2026-08-29T10:00:00Z",
+		"recordedDate": "2026-08-29T10:05:00Z",
+		"severity": {"coding": [{"code": "mild"}]},
+		"study": [{"reference": "ResearchStudy/PHAROS-01"}],
+		"location": {"reference": "Location/SITE-CUSTOM-01"},
+		"custom_device_id": "scanner-442"
+	}`)
+
+	// Event 2: Corrupted/garbage payload byte sequence (non-object JSON type)
+	corrupted := []byte(`"this is a raw string, not a FHIR AdverseEvent object"`)
+
+	batch := BatchRequest{
+		SiteID: siteID,
+		Events: []json.RawMessage{
+			json.RawMessage(validWithExtra),
+			json.RawMessage(corrupted),
+		},
+	}
+
+	body, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatalf("failed to marshal batch: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	h.HandleEvents(rec, req)
+
+	// Partial success -> HTTP 207 Multi-Status
+	if rec.Code != http.StatusMultiStatus {
+		t.Fatalf("expected HTTP 207 Multi-Status, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var resp BatchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if resp.Total != 2 || resp.Accepted != 1 || resp.Rejected != 1 {
+		t.Errorf("expected total=2, accepted=1, rejected=1; got total=%d, accepted=%d, rejected=%d",
+			resp.Total, resp.Accepted, resp.Rejected)
+	}
+
+	// First event accepted despite unmodeled field
+	if resp.Results[0].Status != StatusAccepted || resp.Results[0].IdempotencyKey != "SITE-CUSTOM-01:101" {
+		t.Errorf("expected result 0 ACCEPTED for SITE-CUSTOM-01:101, got: %+v", resp.Results[0])
+	}
+
+	// Second event rejected with structured error
+	if resp.Results[1].Status != StatusRejected {
+		t.Errorf("expected result 1 REJECTED, got: %+v", resp.Results[1])
+	}
+	if !strings.Contains(resp.Results[1].Error, "malformed event payload") {
+		t.Errorf("expected malformed error message, got: %s", resp.Results[1].Error)
+	}
+}
+
