@@ -476,3 +476,111 @@ func TestForwarder_EndToEndWithCentralIngestion(t *testing.T) {
 		t.Errorf("expected 0 throttled, got %d", throttled)
 	}
 }
+
+func TestForwarder_207MixedBatchWithFailedStatus(t *testing.T) {
+	// Tests that when Central Ingestion returns HTTP 207 Multi-Status with a mix of
+	// ACCEPTED, REJECTED, and FAILED outcomes, the forwarder correctly transitions each
+	// record into its proper local state:
+	// - ACCEPTED -> ACKNOWLEDGED
+	// - REJECTED -> REJECTED (with rejection reason)
+	// - FAILED   -> FAILED (with retry_after backoff, NOT acknowledged)
+	ctx := context.Background()
+	store, _ := setupTestStore(t)
+	siteID := "SITE-MIXED-FAIL"
+
+	rec1, err := store.Enqueue(ctx, siteID, newTestEvent(siteID))
+	if err != nil {
+		t.Fatalf("enqueue rec1 failed: %v", err)
+	}
+	rec2, err := store.Enqueue(ctx, siteID, newTestEvent(siteID))
+	if err != nil {
+		t.Fatalf("enqueue rec2 failed: %v", err)
+	}
+	rec3, err := store.Enqueue(ctx, siteID, newTestEvent(siteID))
+	if err != nil {
+		t.Fatalf("enqueue rec3 failed: %v", err)
+	}
+
+	client := &mockHTTPClient{
+		doFunc: func(req *http.Request) (*http.Response, error) {
+			respBody := fmt.Sprintf(`{
+				"total": 3,
+				"accepted": 1,
+				"rejected": 1,
+				"failed": 1,
+				"results": [
+					{"idempotency_key": "%s", "status": "ACCEPTED"},
+					{"idempotency_key": "%s", "status": "REJECTED", "error": "FHIR validation failed: missing subject"},
+					{"idempotency_key": "%s", "status": "FAILED", "error": "kafka publish timeout"}
+				]
+			}`, rec1.IdempotencyKey, rec2.IdempotencyKey, rec3.IdempotencyKey)
+			return &http.Response{
+				StatusCode: http.StatusMultiStatus,
+				Body:       io.NopCloser(strings.NewReader(respBody)),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+
+	cfg := DefaultForwarderConfig("http://mock-central/api/v1/events", siteID)
+	cfg.BaseBackoff = 1 * time.Second
+	cfg.MaxBackoff = 10 * time.Second
+	forwarder := NewForwarder(store, client, cfg)
+
+	count, err := forwarder.Step(ctx)
+	if err != nil {
+		t.Fatalf("step failed: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3 processed, got %d", count)
+	}
+
+	// Verify Record 1: ACKNOWLEDGED
+	var status1 string
+	err = store.db.QueryRow(`SELECT status FROM queued_events WHERE id = ?`, rec1.ID).Scan(&status1)
+	if err != nil || RecordStatus(status1) != StatusAcknowledged {
+		t.Errorf("expected rec1 status ACKNOWLEDGED, got %s (err: %v)", status1, err)
+	}
+
+	// Verify Record 2: REJECTED
+	var status2, rejReason2 string
+	err = store.db.QueryRow(`SELECT status, last_error FROM queued_events WHERE id = ?`, rec2.ID).Scan(&status2, &rejReason2)
+	if err != nil || RecordStatus(status2) != StatusRejected {
+		t.Errorf("expected rec2 status REJECTED, got %s (err: %v)", status2, err)
+	}
+	if !strings.Contains(rejReason2, "missing subject") {
+		t.Errorf("expected rejection reason in rec2, got: %s", rejReason2)
+	}
+
+	// Verify Record 3: FAILED (with backoff, NEVER acknowledged!)
+	var status3, errMsg3 string
+	var attempts3 int
+	var retryAfter3 time.Time
+	err = store.db.QueryRow(`SELECT status, last_error, attempts, next_retry_at FROM queued_events WHERE id = ?`, rec3.ID).
+		Scan(&status3, &errMsg3, &attempts3, &retryAfter3)
+	if err != nil || RecordStatus(status3) != StatusFailed {
+		t.Errorf("expected rec3 status FAILED, got %s (err: %v)", status3, err)
+	}
+	if !strings.Contains(errMsg3, "kafka publish timeout") {
+		t.Errorf("expected error message in rec3, got: %s", errMsg3)
+	}
+	if attempts3 != 1 {
+		t.Errorf("expected attempts = 1, got %d", attempts3)
+	}
+	if !retryAfter3.After(time.Now().Add(-1 * time.Second)) {
+		t.Errorf("expected retry_after to be set, got %v", retryAfter3)
+	}
+
+	// Verify high-level store stats
+	stats, err := store.GetStats(ctx)
+	if err != nil {
+		t.Fatalf("GetStats failed: %v", err)
+	}
+	if stats.AcknowledgedCount != 1 {
+		t.Errorf("expected 1 acknowledged, got %d", stats.AcknowledgedCount)
+	}
+	if stats.RejectedCount != 1 {
+		t.Errorf("expected 1 rejected, got %d", stats.RejectedCount)
+	}
+}
+

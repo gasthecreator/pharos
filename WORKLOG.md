@@ -40,6 +40,390 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code approves Slice 3; merging into main
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's fix for the required 207/503-and-forwarder-
+correlation gap from the prior round. Pulled the branch, independently
+confirmed no header corruption this time (scanned both `WORKLOG.md` and
+`ARCHITECTURE_PROPOSALS.md` programmatically), ran the full suite myself
+including the real Cassandra and Kafka integration tests (both genuinely
+pass, not skip), and read the actual diff for both sides of the fix rather
+than trusting the summary.
+
+Confirmed correct: `HandleEvents` now returns 207 whenever the batch has any
+accepted/rejected events alongside failures, reserving 503 for the case
+where every event failed; `rejectedCount` is correctly decremented when an
+event gets reclassified from rejected to failed, so the response's aggregate
+counts now match what's actually in `Results`. `forwarder.go`'s correlation
+loop now explicitly handles `ingestion.StatusFailed` via `MarkFailed` with
+backoff — and went further than what I asked for: the fallback for an
+unmapped record now depends on the response's status code (200/201 defaults
+to acknowledged, since that's unambiguous full success; anything else,
+including 207, defaults to `MarkFailed` with backoff rather than silently
+acknowledging). That's the right call and I hadn't specified it that
+precisely. `TestForwarder_207MixedBatchWithFailedStatus` verifies actual
+SQLite state for all three outcomes in one batch, not just return values;
+`TestFullBatchInfraFailure_Returns503` covers the reserved-503 case.
+
+**Why:** This closes the last open finding from Slice 3's build. The
+combination of correct claim/lease outbox semantics (verified against real
+Cassandra), correct Kafka publishing (verified against a real broker), and
+now correct edge/central batch-response semantics means the four core
+challenges in PLAN.md §2 are genuinely implemented and tested end to end,
+not just individually plausible in isolation.
+
+**How:** Folded the finalized 207/503 contract into `PLAN.md` §2.3
+(new "batch response status codes are per-event-aware" note, alongside the
+already-approved claim/lease and DLQ-symmetry notes from the design-approval
+round). Updated the §4 checklist to reflect what's actually built after
+three slices — checked off items with real, verified implementations behind
+them; left partial items (DLQ inspection tooling, Kafka retention policy,
+two of the four fault-injection test categories) explicitly unchecked with a
+note on what's missing, rather than rounding up.
+
+**Files/modules touched:** `PLAN.md` (§2.3, §4), `WORKLOG.md`. No code
+changes by Claude this round.
+
+**Tests added/updated:** none by Claude — independently re-verified Gemini's
+2 new tests plus the full existing suite (51+ tests, `go vet` clean, `-race`
+clean, real Cassandra/Kafka integration tests passing for real).
+
+**Follow-ups / left open:**
+- Merging `feat/slice-3-cassandra-outbox-kafka` into `main` after this entry.
+- Owed, per §6 (Claude's explicit responsibility): dedicated fault-injection
+  tests for network partition simulation and out-of-order delivery — the
+  duplicate-delivery and malformed-payload categories are already covered by
+  Slice 3's own tests, but these two are not yet dedicated tests anywhere.
+- DLQ inspection tooling (some way to actually query/replay
+  `dead_letter_events` or the `pharos.events.dlq` topic) doesn't exist yet —
+  durable persistence does, but nothing to look at it with.
+- Kafka retention policy is still on defaults — never explicitly decided.
+- Slice 4 (per Gemini's own note): Kafka consumer + ordered downstream
+  processing — nothing consumes `pharos.events.adverse` yet.
+
+## [2026-08-30] Connect multi-batch StatusFailed to forwarder and return 207 on partial batch failure
+
+**Author:** Gemini (Antigravity)
+
+**What:** Closed the loop between Central Ingestion's per-event infrastructure failure reporting and Edge Forwarder state tracking:
+1. In `pkg/ingestion/handler.go`:
+   - Updated HTTP status decision so HTTP 207 Multi-Status is returned whenever a batch contains any successfully processed events (accepted or rejected) alongside infrastructure failures. Reserved HTTP 503 for the case where every single event in the batch hit an infrastructure failure with nothing else to report.
+   - Fixed bookkeeping discrepancy where DLQ outbox storage or DLQ Kafka publish errors reclassify the event as `StatusFailed` but previously left `rejectedCount` inflated. Decremented `rejectedCount--` upon reclassification so top-level `resp.Rejected` strictly matches the count of `StatusRejected` entries in `resp.Results`.
+2. In `pkg/edge/forwarder.go`:
+   - Extended the per-event correlation logic to explicitly check `res.Status == ingestion.StatusFailed`. Instead of falling through into the acknowledgment branch, failed events call `store.MarkFailed(ctx, r.ID, reason, retryAfter)` with exponential backoff.
+   - Hardened unmapped item fallback in 207 Multi-Status responses to mark records failed with backoff rather than silently acknowledging them.
+3. Tests added/updated:
+   - `pkg/edge/forwarder_test.go`: Added `TestForwarder_207MixedBatchWithFailedStatus` verifying a 3-event batch receiving HTTP 207 with ACCEPTED, REJECTED, and FAILED correctly transitions each record locally into ACKNOWLEDGED, REJECTED (with last_error), and FAILED (with next_retry_at backoff).
+   - `pkg/ingestion/outbox_test.go`: Updated `TestMultiEventBatch_MiddleEventInfraFailureContinuesProcessing` to assert HTTP 207 for mixed outcomes, and added `TestFullBatchInfraFailure_Returns503` asserting HTTP 503 when all events fail.
+
+**Why:** Prevents silent data loss. Without explicit `StatusFailed` handling in the forwarder, extending the forwarder to parse 5xx/207 bodies would have caused failed events to fall through to the acceptance branch and be marked as delivered despite never reaching Kafka.
+
+## [2026-08-30] Claude Code review: Slice 3 core design verified against real infra; one required fix, one recurring process bug
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 3 implementation (commit `6816a47`). Pulled
+the branch, independently confirmed `go vet` clean and the full suite passing
+with `-race`, and read the actual diff rather than trusting the summary
+alone. The core claim/lease outbox design (`pkg/dedup/cassandra_store.go`)
+is implemented correctly and — significantly — actually verified against a
+real Cassandra container and a real Kafka broker, not just mocks
+(`TestCassandraOutboxStore_RealIntegration`, `TestKafkaProducer_RealIntegration`,
+both passing). The `MapScanCAS` fix Gemini found and applied during this
+round is legitimate: Cassandra's LWT protocol returns the existing row's
+columns on a failed conditional write specifically so the client doesn't
+need a follow-up `SELECT`, and the code now correctly reads from that map
+instead of assuming a single-column scan.
+
+Found one real gap in the multi-event-batch fix from the prior review round,
+and repeated the exact same file-corruption mistake from an earlier round in
+a second file.
+
+**Why:** The multi-batch fix (no longer aborting mid-loop on an infra error)
+is real and its own test passes, but it's only half-connected end to end.
+`HandleEvents` now returns HTTP 503 whenever any event in a batch hits a
+transient infra failure, with a `StatusFailed` per-event result inside the
+`BatchResponse` body. But `pkg/edge/forwarder.go` (untouched this round —
+confirmed via `git show --stat`) only parses the response body for
+200/201/207/422; any other status code, including this new 503, falls into
+its `default:` branch, which marks the *entire* batch `FAILED` for retry
+without ever reading the body. So the granular per-event information Central
+Ingestion now produces is never actually consumed — the forwarder just
+retries the whole batch regardless, same as before the fix. Not currently a
+correctness bug: the already-published events in that batch are safe
+idempotent no-ops on retry, so nothing is lost or duplicated today. But it's
+a real latent trap: if the forwarder's switch statement is ever extended to
+parse 5xx bodies (a natural next step given the handler now exists to
+support exactly that), the existing per-event correlation logic doesn't know
+about `StatusFailed` at all — anything that isn't explicitly `StatusRejected`
+falls into an `else` branch that, for any code other than 422, marks it
+`ackIDs` (acknowledged). That would silently mark a genuinely-failed,
+never-published event as successfully delivered — real, silent data loss,
+exactly the class of bug this whole project exists to prevent.
+
+Also found: the exact same header-corruption pattern from an earlier round
+(an `ARCHITECTURE_PROPOSALS.md` entry losing its `## [date] title` line when
+a new entry was prepended above it) recurred here in `WORKLOG.md` — Gemini's
+new Slice 3 entry's insertion swallowed the header of the immediately-
+following entry (my own "Claude Code approves revised Slice 3 outbox design"
+entry). This is the second time this exact mistake has happened in a
+different file, which means it's a systematic pattern in how new entries get
+prepended, not a one-off. Restored the missing header directly.
+
+**How:** Traced the actual code path: `HandleEvents`'s status-code decision
+(`if failedCount > 0 { ...503... }`) takes priority over the 207/422/200
+branches, so ANY infra failure in a batch — even alongside successes — routes
+to 503, which the forwarder's switch statement doesn't special-case.
+Verified via `grep`/`sed` on `pkg/edge/forwarder.go`'s switch statement and
+confirmed `forwarder.go` wasn't in this commit's changed-file list at all.
+Restored the missing `WORKLOG.md` header by hand, then scanned the entire
+file (and `ARCHITECTURE_PROPOSALS.md`) programmatically for any other
+instance of an `**Author:**`/`**Status:**` line missing its preceding header
+— none found, so this was an isolated instance this round, not a chain.
+
+Also noted a minor, non-blocking inconsistency while reading: when a DLQ
+write or Kafka publish fails for an event that was already counted as
+`rejectedCount++` earlier in the loop (because it failed FHIR validation),
+`results[i].Status` correctly gets overwritten to `FAILED`, but
+`rejectedCount` itself is never decremented — so the response's top-level
+`Rejected` count can be inflated relative to how many entries in `Results`
+actually show `Status == "REJECTED"`. Not a correctness issue since a careful
+consumer should trust per-item `Results` over the aggregate counts, but worth
+tidying alongside the status-code fix.
+
+**Files/modules touched this round:** `WORKLOG.md` (header restoration).
+
+**Tests added/updated:** none by Claude this round — independently
+re-verified the existing suite (51 tests across 6 packages, `go vet` clean,
+`-race` clean) rather than adding new tests myself.
+
+**Follow-ups / left open:**
+- Required before merge: change `HandleEvents` to return 207 (not 503)
+  whenever the batch has any successfully-processed events (accepted or
+  rejected) alongside failures — reserve a bare 503 for the case where every
+  single event in the batch hit an infra failure with nothing else to
+  report. Extend `forwarder.go`'s per-event correlation logic to explicitly
+  handle `ingestion.StatusFailed` by calling the existing
+  `QueueStore.MarkFailed` on exactly those record IDs (with backoff),
+  instead of letting them fall into the ambiguous `else` branch. Add a test
+  exercising the full forwarder-receives-207-with-a-FAILED-event path, not
+  just the handler-level behavior in isolation.
+- Fix the `rejectedCount` bookkeeping nit alongside the above, same area of
+  code.
+- Process note, now confirmed recurring: whenever prepending a new entry to
+  `WORKLOG.md` or `ARCHITECTURE_PROPOSALS.md`, verify with a diff or a
+  re-read that the entry immediately below still has its own intact header
+  line before moving on. This has now silently damaged two different files
+  across two different rounds.
+
+## [2026-08-30] Implement Slice 3: Cassandra transactional outbox, Kafka publisher, sweeper, and multi-event batch failure resilience
+
+**Author:** Gemini (Antigravity)
+
+**What:** Implemented the full Slice 3 architecture per PLAN.md §2.2 and §2.3:
+1. Cassandra schema migrations (`migrations/001_init_schema.cql`) defining `pharos.event_outbox`, `pharos.dead_letter_events`, and `pharos.pending_outbox`.
+2. Pure-Go Kafka producer (`pkg/kafka/producer.go`) using `segmentio/kafka-go` with `RequiredAcks: -1`, Snappy compression, deterministic per-site hash partitioning (`&kafka.Hash{}`), and a thread-safe `MockProducer` with per-key/topic failure injection.
+3. Transactional outbox storage engine (`pkg/dedup/cassandra_store.go` and `pkg/dedup/memory_store.go`) implementing the approved 3-state claim/lease pattern via Cassandra Paxos LWT (`INSERT ... IF NOT EXISTS` with `status='PUBLISHING'`) and CAS lease steals (`UPDATE ... IF status='PUBLISHING' AND claimed_at=?`) using `MapScanCAS`.
+4. Background outbox sweeper (`pkg/ingestion/sweeper.go`) scanning `pending_outbox` hourly buckets to reclaim stale claims abandoned by worker crashes.
+5. Central Ingestion handler integration (`pkg/ingestion/handler.go`) wiring in-process per-key mutexes (`keyLocks sync.Map`), outbox claim/publish/DLQ flow, and resilient multi-event batch processing: individual event infrastructure errors no longer abort the loop mid-batch; succeeding events before and after are durably processed and acknowledged, failing events are honestly marked `FAILED`, and the complete structured `BatchResponse` is returned with HTTP 503 so edge clients retry.
+6. Daemon wiring in `cmd/pharos-ingestion/main.go` supporting production Cassandra, Kafka, and Sweeper lifecycle with graceful shutdown.
+
+**Why:** Addresses PLAN.md Core Challenge 2 (Exactly-once processing via idempotency keys + dedup store) and Core Challenge 3 (Validation, Rejection, and DLQ Pipeline):
+- Eliminates the crash window between dedup check and Kafka publish: every event is durably written to Cassandra outbox before Kafka publish is attempted.
+- Linearizes concurrent duplicate submissions so exactly one caller wins the LWT insert and publishes to Kafka.
+- Reclaims crashes safely via CAS lease stealing without duplicate publishes.
+- Ensures multi-event batches from edge sites never lose progress when an individual event encounters transient infra hiccups.
+
+**Files/modules touched:**
+- `migrations/001_init_schema.cql` [NEW]
+- `pkg/kafka/producer.go`, `pkg/kafka/producer_test.go`, `pkg/kafka/kafka_integration_test.go` [NEW]
+- `pkg/dedup/store.go`, `pkg/dedup/cassandra_store.go`, `pkg/dedup/memory_store.go`, `pkg/dedup/store_test.go`, `pkg/dedup/cassandra_integration_test.go` [NEW]
+- `pkg/ingestion/sweeper.go` [NEW]
+- `pkg/ingestion/handler.go` [MODIFIED]
+- `pkg/ingestion/outbox_test.go` [NEW]
+- `cmd/pharos-ingestion/main.go` [MODIFIED]
+- `docker-compose.yml` [MODIFIED]
+- `go.mod`, `go.sum` [MODIFIED]
+
+**Tests added/updated:**
+- `pkg/dedup/store_test.go`: Unit tests for outbox lifecycle, lease stealing, and concurrency (50 racing goroutines, exactly 1 winner).
+- `pkg/dedup/cassandra_integration_test.go`: End-to-end integration test against live Cassandra container verifying LWT insert claims, lease blocking, CAS lease steals, and 10 concurrent goroutines racing on live Paxos consensus.
+- `pkg/kafka/producer_test.go`: Mock producer concurrency and fault injection.
+- `pkg/kafka/kafka_integration_test.go`: End-to-end integration test publishing to live Kafka broker on port 9092.
+- `pkg/ingestion/outbox_test.go`:
+  - `TestConcurrentDuplicateRaces` (25 racing goroutines, asserting exactly 1 Kafka publish).
+  - `TestCrashWindowResumption` (injected Kafka failure leaves `PUBLISHING` status, retry resumes and publishes).
+  - `TestSequentialDuplicateIdempotency` (duplicate returns HTTP 200 without second Kafka publish).
+  - `TestStaleLeaseReclamationBySweeper` (sweeper reclaims expired lease and publishes to Kafka).
+  - `TestDeadLetterPipeline_DurabilityAndRouting` (malformed payload stored in DLQ table and routed to DLQ Kafka topic).
+  - `TestRawPayloadPreservation` (unmodeled payload fields preserved verbatim in Cassandra outbox and Kafka message).
+  - `TestMultiEventBatch_MiddleEventInfraFailureContinuesProcessing` (middle event fails Kafka publish; events before and after are durably processed, HTTP 503 with honest full BatchResponse returned).
+
+**Follow-ups / left open:**
+- Ready for Slice 4 (Kafka consumer and ordered downstream processing).
+
+## [2026-08-30] Claude Code approves revised Slice 3 outbox design; cleared to implement
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's revised Slice 3 proposal against the required fix
+from the prior review round. Read the full revised proposal text directly
+from `ARCHITECTURE_PROPOSALS.md`, then manually traced the concurrent-race
+scenario through the new design to verify the fix actually holds rather than
+just checking that a `status` column was added. Approved — cleared Gemini to
+begin implementation.
+
+**Why/How:** Confirmed the fix closes the race: two requests for the same
+idempotency key both attempt `INSERT ... status='PUBLISHING' IF NOT EXISTS`;
+Cassandra's LWT linearizes it so exactly one wins and proceeds to publish,
+the loser reads a fresh `PUBLISHING` claim and correctly does nothing (this
+is safe because durability was already achieved at the winning insert — the
+sweeper is the real backstop, not the loser's HTTP response). Verified the
+lease-expiry compare-and-swap (`IF status='PUBLISHING' AND claimed_at=?`)
+correctly serializes even when multiple actors (concurrent requests, the
+sweeper) simultaneously try to steal the same expired lease — only one CAS
+can match the exact stale `claimed_at` value. Confirmed the DLQ path now
+mirrors this exactly (previously it had the identical unaddressed
+crash-window gap, just relocated to the rejection path) and that both
+`payload` columns are explicitly specified as raw JSON bytes, not
+re-serialized structs.
+
+Found one harmless, non-blocking issue: `status='PENDING'` is now vestigial
+— since both the accept-path and DLQ-path inserts write `status='PUBLISHING'`
+directly (correctly, since winning the insert *is* the claim), no code path
+actually ever produces a `PENDING` row. Sub-case 2d and the sweeper's
+`PENDING` branch are dead code left over from the pre-revision two-step
+design. Doesn't cause a bug — flagged for deletion when the Go code gets
+written rather than blocking approval on it.
+
+Folded the finalized design into `PLAN.md` §2.2 (replacing the boolean-flag
+description with the claim/lease pattern) and §2.3 (DLQ now explicitly uses
+the same pattern, not a simpler one-shot write).
+
+**Files/modules touched:** `PLAN.md` (§2.2, §2.3), `ARCHITECTURE_PROPOSALS.md`
+(entry marked resolved), `WORKLOG.md`. No Slice 3 code exists yet.
+
+**Tests added/updated:** none — proposal review only. Verification plan in
+the approved proposal already requires the concurrent-race test to assert
+exactly one Kafka publish occurred, not just one `applied == true`, plus a
+new stale-lease-reclamation test — both correctly scoped for what actually
+needs proving.
+
+**Follow-ups / left open:**
+- Gemini cleared to implement Slice 3 against the approved design.
+- Delete the vestigial `PENDING` branches when writing the Go code.
+- Separately: while reviewing this round, traced a `git reset --hard
+  origin/main` Gemini ran mid-session back through the reflog — it was a
+  self-correction after an accidental `git pull origin
+  feat/slice-3-cassandra-outbox-kafka` while sitting on `main` (left checked
+  out from Claude's prior session) fast-forwarded local `main` ahead of
+  `origin/main`. No commits were lost — everything stayed reachable via the
+  feature branch throughout, confirmed via reflog and by diffing `main`
+  against `origin/main` after the fact (identical). No corrective action
+  needed, but worth naming as a process risk: this repo's local checkout is
+  shared between Gemini and Claude Code sessions, so whichever branch is
+  currently checked out is whatever the *previous* session left behind —
+  both should verify `git branch --show-current` before assuming which
+  branch they're on, especially before any pull/reset/checkout.
+
+## [2026-08-30] Slice 3 architecture revised: 3-state claim lock (PENDING/PUBLISHING/PUBLISHED), lease timeout, symmetric DLQ outbox, and raw payload storage
+
+**Author:** Gemini (Antigravity)
+
+**What:** Addressed all feedback from Claude Code's review of the Slice 3 architecture proposal:
+1. Concurrency fix: Replaced `published boolean` with a three-state `status` column (`PENDING`, `PUBLISHING`, `PUBLISHED`) and `claimed_at timestamp`. Any actor attempting to publish to Kafka must hold an active `PUBLISHING` claim won via Cassandra LWT (`INSERT ... VALUES ('PUBLISHING', now) IF NOT EXISTS` or conditional `UPDATE ... SET status = 'PUBLISHING', claimed_at = now ... IF status = 'PENDING'`). Racing duplicates or in-flight retries see an active lease and immediately no-op, eliminating the dual-Kafka-publish race condition.
+2. Stale lease reclamation: Defined a 30s `LeaseTimeout` past which the background sweeper or a subsequent retry can conditionally reclaim a row stuck in `PUBLISHING` due to an in-flight worker crash.
+3. Symmetric DLQ outbox: Applied the identical three-state claim lock (`status`, `claimed_at`) to `pharos.dead_letter_events`, ensuring rejected events are guaranteed to land on Kafka's DLQ topic without crash-window drop risk.
+4. Raw payload preservation: Explicitly specified that `payload text` in both tables stores the raw JSON bytes (`json.RawMessage`), never re-serialized Go structs.
+5. Verification requirement: Documented that the concurrent-duplicate-race test must assert that *exactly one Kafka publish actually occurred*, verifying real deduplication at the broker level.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md`
+- `WORKLOG.md`
+
+## [2026-08-30] Claude Code review: Slice 3 proposal sent back for revision — concurrent-publish race
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 3 architecture proposal (Cassandra
+transactional outbox schema, consistency levels, Kafka pipeline) before any
+code was written, per the elevated-rigor process set for this slice. Read the
+full proposal text directly from `ARCHITECTURE_PROPOSALS.md`, not just the
+chat summary. The core outbox pattern is correct — it closes the original
+crash-window bug from the Slice 2 planning phase (Cassandra write with
+`published: false`, then a separate step publishes to Kafka and flips the
+flag). Traced through what happens under concurrent access and found a real
+race the proposal doesn't close, plus two smaller gaps. Marked the proposal
+"Requires revision" rather than approving — not implemented yet.
+
+**Why:** Two requests for the same idempotency key arriving close together
+(a genuine duplicate, or a retry racing a still-in-flight original — both
+realistic) both hit the LWT insert; one gets `applied == true` and proceeds
+to publish, the other gets `applied == false`, sees `published == false`, and
+under the proposed logic assumes the original crashed and tries to resume the
+publish itself — even though the original is still actively working on it.
+Two goroutines can then both call the Kafka producer for the same event. This
+is the exact "silently dropped or duplicated" failure PLAN.md §2.2 exists to
+prevent, just moved from the Cassandra layer (already correctly fixed) to the
+Kafka-publish layer (not yet). A boolean can't distinguish "nobody is
+publishing this" from "someone is publishing this right now" — that needs a
+third state and its own conditional guard.
+
+**How:** Wrote the required fix into `ARCHITECTURE_PROPOSALS.md` directly on
+the entry rather than just rejecting it: replace `published boolean` with a
+three-state `status` column (`PENDING`/`PUBLISHING`/`PUBLISHED`), and require
+any actor (original request, racing duplicate, or the background sweeper) to
+win a second conditional Cassandra update
+(`... SET status='PUBLISHING' ... IF status='PENDING'`) before it's allowed
+to call the Kafka producer at all — consistent with the rest of this design
+already being built on Cassandra LWTs, rather than reaching for an in-process
+mutex, which would only be safe as long as Central Ingestion stays a single
+instance and would silently stop being safe the moment that changes. Also
+flagged two smaller required clarifications: the DLQ path's
+`kafka_published` flag has the identical unaddressed crash-window problem and
+needs the same status/claim treatment, not a special case; and the `payload`
+columns in both new tables need to explicitly store raw JSON bytes (the
+`json.RawMessage` from Slice 2's fix), not a re-serialized Go struct, so that
+fix doesn't get silently undone here.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `WORKLOG.md`. No code
+exists for Slice 3 yet — proposal-stage review only.
+
+**Tests added/updated:** none yet. Noted for when tests are written: the
+concurrent-duplicate-race test must assert exactly one Kafka publish actually
+occurred, not just that exactly one `applied == true` resulted from the
+insert — those are different claims, and only the second one is the one that
+matters.
+
+**Follow-ups / left open:**
+- Waiting on Gemini's revised proposal before any Slice 3 code gets written.
+- Once the status/claim pattern is in place, verify the sweeper's reclaim
+  logic for a `PUBLISHING` row whose claimant crashed before completing (a
+  lease/claimed-at timeout) — the revision request asked for this to be
+  written down explicitly, not left implicit.
+
+## [2026-08-30] Slice 3 kickoff: re-derived requirements against PLAN.md §2.2/§2.3, drafted architecture proposal for Cassandra outbox and Kafka pipeline
+
+**Author:** Gemini (Antigravity)
+
+**What:** Initiated Slice 3 on feature branch `feat/slice-3-cassandra-outbox-kafka`:
+1. Re-derived the core distributed-systems guarantees against PLAN.md §2.2 (Exactly-once & transactional outbox), §2.3 (DLQ), and §2.4 (per-site FIFO partitioning).
+2. Identified critical ambiguities and submitted a detailed proposal to `ARCHITECTURE_PROPOSALS.md` covering:
+   - Cassandra consistency levels: `LOCAL_SERIAL` for Paxos LWT, `LOCAL_QUORUM` (dev `ONE`) for commits.
+   - Exact CQL schemas for `pharos.event_outbox` and `pharos.dead_letter_events`.
+   - Outbox execution lifecycle: synchronous fast-path write (`published: false` via LWT) followed by Kafka publish and `published: true` update, with automatic resumption on edge retry (`applied: false && published: false`) and a background sweeper for edge-dropout scenarios.
+   - Dual-persistence dead-letter pipeline: durable writes to both Cassandra `dead_letter_events` table and Kafka `pharos.events.dlq` topic before returning HTTP 422/207 to the edge.
+   - Kafka client selection: pure-Go `segmentio/kafka-go` with idempotent producer configuration.
+3. Created feature branch `feat/slice-3-cassandra-outbox-kafka`, committed proposal, and pushed to remote tracking branch for Claude Code review before implementation.
+
+**Why:** PLAN.md §2.2 notes that this is the highest-risk slice in the architecture and the easiest place to introduce subtle correctness bugs (e.g. check-then-publish crash windows). Formalizing schemas, consistency levels, and failure recovery semantics in `ARCHITECTURE_PROPOSALS.md` prevents guessing and ensures alignment with supervisor review before code is written.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md`
+- `WORKLOG.md`
+
 ## [2026-08-29] Claude Code approves Slice 2 (PR #2) after review fixes; merging
 
 **Author:** Claude Code

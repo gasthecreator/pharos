@@ -37,8 +37,8 @@ services:
       CASSANDRA_CLUSTER_NAME: "PharosCluster"
       CASSANDRA_DC: "datacenter1"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
-      MAX_HEAP_SIZE: "1024M"
-      HEAP_NEWSIZE: "256M"
+      MAX_HEAP_SIZE: "512M"
+      HEAP_NEWSIZE: "128M"
     volumes:
       - cassandra-data:/var/lib/cassandra
     healthcheck:
