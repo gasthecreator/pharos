@@ -40,6 +40,60 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code approves Slice 4; merging into main
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's fix for the audit-trail duplication gap. Pulled
+the branch, confirmed no header corruption, ran the full suite myself
+(`go vet` clean, `-race` clean across all 7 packages, real Cassandra/Kafka
+integration tests genuinely passing), and read the actual diff rather than
+trusting the summary. Confirmed correct: a `lateAuditKeys map[string]bool`
+keyed by `windowID + ":" + idempotencyKey`, checked before every append and
+set after — exactly the fix asked for, scoped precisely to the audit-append
+path without touching the status-transition logic. Independently ran
+`TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery` and confirmed
+it genuinely reproduces the failure scenario (injects a `SaveEvent` failure
+on the first attempt after the window has already flipped to `REVISED`,
+redelivers the identical message, asserts exactly one audit entry survives)
+rather than just asserting the happy path.
+
+**Why:** This closes the last open finding across all of Slice 4. Combined
+with the already-verified monotonicity fix and gated-commit correctness from
+the prior round, the consumer/canonical-store/watermark design is now
+genuinely sound end to end — including under the specific failure and
+redelivery conditions that are easy to get subtly wrong and easy to miss in
+testing (this exact bug wouldn't have shown up without deliberately
+constructing the failure-then-redeliver sequence).
+
+**How:** Folded the finalized watermarking and canonical-schema design into
+`PLAN.md` §2.4 (previously only had the original pre-Slice-4 decision text)
+and marked the long-open §5 Cassandra query-pattern question resolved — the
+two named queries did need different partition keys, exactly as flagged
+back in the original planning session, resolved with `events_by_study` and
+`events_by_site` as separate purpose-built tables rather than one schema
+serving both. Updated the §4 checklist: Cassandra schema design and stream
+processing layer both now checked off with what's actually behind them.
+
+**Files/modules touched:** `PLAN.md` (§2.4, §5, §4), `WORKLOG.md`. No code
+changes by Claude this round.
+
+**Tests added/updated:** none by Claude — independently re-verified
+Gemini's new regression test plus the full existing suite.
+
+**Follow-ups / left open:**
+- Merging `feat/slice-4-consumer-ordering-canonical-store` into `main` after
+  this entry.
+- Still owed, per §6 (Claude's explicit responsibility): dedicated
+  fault-injection tests for network partition simulation and out-of-order
+  delivery.
+- DLQ inspection tooling and Kafka retention policy remain undecided
+  (unchanged from the Slice 3 follow-up list).
+- Next natural slice: something actually reads the canonical query tables
+  (an API or CLI surfacing "all events for study X in range Y" / "all events
+  from site Z" — the tables exist and are populated, but nothing queries
+  them yet beyond the integration tests).
+
 ## [2026-08-30] Fix audit trail duplicate on consumer redelivery (21 CFR Part 11 idempotency)
 
 **Author:** Gemini (Antigravity)
