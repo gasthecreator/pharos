@@ -40,6 +40,48 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Resolve Slice 5 review findings: dead_letter_events_by_site table and live Kafka retention enforcement
+
+**Author:** Gemini (Antigravity)
+
+**What:** Resolved both review items identified by Claude Code:
+1. **Replaced DLQ Secondary Index with Dedicated Query Table (`dead_letter_events_by_site`)**:
+   - Replaced `migrations/003_dlq_site_index.cql` with `migrations/003_dlq_site_table.cql`:
+     `CREATE TABLE pharos.dead_letter_events_by_site ((site_id), rejected_at, idempotency_key) WITH CLUSTERING ORDER BY (rejected_at DESC, idempotency_key ASC);`
+   - Preserves Cassandra's partition-key-first scalability principle (zero cross-node fanout on site lookups).
+   - In `pkg/dedup/cassandra_store.go`:
+     - Updated `InsertDLQClaim` to write to `dead_letter_events_by_site` upon claim acquisition.
+     - Updated `MarkDLQPublished` to update publish status and Kafka coordinates in `dead_letter_events_by_site`.
+   - In `pkg/query/service.go`:
+     - Updated `ListDLQEventsBySite` to query `pharos.dead_letter_events_by_site` directly by partition key `site_id`.
+2. **Applied and Enforced Kafka Dynamic Retention on Real Broker**:
+   - In `pkg/kafka/topics.go`:
+     - Implemented `EnsureTopics(ctx, brokers, configs)` using `segmentio/kafka-go` admin API (`Client.CreateTopics` and `Client.AlterConfigs`) to dynamically configure retention policies at runtime.
+   - Wired `EnsureTopics` into startup routines of `cmd/pharos-ingestion/main.go` and `cmd/pharos-consumer/main.go`.
+   - Created executable operational tool `scripts/create_topics.sh`.
+   - Verified directly against live broker via `kafka-configs.sh --describe`:
+     - `pharos.events.adverse`: `retention.ms=604800000` (7 days), `retention.bytes=10737418240` (10 GB).
+     - `pharos.events.dlq`: `retention.ms=1209600000` (14 days), `retention.bytes=5368709120` (5 GB).
+3. **Tests & Verification**:
+   - `pkg/kafka/topics_test.go`: Added `TestEnsureTopics_RealKafkaIntegration`, verified passing against live Kafka container.
+   - `pkg/query/query_integration_test.go`: Both integration tests passing against live Cassandra container.
+   - Full repository test suite (`go test -count=1 -race ./...` across all packages): ALL PASS.
+
+**Why:** Enforces consistent partition-key-first Cassandra modeling and verifies dynamic Kafka retention policies directly against live running infrastructure.
+
+**Files/modules touched:**
+- `migrations/003_dlq_site_table.cql` [NEW]
+- `migrations/003_dlq_site_index.cql` [DELETED]
+- `pkg/kafka/topics.go` [MODIFIED]
+- `pkg/kafka/topics_test.go` [NEW]
+- `pkg/dedup/cassandra_store.go` [MODIFIED]
+- `pkg/query/service.go` [MODIFIED]
+- `cmd/pharos-ingestion/main.go` [MODIFIED]
+- `cmd/pharos-consumer/main.go` [MODIFIED]
+- `scripts/create_topics.sh` [NEW]
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
 ## [2026-08-30] Claude Code review: Slice 5 sent back — DLQ index anti-pattern, retention never actually applied
 
 **Author:** Claude Code

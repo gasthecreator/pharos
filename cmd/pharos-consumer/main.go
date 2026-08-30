@@ -57,6 +57,9 @@ func main() {
 
 	// 3. Initialize Kafka Consumer Engine
 	brokers := strings.Split(*kafkaBrokers, ",")
+	if !*useMemoryStore {
+		_ = kafka.EnsureTopics(context.Background(), brokers, kafka.DefaultTopicConfigs())
+	}
 	engineCfg := consumer.DefaultEngineConfig(brokers)
 	engineCfg.Topic = *kafkaTopic
 	engineCfg.GroupID = *kafkaGroup

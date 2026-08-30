@@ -1,7 +1,12 @@
 package kafka
 
 import (
+	"context"
+	"fmt"
+	"strconv"
 	"time"
+
+	kafkaGo "github.com/segmentio/kafka-go"
 )
 
 const (
@@ -50,4 +55,66 @@ func DefaultTopicConfigs() []TopicConfig {
 			MaxBytes:    DLQTopicMaxBytes,
 		},
 	}
+}
+
+// EnsureTopics creates or configures Kafka topics with explicit retention policies (§4).
+// Follows the same bootstrap-on-connect pattern established for Cassandra (EnsureSchema).
+func EnsureTopics(ctx context.Context, brokers []string, configs []TopicConfig) error {
+	if len(brokers) == 0 {
+		return fmt.Errorf("no brokers provided")
+	}
+
+	addr := kafkaGo.TCP(brokers...)
+	client := &kafkaGo.Client{
+		Addr:    addr,
+		Timeout: 15 * time.Second,
+	}
+
+	// 1. Create topics if they don't exist yet
+	var createConfigs []kafkaGo.TopicConfig
+	for _, tc := range configs {
+		createConfigs = append(createConfigs, kafkaGo.TopicConfig{
+			Topic:             tc.Name,
+			NumPartitions:     tc.Partitions,
+			ReplicationFactor: tc.Replication,
+			ConfigEntries: []kafkaGo.ConfigEntry{
+				{ConfigName: "retention.ms", ConfigValue: strconv.FormatInt(tc.RetentionMs, 10)},
+				{ConfigName: "retention.bytes", ConfigValue: strconv.FormatInt(tc.MaxBytes, 10)},
+			},
+		})
+	}
+
+	_, _ = client.CreateTopics(ctx, &kafkaGo.CreateTopicsRequest{
+		Addr:   addr,
+		Topics: createConfigs,
+	})
+
+	// 2. Ensure dynamic configurations (retention.ms, retention.bytes) on existing topics
+	var resources []kafkaGo.AlterConfigRequestResource
+	for _, tc := range configs {
+		resources = append(resources, kafkaGo.AlterConfigRequestResource{
+			ResourceType: kafkaGo.ResourceTypeTopic,
+			ResourceName: tc.Name,
+			Configs: []kafkaGo.AlterConfigRequestConfig{
+				{Name: "retention.ms", Value: strconv.FormatInt(tc.RetentionMs, 10)},
+				{Name: "retention.bytes", Value: strconv.FormatInt(tc.MaxBytes, 10)},
+			},
+		})
+	}
+
+	alterResp, err := client.AlterConfigs(ctx, &kafkaGo.AlterConfigsRequest{
+		Addr:      addr,
+		Resources: resources,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to alter kafka topic configs: %w", err)
+	}
+
+	for res, rErr := range alterResp.Errors {
+		if rErr != nil {
+			return fmt.Errorf("failed to configure retention for topic %s: %w", res.Name, rErr)
+		}
+	}
+
+	return nil
 }

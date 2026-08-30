@@ -121,9 +121,10 @@ Three unified solutions addressing query surfaces, DLQ inspection, and Kafka ret
        - `pharos-cli dlq list [--site <site_id>] [--limit <n>]`: Lists rejected adverse event submissions.
        - `pharos-cli dlq get <idempotency_key>`: Displays full rejection details including `rejection_reason`, `validation_errors`, wire payload, and DLQ Kafka coordinates.
        - Global `--json` flag for machine-readable output alongside human-readable tabular ASCII output.
-   - **DLQ Indexing**:
-     - To support `pharos-cli dlq list --site <site_id>` without full-table scans, add a secondary index on `dead_letter_events (site_id)` via migration `migrations/003_dlq_site_index.cql`:
-       `CREATE INDEX IF NOT EXISTS dead_letter_site_idx ON pharos.dead_letter_events (site_id);`
+   - **DLQ Query Modeling**:
+     - Dedicated query table `dead_letter_events_by_site` (`PRIMARY KEY ((site_id), rejected_at, idempotency_key)` with `CLUSTERING ORDER BY (rejected_at DESC, idempotency_key ASC)`) via migration `migrations/003_dlq_site_table.cql`.
+     - Completely replaces any secondary indexes, preserving Cassandra's partition-key-first scalability principle with zero cross-node scatter-gather overhead.
+     - Written concurrently during the DLQ outbox claim and updated on publish.
 
 2. **Kafka Topic Retention Policies (§4 checklist)**
    - **`pharos.events.adverse`**:
@@ -132,22 +133,25 @@ Three unified solutions addressing query surfaces, DLQ inspection, and Kafka ret
    - **`pharos.events.dlq`**:
      - **Retention**: **14 days (336 hours / 1,209,600,000 ms)**; per-partition max size: **5 GB**.
      - **Rationale**: Rejected adverse events in clinical trials require human investigation by clinical data managers or site monitors (e.g. contacting the investigator site to resolve invalid subject IDs or unmapped MedDRA codes). A 14-day window provides double the operational buffer of the main stream for downstream monitoring alerts, dashboard scrapers, and investigation before log segment truncation. (Cassandra `dead_letter_events` retains the rejected records indefinitely for compliance).
-   - **Topic Provisioning**:
-     - Documented and automated in `pkg/kafka/topics.go` and `scripts/create_topics.sh` (using `kafka-configs.sh` or programmatic topic metadata).
+   - **Topic Provisioning & Live Enforcement**:
+     - Automated via `EnsureTopics()` in `pkg/kafka/topics.go` called during startup in `pharos-ingestion` and `pharos-consumer`.
+     - Scripted via operational utility `scripts/create_topics.sh`.
+     - Dynamically verified directly against running broker via `kafka-configs.sh --describe`.
 
 **Why:**
-- Closes the final open items in PLAN.md §4: DLQ entries become inspectable, query patterns are fully accessible, and Kafka retention is grounded in pharmacovigilance rationale.
+- Closes the final open items in PLAN.md §4: DLQ entries become inspectable without secondary index anti-patterns, query patterns are fully accessible, and Kafka retention is active, grounded, and enforced on the live broker.
 
 **Alternatives considered:**
 - *Standalone HTTP API only*: Requires starting another process, managing port conflicts, and writing curl commands to demo. Rejected as primary demo surface, though `pkg/query.Service` can be bound to HTTP handlers if desired.
 - *Permanent Kafka retention*: Wasteful and anti-pattern; Cassandra is already the long-term immutable record store.
 - *Short 24-hour Kafka retention*: Too tight for clinical operations; an unhandled consumer group partition failure on a Friday evening would cause unrecoverable message loss by Monday.
+- *Cassandra Secondary Indexes*: Fan out to every cluster node and degrade as cardinality increases; rejected in favor of dedicated query table `dead_letter_events_by_site`.
 
 **Impact if approved:**
 - New package `pkg/query` (Query and DLQ inspection service).
 - New binary `cmd/pharos-cli` with subcommands `query` and `dlq`.
-- New migration `migrations/003_dlq_site_index.cql`.
-- Topic configuration helper in `pkg/kafka/topics.go`.
+- New migration `migrations/003_dlq_site_table.cql`.
+- Topic configuration and enforcement in `pkg/kafka/topics.go` (`EnsureTopics`) and `scripts/create_topics.sh`.
 - Full integration tests verifying queries against live Cassandra data and actual rejected DLQ payloads.
 
 ---

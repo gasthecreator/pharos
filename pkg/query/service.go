@@ -75,19 +75,35 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 		session:        session,
 	}
 
-	if err := svc.EnsureIndexes(); err != nil {
+	if err := svc.EnsureSchemas(); err != nil {
 		svc.Close()
-		return nil, fmt.Errorf("failed to ensure DLQ indexes: %w", err)
+		return nil, fmt.Errorf("failed to ensure DLQ schemas: %w", err)
 	}
 
 	return svc, nil
 }
 
-// EnsureIndexes creates the secondary index on dead_letter_events (site_id) if not exists.
-func (s *CassandraService) EnsureIndexes() error {
-	indexQuery := `CREATE INDEX IF NOT EXISTS dead_letter_site_idx ON pharos.dead_letter_events (site_id);`
-	if err := s.session.Query(indexQuery).Exec(); err != nil {
-		return fmt.Errorf("failed to create dead_letter_site_idx: %w", err)
+// EnsureSchemas bootstraps the dead_letter_events_by_site query table if not exists (§2.3, §4).
+func (s *CassandraService) EnsureSchemas() error {
+	tableQuery := `
+		CREATE TABLE IF NOT EXISTS pharos.dead_letter_events_by_site (
+			site_id text,
+			rejected_at timestamp,
+			idempotency_key text,
+			payload text,
+			rejection_reason text,
+			validation_errors text,
+			status text,
+			claimed_at timestamp,
+			published_at timestamp,
+			kafka_topic text,
+			kafka_partition int,
+			kafka_offset bigint,
+			PRIMARY KEY ((site_id), rejected_at, idempotency_key)
+		) WITH CLUSTERING ORDER BY (rejected_at DESC, idempotency_key ASC);
+	`
+	if err := s.session.Query(tableQuery).Exec(); err != nil {
+		return fmt.Errorf("failed to create dead_letter_events_by_site: %w", err)
 	}
 	return nil
 }
@@ -165,7 +181,8 @@ func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey strin
 	return &rec, nil
 }
 
-// ListDLQEventsBySite retrieves rejected events for a specific clinical trial site (§2.3).
+// ListDLQEventsBySite retrieves rejected events for a specific clinical trial site (§2.3)
+// querying pharos.dead_letter_events_by_site directly by partition key site_id.
 func (s *CassandraService) ListDLQEventsBySite(ctx context.Context, siteID string, limit int) ([]*DLQRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -179,7 +196,7 @@ func (s *CassandraService) ListDLQEventsBySite(ctx context.Context, siteID strin
 
 	query := `SELECT idempotency_key, site_id, payload, rejection_reason, validation_errors,
 	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset
-	          FROM pharos.dead_letter_events
+	          FROM pharos.dead_letter_events_by_site
 	          WHERE site_id = ? LIMIT ?`
 
 	iter := s.session.Query(query, siteID, limit).WithContext(ctx).Consistency(gocql.One).Iter()
