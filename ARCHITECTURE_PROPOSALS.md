@@ -44,7 +44,45 @@ to change)
 
 #### [2026-08-30] Slice 4 Architecture: Kafka Consumer Topology, Canonical Cassandra Query Tables, Event-Time Watermarking, and Idempotent Downstream Sinks
 
-**Status:** Resubmitted for Review (2026-08-30) — revised per Claude Code review feedback (idle partition exclusion, completeness signal revision lifecycle, errgroup parallel upserts, and explicit study_id extraction).
+**Status:** Requires one more small revision (Claude Code, 2026-08-30) — very
+close, don't restart the design, just add one wrapper to the watermark
+computation. Idle-partition detection, the `COMPLETE`→`REVISED` lifecycle
+(genuinely good addition — the 21 CFR Part 11 reasoning is the right kind of
+detail for this project), `errgroup` parallel upserts, and `study_id`
+extraction are all approved as-is.
+
+**Required fix — the formula doesn't actually deliver the monotonicity it
+claims.** The proposal states "$W$ is monotonically non-decreasing" as an
+invariant, but trace through the exact reconnection scenario this whole
+design exists to handle: partition A is active with $T_A = 100$; partition B
+went idle and is excluded, so $W = T_A - L = 100 - L$. Now B reconnects and
+delivers its backlog — its first message has an old event-time, say
+$T_B = 50$. Per the stated rule, B immediately transitions back to Active
+the moment it produces a message, so `ActivePartitions = {A, B}`, and the
+recomputed $W = \min(100, 50) - L = 50 - L$ — *lower* than the previously
+emitted watermark. The design regresses exactly when a site reconnects with
+a backlog, which is the specific case idle-detection was built for. This
+isn't just a broken claim in the writeup — it threatens the completeness
+signal directly: a window already marked `COMPLETE` based on the old
+(higher) $W$ could look inconsistent against a freshly recomputed (lower)
+$W$, undermining the exact audit-trail correctness the `REVISED` lifecycle
+was designed to protect.
+
+Standard fix, same one every real watermark generator uses (Flink included)
+for this exact reason: never let the emitted watermark fall below what's
+already been emitted. `W_new = max(W_previous_emitted, candidate)`, where
+`candidate` is what the idle-aware `min()` formula computes. The `REVISED`
+lifecycle already correctly handles "late data arrived after a window
+closed" — that mechanism doesn't need $W$ itself to regress, it needs $W$ to
+keep moving forward while late data gets flagged separately. Add this
+max-wrapper and the design is complete.
+
+Once this is fixed, you're cleared to go straight to implementation — no
+need for another proposal-only round-trip. Build the full slice (schema
+migration, `pkg/consumer` including the corrected watermark tracker, the
+canonical Cassandra store with errgroup upserts, the consumer binary) and
+the full test suite in one pass, self-verifying as you go per the standing
+process.
 
 **What in PLAN.md this touches:**
 - §2.4 Multi-timezone event ordering and correctness

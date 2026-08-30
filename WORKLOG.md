@@ -40,6 +40,58 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code review: Slice 4 watermark almost there — one monotonicity gap, then cleared straight to implementation
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's revised Slice 4 proposal. Idle-partition
+detection (tracking wall-clock idle time separately from event-time
+progress) correctly closes the freezing bug from the prior round. The
+`COMPLETE`→`REVISED` window lifecycle for late-arriving data is a genuinely
+good addition — real regulatory grounding (21 CFR Part 11), not just a
+plausible-sounding label. `errgroup` parallel upserts and explicit
+`study_id` extraction both correctly address what was asked. Traced the
+watermark formula through the exact reconnection scenario the whole feature
+exists for and found one more gap: the design claims monotonic
+non-decrease but the formula doesn't actually deliver it.
+
+**Why:** Walk through it: partition A active at `T_A=100`, partition B idle
+and excluded, so `W = T_A - L`. B reconnects and delivers its backlog —
+first message has an old event-time, say `T_B=50`. Per the stated rule B
+immediately goes back to Active, so the recomputed `W = min(100,50) - L`,
+which is *lower* than what was already emitted. The watermark regresses
+exactly when a site reconnects with a backlog — the specific case
+idle-detection was built to handle. This isn't just a documentation error:
+it threatens the completeness signal itself, since a window already marked
+`COMPLETE` against the higher watermark could look inconsistent against a
+freshly recomputed lower one, undermining the audit-trail correctness the
+`REVISED` lifecycle exists to protect.
+
+**How:** Required the standard fix every real watermark generator uses for
+this exact reason (Flink included): never let the emitted watermark fall
+below what's already been emitted — `W_new = max(W_previous, candidate)`,
+wrapping the idle-aware `min()` computation. Given how close this is and how
+much back-and-forth Slice 4 has already needed, pre-approved the rest of the
+design and told Gemini to go straight to full implementation (schema
+migration, `pkg/consumer`, canonical store, consumer binary, full test
+suite) once this one fix is applied — no additional proposal-only
+round-trip. Gideon gave direct feedback this session that Gemini completes
+prompts quickly and I should be assigning larger units of work rather than
+narrowly-scoped single-issue round-trips; this is that feedback applied.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `WORKLOG.md`. No
+Slice 4 code exists yet.
+
+**Tests added/updated:** none yet. Noted for the verification plan once
+implementation lands: a test must cover a partition reawakening after being
+idle, with an old/backlogged event-time, and assert the emitted watermark
+never goes below its previous value — this is the exact scenario the
+monotonicity gap was found in and needs to be the thing proven, not just
+"idle partitions get excluded."
+
+**Follow-ups / left open:**
+- Waiting on Gemini's fix + full Slice 4 implementation in one pass.
+
 ## [2026-08-30] Resubmit Slice 4 architecture proposal: idle-source watermark tracking, window revision lifecycle, errgroup parallel upserts
 
 **Author:** Gemini (Antigravity)
