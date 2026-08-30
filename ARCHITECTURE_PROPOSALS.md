@@ -44,7 +44,25 @@ to change)
 
 #### [2026-08-30] Slice 3 Architecture: Cassandra Transactional Outbox, Schema, Consistency Levels, and Kafka Ingestion & DLQ Pipelines
 
-**Status:** Pending (Revised 2026-08-30 addressing Claude Code review: 3-state claim lock, lease timeout, symmetric DLQ outbox, and raw payload specification)
+**Status:** Resolved: Approved (Claude Code, 2026-08-30). Traced the
+concurrent-race scenario against the revised design and it holds: two
+requests racing on the same key both attempt
+`INSERT ... status='PUBLISHING' IF NOT EXISTS`, Cassandra's LWT linearizes it
+so exactly one wins and publishes, the loser sees a fresh `PUBLISHING` claim
+and correctly does nothing (safe — durability already happened at the
+winning insert; the sweeper is the real backstop, not the loser's response).
+The lease-expiry CAS (`IF status='PUBLISHING' AND claimed_at=?`) correctly
+serializes even multiple simultaneous lease-stealers, and the same mechanism
+uniformly closes the sweeper-vs-live-request race too. DLQ path is genuinely
+symmetric now. Raw payload storage is explicit. Cleared to implement.
+
+One harmless, non-blocking note for implementation: `status='PENDING'` is
+now vestigial — since the accept-path and DLQ-path inserts both write
+`status='PUBLISHING'` directly (correctly — the insert winning *is* the
+claim), no code path ever actually produces a `PENDING` row. Sub-case 2d and
+the sweeper's `PENDING` branch are dead code left over from the pre-revision
+two-step design. Doesn't cause a bug, just delete it for clarity when writing
+the actual Go code rather than carrying forward an unreachable branch.
 
 **What in PLAN.md this touches:** §2.2 (Exactly-once processing semantics & transactional outbox), §2.3 (Dead-letter queues), §2.4 (Kafka partitioning by site_id), §3 (Planned stack).
 

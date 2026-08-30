@@ -113,28 +113,43 @@ enforced with an application-level idempotency key.
   pipeline.
 
 **Resolved 2026-08-29 — dedup store:** Cassandra, via a lightweight-transaction
-insert (`INSERT ... IF NOT EXISTS`) into a `processed_idempotency_keys` table.
-Chosen over Redis+TTL because a TTL risks re-processing a duplicate that arrives
-after a very long site outage — exactly the partition scenario §2.1 exists to
-tolerate — where Cassandra gives a permanent, non-expiring dedup record instead.
-Kept behind a `DedupStore` interface in case Redis is added later purely as a
-cache in front of it. Resolves former Open Question 3 — full comparison in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+insert (`INSERT ... IF NOT EXISTS`) into an `event_outbox` table. Chosen over
+Redis+TTL because a TTL risks re-processing a duplicate that arrives after a
+very long site outage — exactly the partition scenario §2.1 exists to
+tolerate — where Cassandra gives a permanent, non-expiring dedup record
+instead. Resolves former Open Question 3.
 
-**Required correctness pattern — transactional outbox, not check-then-publish:**
-the dedup-key insert and the Kafka publish must not be two independent steps with
-a crash window between them. If the LWT insert succeeds and the process then
-crashes or loses connectivity *before* publishing to Kafka, a naive
-implementation would treat every future retry of that same event as an
-already-seen duplicate and silently drop it forever — precisely the "silently
-dropped" failure mode this section exists to prevent. Instead: write the event
-(with its idempotency key and a `published: false` flag) into Cassandra in one
-statement, then have a separate, retriable step publish it to Kafka and flip
-`published: true` — so an interrupted publish is *resumable*, not lost. This
-mirrors the store-then-forward shape already used at the edge (§2.1). Any dedup
-implementation that does "insert key, then publish" as two unrelated steps
-without a resumable outbox in between does not satisfy this section and should
-be sent back for revision.
+**Resolved 2026-08-30 — transactional outbox with a claim lock, not a bare
+boolean:** the dedup-key insert and the Kafka publish must not be two
+independent steps with a crash window between them, *and* concurrent
+duplicate requests must not be able to both decide "the original crashed,
+I'll publish too." A boolean `published` flag closes the first problem but
+not the second — it can't distinguish "nobody is publishing this" from
+"someone is publishing this right now." The actual design: `event_outbox`
+carries a three-state `status` (`PUBLISHING` → `PUBLISHED`, set directly by
+the winning `INSERT ... IF NOT EXISTS` — the insert winning *is* the claim)
+plus a `claimed_at` lease timestamp. Any request that loses the insert reads
+the row: if `PUBLISHED`, no-op; if `PUBLISHING` with a fresh lease, another
+worker is actively handling it, do nothing; if `PUBLISHING` with an expired
+lease (default 30s), steal it via a compare-and-swap `UPDATE ... IF
+status='PUBLISHING' AND claimed_at=?` — only the winner of that CAS may call
+Kafka. A background sweeper (every 10s, indexed via a `pending_outbox`
+time-bucketed table to avoid scanning a low-cardinality column) applies the
+identical claim/CAS logic as the ultimate backstop, independent of whether
+the edge ever retries. The dead-letter path (§2.3) uses the exact same
+three-state pattern, symmetrically — a rejected event has the identical
+crash-window risk as an accepted one, and treating it as a special case was
+the gap that got caught in review. Both `event_outbox.payload` and
+`dead_letter_events.payload` store the *raw JSON bytes* Central Ingestion
+received, never a re-serialized Go struct, per the Slice 2 fix. Full schemas,
+CQL, and the lifecycle walkthrough are in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). An in-process
+per-key mutex may be layered on top purely to avoid redundant same-process
+Cassandra round-trips — it is never the actual correctness mechanism, since
+it wouldn't hold across a process restart or multiple instances; the
+Cassandra claim/CAS is what's authoritative. Any dedup implementation that
+uses a plain boolean instead of this claim/lease pattern does not satisfy
+this section and should be sent back for revision.
 
 **Reasoning:** A severe adverse event must never be silently dropped *or*
 duplicated, even under retries. Retries are guaranteed to happen (that's the whole
@@ -179,6 +194,23 @@ precise per-event budget — full detail and the alternatives considered in
 **Reasoning:** A single misbehaving site (bad clock, buggy client, malformed FHIR)
 must not be able to degrade ingestion for every other site, and must not silently
 lose data — DLQ entries need to be inspectable and replayable once fixed.
+
+**Resolved 2026-08-30 — DLQ durability uses the same claim/lease outbox
+pattern as §2.2, not a simpler one-shot write.** A rejected event has the
+identical crash-window risk as an accepted one: a naive "write to Cassandra,
+then publish to the Kafka DLQ topic" as two independent steps could crash
+between them and leave the rejection unrecoverable, silently defeating the
+"never lose data" guarantee this section exists to provide — it would just be
+the same bug relocated to the rejection path. `dead_letter_events` mirrors
+`event_outbox`'s exact schema shape (three-state `status`, `claimed_at`
+lease, raw JSON `payload`): the insert on rejection writes `status='PUBLISHING'`
+directly (the insert winning is the claim), a Kafka publish to
+`pharos.events.dlq` (partitioned by `site_id`) follows, and only after that
+succeeds does `status` flip to `PUBLISHED` — with the same background sweeper
+and lease-expiry CAS as the accept path as the resumption backstop. Central
+Ingestion only responds 422/207 to the edge after the Cassandra write
+durably succeeds. Full schema and lifecycle in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 
 **Resolved 2026-08-29 — payload schema:** rather than implementing the full FHIR
 R4 `AdverseEvent` resource (large, mostly irrelevant regulatory sub-fields for

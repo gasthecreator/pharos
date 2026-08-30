@@ -40,6 +40,70 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code approves revised Slice 3 proposal; cleared to implement
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's revised Slice 3 proposal against the required fix
+from the prior review round. Read the full revised proposal text directly
+from `ARCHITECTURE_PROPOSALS.md`, then manually traced the concurrent-race
+scenario through the new design to verify the fix actually holds rather than
+just checking that a `status` column was added. Approved — cleared Gemini to
+begin implementation.
+
+**Why/How:** Confirmed the fix closes the race: two requests for the same
+idempotency key both attempt `INSERT ... status='PUBLISHING' IF NOT EXISTS`;
+Cassandra's LWT linearizes it so exactly one wins and proceeds to publish,
+the loser reads a fresh `PUBLISHING` claim and correctly does nothing (this
+is safe because durability was already achieved at the winning insert — the
+sweeper is the real backstop, not the loser's HTTP response). Verified the
+lease-expiry compare-and-swap (`IF status='PUBLISHING' AND claimed_at=?`)
+correctly serializes even when multiple actors (concurrent requests, the
+sweeper) simultaneously try to steal the same expired lease — only one CAS
+can match the exact stale `claimed_at` value. Confirmed the DLQ path now
+mirrors this exactly (previously it had the identical unaddressed
+crash-window gap, just relocated to the rejection path) and that both
+`payload` columns are explicitly specified as raw JSON bytes, not
+re-serialized structs.
+
+Found one harmless, non-blocking issue: `status='PENDING'` is now vestigial
+— since both the accept-path and DLQ-path inserts write `status='PUBLISHING'`
+directly (correctly, since winning the insert *is* the claim), no code path
+actually ever produces a `PENDING` row. Sub-case 2d and the sweeper's
+`PENDING` branch are dead code left over from the pre-revision two-step
+design. Doesn't cause a bug — flagged for deletion when the Go code gets
+written rather than blocking approval on it.
+
+Folded the finalized design into `PLAN.md` §2.2 (replacing the boolean-flag
+description with the claim/lease pattern) and §2.3 (DLQ now explicitly uses
+the same pattern, not a simpler one-shot write).
+
+**Files/modules touched:** `PLAN.md` (§2.2, §2.3), `ARCHITECTURE_PROPOSALS.md`
+(entry marked resolved), `WORKLOG.md`. No Slice 3 code exists yet.
+
+**Tests added/updated:** none — proposal review only. Verification plan in
+the approved proposal already requires the concurrent-race test to assert
+exactly one Kafka publish occurred, not just one `applied == true`, plus a
+new stale-lease-reclamation test — both correctly scoped for what actually
+needs proving.
+
+**Follow-ups / left open:**
+- Gemini cleared to implement Slice 3 against the approved design.
+- Delete the vestigial `PENDING` branches when writing the Go code.
+- Separately: while reviewing this round, traced a `git reset --hard
+  origin/main` Gemini ran mid-session back through the reflog — it was a
+  self-correction after an accidental `git pull origin
+  feat/slice-3-cassandra-outbox-kafka` while sitting on `main` (left checked
+  out from Claude's prior session) fast-forwarded local `main` ahead of
+  `origin/main`. No commits were lost — everything stayed reachable via the
+  feature branch throughout, confirmed via reflog and by diffing `main`
+  against `origin/main` after the fact (identical). No corrective action
+  needed, but worth naming as a process risk: this repo's local checkout is
+  shared between Gemini and Claude Code sessions, so whichever branch is
+  currently checked out is whatever the *previous* session left behind —
+  both should verify `git branch --show-current` before assuming which
+  branch they're on, especially before any pull/reset/checkout.
+
 ## [2026-08-30] Slice 3 architecture revised: 3-state claim lock (PENDING/PUBLISHING/PUBLISHED), lease timeout, symmetric DLQ outbox, and raw payload storage
 
 **Author:** Gemini (Antigravity)
