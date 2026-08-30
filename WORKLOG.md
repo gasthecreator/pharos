@@ -40,6 +40,52 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code: Phase 2 scoped into slices 6-13; overnight kickoff
+
+**Author:** Claude Code
+
+**What:** Broke Phase 2's gap list (already recorded in PLAN.md's roadmap
+section) into eight sequenced, individually-reviewable slices (6 through
+13 — observability, multi-node Cassandra/Kafka, auth/TLS, load testing,
+deployment automation, backup/DR, multi-instance scaling, access-audit
+logging) and added them to `PLAN.md`. Resolved one concrete Slice 7
+decision ahead of time (3-node Cassandra at RF 3, 3-broker Kafka, both
+`LOCAL_QUORUM` reads/writes) so it wouldn't need a real-time review
+round-trip overnight. Kicked off Slice 6 (observability) as a background
+build task and prepared a Slice 7 kickoff prompt for Gideon to hand to
+Gemini if he chooses to run it overnight too.
+
+**Why:** Gideon wants to sleep but wants Phase 2 progress to happen while
+he's away. He's not able to relay Gemini transcripts to Claude Code for
+review while asleep, and there's no way for Claude Code to drive
+Antigravity directly — so the only mechanism Claude Code actually controls
+for guaranteed overnight progress is doing a well-scoped slice itself, on
+a feature branch, PR-only, same as every other slice. Slice 6 was chosen
+because it's additive (doesn't touch existing correctness-critical logic),
+self-contained, and closes the one item Phase 1 explicitly left open.
+
+**How:** Spawned a background agent with a self-contained prompt: read
+PLAN.md's Slice 6 spec, implement it end to end (Prometheus instrumentation
+across all three services, Grafana in docker-compose, a starter dashboard),
+verify against the real running stack, write its own WORKLOG.md entry, open
+a PR, and stop — no merge, per the standing branch discipline in §6.
+
+**Files/modules touched:** `PLAN.md` (Phase 2 slice breakdown). Slice 6's
+actual file changes will be logged in that work's own WORKLOG.md entry when
+it lands.
+
+**Tests added/updated:** None in this entry — this is scoping, not
+implementation.
+
+**Follow-ups / left open:** Slice 8 (auth/TLS) is deliberately flagged in
+PLAN.md as needing a real proposal-review round-trip before implementation,
+not a decision to make unattended. Node-failure fault-injection tests for
+Slice 7 (kill a Cassandra node / Kafka broker mid-write) are Claude's to add
+once the multi-node infra exists, not Gemini's — consistent with §6's
+existing division of labor.
+
+---
+
 ## [2026-08-30] Claude Code: Phase 1 portfolio-readiness — README, demo script, Makefile fix
 
 **Author:** Claude Code

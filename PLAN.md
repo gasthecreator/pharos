@@ -76,6 +76,93 @@ Don't let Phase 2 quietly bleed into Phase 1's scope, and don't let Phase 1's
 speed be read as evidence Phase 2 will be equally fast — it won't be, and
 that's expected, not a problem to solve.
 
+### Phase 2 slice breakdown, scoped 2026-08-30
+
+Sequenced so each slice is reviewable on its own and later slices can lean on
+earlier ones (observability before load testing, multi-node infra before
+scaling/backup-restore drills). Each slice follows the exact same discipline
+as Slices 1-5: feature branch, PR, WORKLOG.md entry, and anything not already
+resolved here goes through ARCHITECTURE_PROPOSALS.md before implementation —
+Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
+
+- **Slice 6 — Observability & metrics.** Closes the one item Phase 1 left
+  open. Instrument `pharos-ingestion`, `pharos-consumer`, and `pharos-edge`
+  with Prometheus (`prometheus/client_golang`), expose `/metrics` on each
+  (ingestion/edge already run an HTTP server; consumer needs a small one
+  added for this). Minimum metric set, matching what §4's checklist already
+  named: request count/latency by status code, rate-limit rejections,
+  validation failures, dedup claim-hit rate (existing vs. new key), outbox/DLQ
+  publish latency, consumer lag per partition, watermark value, late-arrival
+  count, Cassandra write latency/errors, edge queue depth (pending SQLite
+  rows) and forwarder attempt/success/failure counts. Add Prometheus +
+  Grafana to `docker-compose.yml` (self-hosted, Apache 2.0 / AGPL-with-free-
+  tier respectively — confirm no licensing surprise before wiring in, same
+  diligence as the original Cassandra-vs-cost check) with a scrape config and
+  a starter dashboard. Update this file's §4 checklist and the README once
+  real metrics are flowing — verified against the live `/metrics` endpoints
+  and a real Grafana panel, not just "the code compiles."
+
+- **Slice 7 — Multi-node Cassandra + Kafka.** Every service has only ever run
+  against a single-container Cassandra (RF=1) and a single Kafka broker —
+  this slice is what actually proves the "distributed" in this project's
+  premise. **Resolved 2026-08-30 — target topology:** 3-node Cassandra
+  cluster via `docker-compose`, keyspace replication factor 3, application
+  consistency level `LOCAL_QUORUM` for both reads and writes on every table
+  (the existing LWT claim/lease CAS operations already use Cassandra's serial
+  consistency internally and don't need to change — this only affects the
+  plain reads/writes around them). 3-broker Kafka cluster, still KRaft mode
+  (no ZooKeeper), topic replication factor 3, `min.insync.replicas=2`.
+  `gocql`/`kafka-go` client configs need multiple contact points/broker
+  addresses. Full existing test suite (including `pkg/faultinjection`) must
+  pass unchanged against the multi-node setup before this slice is done —
+  that's the actual proof, not a new feature. **New node-failure
+  fault-injection scenarios (kill one Cassandra node or one Kafka broker
+  mid-write, verify no data loss/duplication) are Claude's to add afterward,
+  per §6 — this slice delivers the multi-node infra and confirms the
+  existing suite survives it, not new fault-injection tests.**
+
+- **Slice 8 — Auth & TLS.** Nothing in this system authenticates or encrypts
+  anything today — any process that can reach the HTTP ports can submit or
+  read adverse event data, which is disqualifying for anything claiming
+  production-readiness with clinical data. Needs a proposal in
+  ARCHITECTURE_PROPOSALS.md before implementation (genuinely open: per-site
+  API keys vs. mTLS for edge→ingestion; TLS termination approach for
+  Cassandra/Kafka inter-node and client traffic) — this is exactly the kind
+  of decision that shouldn't get made unattended overnight, so treat it as
+  requiring review before building, not skippable.
+
+- **Slice 9 — Load testing.** Needs Slice 7 (multi-node) to produce numbers
+  worth trusting. `k6` or `vegeta` scripts simulating realistic multi-site
+  submission volume; establish baseline throughput/latency numbers under
+  normal operation and under one site producing a burst; identify the actual
+  bottleneck rather than assuming one.
+
+- **Slice 10 — Deployment automation.** Kubernetes manifests or an
+  equivalent IaC approach for every service, health/readiness probes wired
+  to the metrics from Slice 6, basic CI image build.
+
+- **Slice 11 — Backup & disaster recovery.** Cassandra snapshot/restore
+  procedure for the multi-node cluster from Slice 7, an actual tested
+  restore drill (not just a documented procedure that's never been run), and
+  a stated RPO/RTO.
+
+- **Slice 12 — Multi-instance scaling.** Run 2+ `pharos-ingestion` instances
+  behind a load balancer (this is what the rate limiter's already-pluggable
+  interface from §2.3 exists for — swap in the Redis-backed implementation
+  here, don't build a new one), and 2+ `pharos-consumer` instances, verifying
+  Kafka consumer-group rebalancing actually works correctly with this
+  project's watermark tracking.
+
+- **Slice 13 — Compliance / access-audit logging.** Who queried what,
+  building on the existing `LateArrivalAudit` pattern from §2.4 rather than
+  inventing a second audit mechanism.
+
+This is genuinely weeks of work sequenced across many sessions — nobody
+should expect Phase 2 to close in a day the way Phase 1's core challenges
+did, and no single slice above should be treated as "finished" until it's
+been reviewed and verified against real infrastructure the same way every
+Phase 1 slice was.
+
 ---
 
 ## 2. Core engineering challenges (design decisions)
