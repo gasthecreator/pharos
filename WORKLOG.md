@@ -81,6 +81,51 @@ especially for anything touching partition handling, dedup, or ordering)
 **Follow-ups / left open:**
 - Slice 3: Central Ingestion Kafka publishing, Dead-Letter Queue (DLQ) topic routing for rejected events, and Cassandra transactional-outbox dedup path (§2.2).
 
+## [2026-08-29] Branch/PR workflow adopted; two Slice 2 proposals reviewed and approved; a file-corruption fix
+
+**Author:** Claude Code
+
+**What:** Gideon asked whether Slice 1 was pushed straight to `main` (it was —
+all three commits so far). That surfaced a standing preference from another
+project (never commit to `main` directly, always feature branches + PR
+review) that hadn't been applied here. Asked Gideon directly rather than
+assuming either way, since the original reason for that rule (a specific
+teammate reviewing PRs) doesn't automatically transfer to a solo project.
+Gideon chose to adopt branches + PRs for Pharos too. Folded into `PLAN.md` §6.
+
+Also reviewed two new proposals Gemini had written to `ARCHITECTURE_PROPOSALS.md`
+in the meantime — a per-site in-memory token-bucket rate limiter (pluggable
+for Redis later) and an exponential-backoff-with-full-jitter formula for the
+edge forwarder, with concrete parameters. Both approved as-is and folded into
+`PLAN.md` §2.1 and §2.3/§3 — good proposals, and correctly written up as
+proposals rather than guessed silently, which is exactly the process working
+as intended.
+
+While reading the file, found that the "Clarify Ingress Topology" proposal's
+own header line had gone missing — its `**Status:**` line was left floating
+with no preceding `## [date] title` line, most likely lost when the two new
+entries were prepended above it. Restored the header from the earlier
+(already-approved) version of that entry.
+
+**Why:** Consistency of process documentation matters as much as the code
+here — a broken header makes an already-resolved decision look unresolved or
+orphaned to the next reader (human or Gemini), and this file only works as a
+system-of-record if entries stay structurally intact.
+
+**How:** Direct edits to `ARCHITECTURE_PROPOSALS.md` (status updates on 2
+entries, header restoration on 1) and `PLAN.md` (§2.1 retry/backoff
+parameters, §2.3 + §3 rate limiter design, §6 branch workflow).
+
+**Files/modules touched:** `PLAN.md`, `ARCHITECTURE_PROPOSALS.md`.
+
+**Tests added/updated:** none — process/documentation only.
+
+**Follow-ups / left open:**
+- Everything from this point forward (including whatever lands this entry)
+  should go out on a branch + PR, not straight to `main`.
+- Gemini should build Slice 2 against the now-resolved rate-limiter and
+  backoff parameters in `PLAN.md` §2.1/§2.3, not the original proposal text.
+
 ## [2026-08-29] Claude Code review of Slice 1: fixed edge-side validation conflicting with PLAN.md §2.3
 
 **Author:** Claude Code

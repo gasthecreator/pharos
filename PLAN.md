@@ -85,6 +85,16 @@ forwards queued batches to the Central Ingestion service over an HTTPS API
 (`POST /api/v1/events`) with retry/backoff; Central Ingestion is the only thing
 that writes to Kafka.
 
+**Resolved 2026-08-29 — retry/backoff formula:** Exponential Backoff with Full
+Jitter: `backoff = random_between(0, min(MaxBackoff, BaseBackoff * 2^attempts))`,
+with `BaseBackoff=500ms`, `MaxBackoff=30s`, `BatchSize=50`, `PollInterval=1s`
+(when the queue is empty), `RequestTimeout=5s`. On HTTP 429 the forwarder
+respects a `Retry-After` header if present (clamped 1s–60s); on timeouts,
+connection refused, or 5xx it backs off per the formula above. Full Jitter
+(not plain exponential backoff) specifically to avoid every site's retries
+synchronizing into a thundering herd when Central Ingestion recovers from an
+outage. Full detail in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+
 ### 2.2 Exactly-once processing semantics
 
 **Decision:** Exactly-once is *not* delivered by Kafka transactions alone — those
@@ -145,9 +155,16 @@ Malformed/out-of-spec payloads are routed to a Kafka dead-letter topic with
 structured failure metadata (which validation rule failed, raw payload, site,
 timestamp) rather than being dropped or blocking the pipeline.
 
-Rate limiting is per-site (token bucket), enforced at the central ingestion
-service, backed by a shared store (Redis, most likely) since ingestion runs as
-multiple instances behind a load balancer.
+**Resolved 2026-08-29 — rate limiter:** per-site token bucket behind a Go
+`RateLimiter` interface, starting with an in-memory implementation (default
+100-token capacity/burst, 10 tokens/sec refill) since Central Ingestion runs as
+a single instance for now. Exhaustion returns HTTP 429 with `Retry-After`,
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` headers —
+the edge forwarder's backoff (§2.1) is designed to respect `Retry-After`
+directly. The interface is kept pluggable so a Redis-backed distributed token
+bucket can be swapped in without changing callers once Central Ingestion
+actually runs multiple replicas behind a load balancer — no reason to pay that
+resource/complexity cost before it's needed.
 
 **Reasoning:** A single misbehaving site (bad clock, buggy client, malformed FHIR)
 must not be able to degrade ingestion for every other site, and must not silently
@@ -196,7 +213,7 @@ ingestion time for operational monitoring, and they are not interchangeable.
 | Event backbone | Apache Kafka | fairly confident fit |
 | Primary storage | Apache Cassandra, self-hosted via Docker | **resolved 2026-08-28 — see §5.1** |
 | Dedup store | Cassandra (LWT insert + transactional outbox to Kafka) | resolved 2026-08-29 — see §2.2 |
-| Rate limiter backing store | Redis (leading candidate) | not yet validated |
+| Rate limiter backing store | In-memory token bucket (Go interface, Redis-pluggable later) | resolved 2026-08-29 — see §2.3 |
 
 Go vs Rust: no strong reason yet to reach for Rust's stricter guarantees over Go's
 simplicity for this scope. Revisit only if a specific component turns out to need
@@ -273,6 +290,12 @@ lands — do not mark anything done based on a plan or a stub.
   fault-injection tests for partition/duplicate/out-of-order scenarios — this is
   Claude's primary hands-on-code responsibility), and reviewing Antigravity's
   output against this file and the four challenges in §2.
+- **All work happens on feature branches (`feat/`, `fix/`), never committed
+  straight to `main`.** Gemini/Gideon push a branch; Claude Code reviews the
+  diff (same as it reviews proposals and does spot-check code review); Gideon
+  merges via PR. Resolved 2026-08-29 — the first three commits on this repo
+  went straight to `main` before this was decided; that's not being rewritten,
+  but everything from here forward uses branches.
 - **This file (`PLAN.md`) is not edited directly by Antigravity/Gemini.** If
   building surfaces a reason to deviate from or extend what's recorded here,
   Gemini writes the proposal into [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md)

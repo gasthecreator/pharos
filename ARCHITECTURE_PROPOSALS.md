@@ -44,6 +44,56 @@ to change)
 
 ## Proposals
 
+## [2026-08-29] Central Ingestion Rate Limiter: In-Memory Token Bucket with Pluggable Interface
+
+**Status:** Resolved: Approved (Claude Code, 2026-08-29) — folded into PLAN.md
+§2.3 and §3 as-is. Starting in-memory and deferring Redis until Central
+Ingestion actually runs multiple replicas is the right call — no reason to pay
+that resource cost before it's needed. No changes required.
+
+**What in PLAN.md this touches:** §2.3 (Rate limiting and dead-letter queues), §3 (Rate limiter backing store).
+
+**What I'm proposing:** Implement per-site rate limiting at Central Ingestion using a thread-safe token bucket algorithm behind a Go `RateLimiter` interface. For local dev and test execution (consistent with the zero-cloud-spend constraint), default to an in-memory token bucket implementation (`pkg/ratelimit`) parameterized per site with configurable capacity/burst (default: 100 tokens) and refill rate (default: 10 tokens/sec). When exhausted, Central Ingestion returns HTTP 429 (Too Many Requests) with standard headers: `Retry-After: <seconds>`, `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`. The interface allows swapping in a Redis-backed distributed token bucket (via Lua script) when Central Ingestion scales to multiple instances.
+
+**Why:** PLAN.md §3 listed Redis as "not yet validated", and Open Question 3 previously avoided an immediate Redis dependency to keep local resource usage lean. An interface-driven token bucket allows full testability of burst behavior, per-site isolation, and 429 backoff semantics without forcing a Redis container to run during initial slices.
+
+**Alternatives considered:**
+1. Hard-requiring Redis via Docker Compose immediately: Increases memory footprint and test complexity for Slice 2, though it will be necessary if Central Ingestion runs multiple replicas behind a load balancer.
+2. Leaky bucket algorithm: Token bucket is preferred because it permits natural bursts of adverse event reports from sites while bounding sustained load.
+
+**Impact if approved:** Formalizes the rate-limiting interface, default capacity/refill parameters, and HTTP 429 response headers in §2.3.
+
+---
+
+## [2026-08-29] Edge Forwarder Retry and Exponential Backoff with Full Jitter
+
+**Status:** Resolved: Approved (Claude Code, 2026-08-29) — folded into PLAN.md
+§2.1 as-is. Full Jitter is the right call to avoid synchronized retry storms
+when Central Ingestion recovers from an outage; parameters are reasonable
+defaults. No changes required.
+
+**What in PLAN.md this touches:** §2.1 (Network partition tolerance), §2.3 (Rate limiting response).
+
+**What I'm proposing:** Formalize the edge forwarder retry/backoff algorithm as Exponential Backoff with Full Jitter:
+`backoff = random_between(0, min(MaxBackoff, BaseBackoff * 2^attempts))`
+With standard parameters:
+- `BaseBackoff`: 500ms
+- `MaxBackoff`: 30s
+- `BatchSize`: 50 events
+- `PollInterval`: 1s (when queue has no pending items)
+- `RequestTimeout`: 5s
+When receiving HTTP 429, the forwarder respects the `Retry-After` header if present (clamped to 1s–60s); on network timeouts, connection refused, or HTTP 5xx, it increments the attempt count and schedules `next_retry_at = now + backoff`.
+
+**Why:** PLAN.md §2.1 specifies "with retry/backoff, and is allowed to lag indefinitely without data loss", but left the exact backoff formula and parameters unspecified. Standard exponential backoff without jitter causes synchronized "thundering herd" retry waves across trial sites when Central Ingestion recovers from an outage. Full Jitter spreads retry traffic uniformly across the backoff window.
+
+**Alternatives considered:**
+1. Constant retry interval: Simpler, but overloads a recovering central service and fails to scale back during multi-day network partitions.
+2. Equal Jitter or Decorrelated Jitter: Full Jitter provides optimal desynchronization with low average latency for client retries (supported by AWS Architecture research).
+
+**Impact if approved:** Standardizes forwarder parameters and resilience behavior in §2.1.
+
+---
+
 ## [2026-08-29] Clarify Ingress Topology: Edge forwards to Central Ingestion API, not direct Kafka over WAN
 
 **Status:** Resolved: Approved (Claude Code, 2026-08-29) — folded into PLAN.md §2.1
