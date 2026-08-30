@@ -343,30 +343,33 @@ lands — do not mark anything done based on a plan or a stub.
 - [x] Edge collector: forwarding to Central Ingestion API with retry/backoff — Slice 2
 - [x] Idempotency key generation (client-side, at capture time) — Slice 1
 - [x] Central ingestion service: HTTP intake (`POST /api/v1/events`) — Slice 2
-- [ ] Dead-letter topic + DLQ inspection tooling — persistence in Cassandra
+- [x] Dead-letter topic + DLQ inspection tooling — persistence in Cassandra
       `dead_letter_events` + Kafka `pharos.events.dlq` (Slice 3) and CLI
       inspection tooling (Slice 5: `cmd/pharos-cli dlq list/get` and
-      `pkg/query.Service`) both work and are verified against real Cassandra
-      with actual validation failure details. Not checking this off yet:
-      Slice 5's site-lookup uses a Cassandra secondary index, which
-      contradicts the partition-key-first modeling principle §2.4 already
-      established for the canonical tables one slice ago — sent back for a
-      proper `dead_letter_events_by_site` table instead. See
-      [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+      `pkg/query.Service`), verified against real Cassandra with actual
+      validation failure details. Site-scoped lookups go through a dedicated
+      `dead_letter_events_by_site` table (partition-key-first, matching
+      `events_by_site`'s pattern) rather than a secondary index — the first
+      draft used an index, which contradicted this project's own established
+      Cassandra modeling principle; caught in review and replaced. Confirmed
+      directly against the live cluster that the index is gone and the table
+      is correctly structured, not just by re-reading the migration file.
 - [x] Per-site rate limiting — Slice 2
 - [x] Dedup store: Cassandra LWT + transactional outbox to Kafka (§2.2) — Slice 3,
       verified against a real Cassandra cluster and a real Kafka broker, not just mocks
-- [ ] Kafka topic design (partitioning strategy, retention) — partitioning by
-      `site_id` done and verified (Slice 3). Retention policy is *decided*
-      (Slice 5: 7 days / 10GB for `pharos.events.adverse`, grounded in FDA
-      21 CFR 312.32(c)(2) expedited safety reporting; 14 days / 5GB for
-      `pharos.events.dlq`) but not yet checked off — verified directly
-      against the real broker (`kafka-configs.sh --describe`) that it was
-      only defined as unused Go constants in `pkg/kafka/topics.go`, never
-      actually applied to the running topics. Sent back to apply it for
-      real via an `EnsureTopics()`-style bootstrap, matching how Cassandra
-      schema already gets ensured on connect. See
-      [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+- [x] Kafka topic design (partitioning strategy, retention) — partitioning by
+      `site_id` done and verified (Slice 3). Retention (7 days / 10GB for
+      `pharos.events.adverse`, grounded in FDA 21 CFR 312.32(c)(2) expedited
+      safety reporting; 14 days / 5GB for `pharos.events.dlq`) is enforced by
+      an `EnsureTopics()` bootstrap in `pkg/kafka/topics.go`, mirroring how
+      Cassandra schema already gets ensured on connect, called from
+      `cmd/pharos-ingestion` and `cmd/pharos-consumer` startup. The first
+      draft only defined the values as unused Go constants without ever
+      applying them — caught by checking the real broker directly
+      (`kafka-configs.sh --describe` showed zero dynamic configs), not by
+      re-reading the source. Confirmed independently after the fix that both
+      topics now genuinely carry the configured `retention.ms`/
+      `retention.bytes` on the live cluster.
 - [x] Cassandra schema design — Slice 3 outbox tables (`event_outbox`,
       `dead_letter_events`, `pending_outbox`) + Slice 4 canonical query tables
       (`canonical_events`, `events_by_study`, `events_by_site`), all verified

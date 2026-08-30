@@ -44,15 +44,41 @@ to change)
 
 #### [2026-08-30] Slice 5 Architecture: Query Surface (CLI & Service), DLQ Inspection, and Kafka Topic Retention Policies
 
-**Status:** Requires revision (Claude Code, 2026-08-30) — do not merge yet.
-The query CLI and `pkg/query.Service` design is approved as-is — genuinely
-useful, and the real-infra DLQ test that submits an actually-invalid FHIR
-payload through the real handler and reads back the real rejection reason
-("actuality must be 'actual': got \"invalid_not_actual\"") is exactly the
-right way to prove this, not a happy-path fixture. Two required fixes below,
-both the same pattern: something claimed done that isn't actually true when
-checked against reality, which is exactly the standard every prior slice in
-this project has been held to.
+**Status:** Resolved: Approved (Claude Code, 2026-08-30). Both required fixes
+verified independently against real infrastructure — not by re-reading the
+Go source, but by actually checking the systems themselves, matching how
+this finding was originally caught:
+- `docker exec pharos-cassandra cqlsh` confirms `dead_letter_events_by_site`
+  exists with correct partition-key-first design, and that the old
+  `dead_letter_site_idx` secondary index is genuinely gone ("Table for
+  existing index ... not found").
+- `kafka-configs.sh --describe` against the live broker confirms
+  `retention.ms=604800000` / `retention.bytes=10737418240` on
+  `pharos.events.adverse` and `retention.ms=1209600000` /
+  `retention.bytes=5368709120` on `pharos.events.dlq` — genuinely applied,
+  not just documented.
+
+Read the actual diff for the write-path change (`InsertDLQClaim`,
+`MarkDLQPublished` in `pkg/dedup/cassandra_store.go`) rather than trusting
+the summary: both the `dead_letter_events` and `dead_letter_events_by_site`
+inserts correctly share the same `now` value for `rejected_at` within a
+single `InsertDLQClaim` call, so `MarkDLQPublished`'s later `UPDATE` (keyed
+on the immutable `site_id`+`rejected_at`+`idempotency_key` primary key, not
+on the mutable `claimed_at`/`status`) correctly finds and updates the
+by-site row regardless of what happens in between — the timestamp-mismatch
+failure mode this diff shape could easily have introduced does not occur.
+
+One minor, non-blocking observation: the lease-steal branch (a stale DLQ
+claim being reclaimed after its original claimant crashed) only updates
+`dead_letter_events`, not `dead_letter_events_by_site` — so the by-site
+table's `claimed_at`/`status` can be momentarily stale until the eventual
+`MarkDLQPublished` call converges both tables. Doesn't violate any
+correctness guarantee (the identifying data stays accurate throughout, and
+final state always converges correctly) — just a narrow cosmetic staleness
+window for an operator browsing at exactly the wrong instant. Not required,
+worth a follow-up if this table sees real operational use.
+
+Original findings below, both fixed:
 
 **Required fix 1 — the DLQ secondary index contradicts this project's own
 established Cassandra modeling principle.** Slice 4 explicitly reasoned
