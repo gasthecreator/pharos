@@ -40,6 +40,382 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code approves Slice 4; merging into main
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's fix for the audit-trail duplication gap. Pulled
+the branch, confirmed no header corruption, ran the full suite myself
+(`go vet` clean, `-race` clean across all 7 packages, real Cassandra/Kafka
+integration tests genuinely passing), and read the actual diff rather than
+trusting the summary. Confirmed correct: a `lateAuditKeys map[string]bool`
+keyed by `windowID + ":" + idempotencyKey`, checked before every append and
+set after — exactly the fix asked for, scoped precisely to the audit-append
+path without touching the status-transition logic. Independently ran
+`TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery` and confirmed
+it genuinely reproduces the failure scenario (injects a `SaveEvent` failure
+on the first attempt after the window has already flipped to `REVISED`,
+redelivers the identical message, asserts exactly one audit entry survives)
+rather than just asserting the happy path.
+
+**Why:** This closes the last open finding across all of Slice 4. Combined
+with the already-verified monotonicity fix and gated-commit correctness from
+the prior round, the consumer/canonical-store/watermark design is now
+genuinely sound end to end — including under the specific failure and
+redelivery conditions that are easy to get subtly wrong and easy to miss in
+testing (this exact bug wouldn't have shown up without deliberately
+constructing the failure-then-redeliver sequence).
+
+**How:** Folded the finalized watermarking and canonical-schema design into
+`PLAN.md` §2.4 (previously only had the original pre-Slice-4 decision text)
+and marked the long-open §5 Cassandra query-pattern question resolved — the
+two named queries did need different partition keys, exactly as flagged
+back in the original planning session, resolved with `events_by_study` and
+`events_by_site` as separate purpose-built tables rather than one schema
+serving both. Updated the §4 checklist: Cassandra schema design and stream
+processing layer both now checked off with what's actually behind them.
+
+**Files/modules touched:** `PLAN.md` (§2.4, §5, §4), `WORKLOG.md`. No code
+changes by Claude this round.
+
+**Tests added/updated:** none by Claude — independently re-verified
+Gemini's new regression test plus the full existing suite.
+
+**Follow-ups / left open:**
+- Merging `feat/slice-4-consumer-ordering-canonical-store` into `main` after
+  this entry.
+- Still owed, per §6 (Claude's explicit responsibility): dedicated
+  fault-injection tests for network partition simulation and out-of-order
+  delivery.
+- DLQ inspection tooling and Kafka retention policy remain undecided
+  (unchanged from the Slice 3 follow-up list).
+- Next natural slice: something actually reads the canonical query tables
+  (an API or CLI surfacing "all events for study X in range Y" / "all events
+  from site Z" — the tables exist and are populated, but nothing queries
+  them yet beyond the integration tests).
+
+## [2026-08-30] Fix audit trail duplicate on consumer redelivery (21 CFR Part 11 idempotency)
+
+**Author:** Gemini (Antigravity)
+
+**What:** Resolved the audit-trail deduplication gap identified in Claude Code review:
+1. In `pkg/consumer/watermark.go`:
+   - Added `lateAuditKeys map[string]bool` keyed by `windowID + ":" + idempotencyKey` to `WatermarkTracker`.
+   - Introduced `appendLateAuditIfNotExistsLocked`: checks whether an audit entry already exists for that `(window, idempotencyKey)` pair before appending.
+   - When a transient Cassandra `SaveEvent` failure occurs after a window is transitioned to `REVISED`, subsequent redelivery of the uncommitted Kafka message re-evaluates the event safely without creating duplicate `LateArrivalAudit` records.
+2. In `pkg/consumer/engine_test.go`:
+   - Added `TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery`: simulates transient database error on the first `Step()` attempt after flipping a window to `REVISED`, redelivers the identical Kafka message, and asserts that exactly one `LateArrivalAudit` entry exists in the audit log.
+
+**Why:** Preserves strict electronic records compliance (21 CFR Part 11) by ensuring the audit log is strictly idempotent under message redelivery.
+
+**Files/modules touched:**
+- `pkg/consumer/watermark.go` [MODIFIED]
+- `pkg/consumer/engine_test.go` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+**Tests added/updated:**
+- `TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery`: PASS
+- Full repository test suite (`go test -count=1 -race ./...` across all 7 packages + live integration tests): ALL PASS
+
+## [2026-08-30] Claude Code review: Slice 4 implementation verified against real infra; one audit-trail idempotency gap
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's full Slice 4 implementation (commit `61faa88`) —
+a large round, built in one pass per the pre-approval from the prior review.
+Pulled the branch, independently scanned both `WORKLOG.md` and
+`ARCHITECTURE_PROPOSALS.md` for header corruption (none this round), ran the
+full suite myself (`go vet` clean, `-race` clean across all 7 packages), and
+separately confirmed the real Cassandra and Kafka integration tests actually
+pass against the live containers, not skip. Read the actual diffs for
+`watermark.go`, `engine.go`, and `canonical_store.go` rather than trusting
+the summary.
+
+Confirmed correct: the monotonicity fix genuinely holds —
+`advanceWatermarkLocked` only updates `previousEmitted` when the candidate
+is strictly after it, which I traced through the exact regression scenario
+from the prior review (partition reawakening with an older backlogged
+event-time) and it no longer regresses. The gated offset commit
+(`SaveEvent` must succeed before `CommitMessages` is ever called) is
+correctly implemented and covered by
+`TestConsumerEngine_GatedCommitOnCassandraError`, which asserts zero commits
+on an injected write failure. Per-site ordering is trivially preserved since
+`Engine.Run` is a single sequential consumption loop, not concurrent
+per-partition workers. `model.AdverseEvent.StudyID()` was added exactly as
+asked — mirrors `SiteID()`, defaults to `"UNKNOWN_STUDY"`. The parallel
+canonical-table writes use a hand-rolled `sync.WaitGroup` + buffered error
+channel rather than the literal `errgroup` package the commit message names
+— functionally equivalent and correct, just a naming inaccuracy, not worth
+a fix.
+
+**Why:** Found one real gap by tracing what happens on a Kafka redelivery.
+`Step()` calls `tracker.ProcessEvent()` — which updates the watermark *and*
+appends to the `LateArrivalAudit` trail on a `COMPLETE`→`REVISED`
+transition — *before* `SaveEvent()` and the offset commit. If `SaveEvent()`
+fails after `ProcessEvent()` already ran (an entirely ordinary transient
+Cassandra write failure, not an adversarial scenario), the offset correctly
+stays uncommitted and Kafka redelivers the same message later. On
+redelivery, `ProcessEvent()` runs again for the identical event: the window
+is already `REVISED` from the first attempt, so it falls into the
+"already-revised" branch and appends a *second, duplicate*
+`LateArrivalAudit` entry for what is actually the same real-world event.
+The canonical data itself stays correctly idempotent — this only pollutes
+the audit trail — but that's exactly the property this feature leans on 21
+CFR Part 11 reasoning to justify, so a duplicate-prone audit log undermines
+its own stated purpose.
+
+**How:** Not fixed by me — sent back to Gemini as a small, precisely-scoped
+fix rather than a full re-review, consistent with the "bigger tasks, less
+fragmentation" adjustment from earlier this session: before appending a
+`LateArrivalAudit`, check whether one already exists for the same
+`(WindowID, IdempotencyKey)` pair and skip if so. This is also just the
+semantically correct behavior independent of the redelivery angle — you
+never want two audit entries for "this event arrived late into this
+window," regardless of cause.
+
+**Files/modules touched:** `WORKLOG.md` only — review notes, no code
+changes by Claude this round.
+
+**Tests added/updated:** none by Claude — independently re-verified
+Gemini's 7 new `pkg/consumer` unit tests plus both real-infra integration
+tests genuinely pass (not skip).
+
+**Follow-ups / left open:**
+- Waiting on Gemini's audit-dedup fix. Once applied, this is mergeable —
+  no further design review needed.
+- Add a test alongside the fix: force a `SaveEvent` failure *after*
+  `ProcessEvent` has already caused a window to flip to `REVISED`, redeliver
+  the same message, and assert exactly one `LateArrivalAudit` entry exists
+  for that `(window, idempotency_key)` pair, not two.
+
+## [2026-08-30] Implement Slice 4: Kafka consumer engine, canonical query tables, monotonic watermark tracker, and E2E verification
+
+**Author:** Gemini (Antigravity)
+
+**What:** Implemented full downstream consumption pipeline closing PLAN.md §2.4 (event-time ordering and watermarking) and §5 (canonical Cassandra query schemas):
+1. **Schema Migration (`migrations/002_canonical_schema.cql`)**:
+   - `pharos.canonical_events` (PRIMARY KEY: `idempotency_key`) for full audit and point lookups.
+   - `pharos.events_by_study` (PRIMARY KEY: `((study_id), event_time, idempotency_key)` CLUSTERING: `event_time DESC, idempotency_key ASC`) serving clinical range scans ("all events for trial X in date range Y").
+   - `pharos.events_by_site` (PRIMARY KEY: `((site_id), local_seq, idempotency_key)` CLUSTERING: `local_seq DESC, idempotency_key ASC`) serving site audit and continuous sequence verification ("all events from site Z").
+2. **Canonical Store (`pkg/consumer/canonical_store.go`)**:
+   - `CassandraCanonicalStore`: Implements `CanonicalStore` with `SaveEvent` executing 3 concurrent independent idempotent upserts across the canonical tables at `LOCAL_QUORUM` (single node dev `ONE`) via parallel goroutines with coordinated error aggregation.
+   - `MemoryCanonicalStore`: Thread-safe mock implementation for unit testing without live infrastructure dependencies.
+3. **Monotonic Watermark Tracker with Idle Detection (`pkg/consumer/watermark.go`)**:
+   - Tracks $T_p$ (max event time) and $U_p$ (wall-clock last activity) per partition.
+   - Excludes partitions where `now - U_p > IdleTimeout` from candidate watermark:
+     $$W_{candidate} = \min_{p \in \text{ActivePartitions}}(T_p) - L$$
+   - Enforces strict monotonic non-decrease via $W_{new} = \max(W_{previous\_emitted}, W_{candidate})$.
+   - Manages analytical window transitions: `OPEN` -> `COMPLETE` when $W \ge \text{windowEnd}$.
+   - When late data arrives for a closed window ($t_{event} < \text{windowEnd}$), durably marks records with `is_late = true`, transitions window to `REVISED`, and records audit entries in `LateArrivalAudit` for 21 CFR Part 11 electronic records traceability.
+4. **Consumer Engine (`pkg/consumer/engine.go`)**:
+   - `Engine`: Consumes from Kafka group `pharos-canonical-sink`, unmarshals wire payload, processes through `WatermarkTracker`, executes parallel Cassandra upserts, and commits offset only after successful persistence.
+   - Preserves per-site order end-to-end via Kafka `site_id` partition keying.
+   - Consumer-side idempotency: duplicate message delivery overwrites identical primary keys with zero duplicate rows.
+5. **Standalone Consumer Binary (`cmd/pharos-consumer/main.go`)**:
+   - Provides an independently deployable worker with signal handling (`SIGINT`, `SIGTERM`), environment/flag configuration, and periodic telemetry.
+6. **Tests Added & Verified**:
+   - `pkg/consumer/watermark_test.go`:
+     - `TestWatermarkTracker_MonotonicityOnPartitionReawakening`: Proves watermark never regresses when an idle partition reawakens with older backlogged events.
+     - `TestWatermarkTracker_IdlePartitionExclusion`: Proves an idle partition does not stall global watermark progression.
+     - `TestWatermarkTracker_CompleteToRevisedLifecycle`: Proves `COMPLETE` -> `REVISED` window lifecycle and audit logging upon late arrival.
+   - `pkg/consumer/engine_test.go`:
+     - `TestConsumerEngine_IdempotentRedelivery`: Asserts redelivering duplicate message yields exactly 1 row.
+     - `TestConsumerEngine_PreservesPerSiteOrdering`: Asserts per-site sequence ordering.
+     - `TestConsumerEngine_GatedCommitOnCassandraError`: Asserts uncommitted offset on database error.
+     - `TestConsumerEngine_QueryByStudyAndDateRange`: Verifies `GetEventsByStudy` range queries.
+   - `pkg/consumer/consumer_integration_test.go`:
+     - `TestCassandraCanonicalStore_RealIntegration`: Verified against live Cassandra container on port 9042.
+     - `TestConsumerEngine_RealEndToEndKafkaAndCassandra`: Verified live end-to-end publish-consume-store loop against real Kafka (9092) and Cassandra (9042).
+
+**Why:** Fulfills all Slice 4 requirements and closes PLAN.md §2.4 and §5.
+
+**Files/modules touched:**
+- `migrations/002_canonical_schema.cql` [NEW]
+- `pkg/consumer/types.go` [NEW]
+- `pkg/consumer/watermark.go` [NEW]
+- `pkg/consumer/watermark_test.go` [NEW]
+- `pkg/consumer/canonical_store.go` [NEW]
+- `pkg/consumer/engine.go` [NEW]
+- `pkg/consumer/engine_test.go` [NEW]
+- `pkg/consumer/consumer_integration_test.go` [NEW]
+- `cmd/pharos-consumer/main.go` [NEW]
+- `pkg/model/adverse_event.go` [MODIFIED]
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+## [2026-08-30] Claude Code review: Slice 4 watermark almost there — one monotonicity gap, then cleared straight to implementation
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's revised Slice 4 proposal. Idle-partition
+detection (tracking wall-clock idle time separately from event-time
+progress) correctly closes the freezing bug from the prior round. The
+`COMPLETE`→`REVISED` window lifecycle for late-arriving data is a genuinely
+good addition — real regulatory grounding (21 CFR Part 11), not just a
+plausible-sounding label. `errgroup` parallel upserts and explicit
+`study_id` extraction both correctly address what was asked. Traced the
+watermark formula through the exact reconnection scenario the whole feature
+exists for and found one more gap: the design claims monotonic
+non-decrease but the formula doesn't actually deliver it.
+
+**Why:** Walk through it: partition A active at `T_A=100`, partition B idle
+and excluded, so `W = T_A - L`. B reconnects and delivers its backlog —
+first message has an old event-time, say `T_B=50`. Per the stated rule B
+immediately goes back to Active, so the recomputed `W = min(100,50) - L`,
+which is *lower* than what was already emitted. The watermark regresses
+exactly when a site reconnects with a backlog — the specific case
+idle-detection was built to handle. This isn't just a documentation error:
+it threatens the completeness signal itself, since a window already marked
+`COMPLETE` against the higher watermark could look inconsistent against a
+freshly recomputed lower one, undermining the audit-trail correctness the
+`REVISED` lifecycle exists to protect.
+
+**How:** Required the standard fix every real watermark generator uses for
+this exact reason (Flink included): never let the emitted watermark fall
+below what's already been emitted — `W_new = max(W_previous, candidate)`,
+wrapping the idle-aware `min()` computation. Given how close this is and how
+much back-and-forth Slice 4 has already needed, pre-approved the rest of the
+design and told Gemini to go straight to full implementation (schema
+migration, `pkg/consumer`, canonical store, consumer binary, full test
+suite) once this one fix is applied — no additional proposal-only
+round-trip. Gideon gave direct feedback this session that Gemini completes
+prompts quickly and I should be assigning larger units of work rather than
+narrowly-scoped single-issue round-trips; this is that feedback applied.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `WORKLOG.md`. No
+Slice 4 code exists yet.
+
+**Tests added/updated:** none yet. Noted for the verification plan once
+implementation lands: a test must cover a partition reawakening after being
+idle, with an old/backlogged event-time, and assert the emitted watermark
+never goes below its previous value — this is the exact scenario the
+monotonicity gap was found in and needs to be the thing proven, not just
+"idle partitions get excluded."
+
+**Follow-ups / left open:**
+- Waiting on Gemini's fix + full Slice 4 implementation in one pass.
+
+## [2026-08-30] Resubmit Slice 4 architecture proposal: idle-source watermark tracking, window revision lifecycle, errgroup parallel upserts
+
+**Author:** Gemini (Antigravity)
+
+**What:** Revised and resubmitted the Slice 4 architecture proposal in `ARCHITECTURE_PROPOSALS.md` addressing all review feedback from Claude Code:
+1. **Idle-Partition Detection in Watermark Tracking**:
+   - Separately tracks $T_p$ (max event-time) and $U_p$ (wall-clock timestamp of last consumed message) per partition.
+   - Partitions with `now - U_p > IdleTimeout` are classified as `Idle` and excluded from the global watermark computation:
+     $$W = \min_{p \in \text{ActivePartitions}}(T_p) - L$$
+     preventing a disconnected site (e.g. Nigeria or Tokyo offline for hours/days) from indefinitely stalling the global stream watermark.
+   - Immediate re-inclusion upon receiving a new message, with monotonic progression guaranteed ($W_t \ge W_{t-1}$).
+2. **Completeness Signal Lifecycle & Revision Policy**:
+   - Defined window status progression: `OPEN` -> `COMPLETE` when $W \ge \text{windowEnd}$.
+   - When a reconnected site produces late-arriving events ($t_{event} < \text{windowEnd}$), records are durably saved to Cassandra with `is_late = true`, and the window transitions to `REVISED` with a logged `LateArrivalAudit`.
+   - Adheres to 21 CFR Part 11 electronic records traceability (neither ignoring late adverse events nor silently altering historical audit records).
+3. **Cassandra Write Strategy**:
+   - Replaced CQL logged batch across the 3 tables (`canonical_events`, `events_by_study`, `events_by_site`) with parallel independent idempotent upserts managed by an `errgroup.Group` at `LOCAL_QUORUM`.
+   - Avoids coordinator batch-log replication overhead across multiple partition keys while preserving exact-once processing semantics through Kafka offset commit gating.
+4. **Study ID Extraction**:
+   - Specified deterministic extraction from `model.AdverseEvent.Study[0].Reference` with `"UNKNOWN_STUDY"` fallback.
+
+**Why:** Solves the watermark starvation bug during site network partitions and optimizes downstream Cassandra write throughput.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+**Follow-ups / left open:**
+- Awaiting Claude Code review on revised `ARCHITECTURE_PROPOSALS.md`.
+
+## [2026-08-30] Claude Code review: Slice 4 proposal sent back — watermark starves on the exact scenario this project targets
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 4 architecture proposal (Kafka consumer
+topology, three-table canonical Cassandra schema, event-time watermarking,
+consumer-side idempotency) before any code was written. Read the full
+proposal text directly from `ARCHITECTURE_PROPOSALS.md`. The consumer
+topology, the three-table schema (genuinely resolves the query-pattern
+question that's been open since the very first planning pass), and the
+decision to hand-roll a Go watermark tracker instead of pulling in Flink are
+all sound and approved as-is. Traced the watermark formula against the
+project's own central scenario and found it doesn't hold up. Marked the
+proposal "Requires revision" — not implemented yet.
+
+**Why:** The proposed formula `W = min_p(T_p) - L` takes the minimum
+observed event-time across all partitions with no way to exclude one that's
+gone silent. Walking through PLAN.md §2.1's own example — a site
+disconnected for hours or days — that partition's `T_p` freezes the moment
+the site goes offline, and because a frozen partition is still counted in
+the `min()`, the *global* watermark freezes with it, even while every other
+site's partition keeps advancing normally. The proposal's own motivating
+question ("is yesterday's clinical safety data complete across all global
+trial sites?") would answer "no, indefinitely" for the entire dataset the
+instant any single site has the exact outage this whole project exists to
+tolerate. Not an edge case — the central one.
+
+**How:** Wrote the required fix directly onto the proposal entry rather than
+just rejecting it: track wall-clock idle time per partition, separately from
+event-time progress, and exclude a partition from the watermark's `min()`
+once it's been idle past a configurable threshold — the same idle-source
+pattern Flink and Kafka Streams use for this exact problem — re-including it
+once it resumes. Also asked for explicit treatment of what happens to a
+completeness signal that was already reported while a partition was excluded
+and later catches up with a backlog of "late" events, since PLAN.md already
+requires the underlying late data to be durably flagged, but the
+*completeness signal* itself (the actual artifact clinical staff would act
+on) needs the same scrutiny.
+
+Also flagged, less severe: the proposed multi-table write uses a Cassandra
+logged batch across three *different* partition keys, a known throughput
+anti-pattern, for a guarantee (atomicity) the design doesn't actually need —
+all three writes are individually idempotent, and the consumer already
+withholds its Kafka offset commit until all three succeed, which already
+gives "retry until every table reflects it" without Cassandra's batch-log
+overhead. Recommended independent writes gated by an errgroup instead, but
+left room for Gemini to argue for keeping the batch if there's a concrete
+reason — the point is the stated rationale doesn't hold up, not that logged
+batches are never appropriate.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `WORKLOG.md`. No
+Slice 4 code exists yet — proposal-stage review only.
+
+**Tests added/updated:** none yet. Noted for when the revised proposal adds
+its verification plan: whatever test proves watermark correctness needs to
+include a scenario where one partition goes idle for longer than the lease/
+idle threshold while others keep advancing, asserting the global watermark
+continues progressing based on the active partitions rather than freezing.
+
+**Follow-ups / left open:**
+- Waiting on Gemini's revised watermark design before any Slice 4 code gets
+  written.
+- Minor clarification requested alongside the revision: how `study_id` gets
+  extracted for `events_by_study`'s partition key, given
+  `model.AdverseEvent.Study` is a list.
+
+## [2026-08-30] Propose Slice 4 architecture: Kafka consumer topology, queryable Cassandra tables, event-time watermarking, and idempotent sinks
+
+**Author:** Gemini (Antigravity)
+
+**What:** Authored and submitted Slice 4 architecture proposal in `ARCHITECTURE_PROPOSALS.md` addressing PLAN.md §2.4 and §5 (Open Question 1):
+1. Dedicated consumer binary topology (`cmd/pharos-consumer` and `pkg/consumer.Engine`) with `segmentio/kafka-go` consumer group `pharos-canonical-sink` and explicit manual offset commit.
+2. Canonical Cassandra schema design with 3 targeted tables:
+   - `pharos.canonical_events` partitioned by `(idempotency_key)` for exact point lookups and lineage tracking.
+   - `pharos.events_by_study` partitioned by `((study_id), event_time, idempotency_key)` for time-range safety queries (`WHERE study_id = ? AND event_time >= ? AND event_time <= ?`).
+   - `pharos.events_by_site` partitioned by `((site_id), local_seq, idempotency_key)` for site audit and continuous sequence verification.
+3. Event-time watermarking semantics via `pkg/consumer.WatermarkTracker` calculating global watermark $W = \min(T_p) - L$ across active per-site partitions, providing verifiable window completeness metrics and late-arrival detection for multi-timezone clinical trial streams.
+4. Consumer-side idempotency via natural CQL upsert semantics keyed by idempotency key.
+
+**Why:** Prepares the technical foundation for closing the gap between Kafka topic `pharos.events.adverse` and a durable, queryable clinical data store before implementing code.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+**Tests added/updated:**
+- None yet (proposal phase). Full test suite planned upon approval.
+
+**Follow-ups / left open:**
+- Awaiting Claude Code review on `ARCHITECTURE_PROPOSALS.md`.
+
 ## [2026-08-30] Claude Code approves Slice 3; merging into main
 
 **Author:** Claude Code

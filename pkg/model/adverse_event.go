@@ -175,6 +175,57 @@ func (ae *AdverseEvent) SiteID() string {
 	return ref
 }
 
+// StudyID extracts the trial/study ID from Study[0] reference (e.g. "ResearchStudy/STUDY-001" -> "STUDY-001").
+func (ae *AdverseEvent) StudyID() string {
+	if len(ae.Study) == 0 {
+		return "UNKNOWN_STUDY"
+	}
+	ref := strings.TrimSpace(ae.Study[0].Reference)
+	if ref == "" {
+		return "UNKNOWN_STUDY"
+	}
+	if strings.HasPrefix(ref, "ResearchStudy/") {
+		return strings.TrimPrefix(ref, "ResearchStudy/")
+	}
+	parts := strings.Split(ref, "/")
+	return parts[len(parts)-1]
+}
+
+// SeverityCode returns the normalized severity string ("mild", "moderate", "severe").
+func (ae *AdverseEvent) SeverityCode() string {
+	for _, c := range ae.Severity.Coding {
+		if code := strings.TrimSpace(c.Code); code != "" {
+			return strings.ToLower(code)
+		}
+	}
+	if text := strings.TrimSpace(ae.Severity.Text); text != "" {
+		return strings.ToLower(text)
+	}
+	return "unknown"
+}
+
+// EventCode returns the primary MedDRA or clinical event code/text.
+func (ae *AdverseEvent) EventCode() string {
+	for _, c := range ae.Event.Coding {
+		if code := strings.TrimSpace(c.Code); code != "" {
+			return code
+		}
+	}
+	if text := strings.TrimSpace(ae.Event.Text); text != "" {
+		return text
+	}
+	return "unknown"
+}
+
+// SubjectID extracts the subject ID from Subject reference (e.g. "Patient/PT-1234" -> "PT-1234").
+func (ae *AdverseEvent) SubjectID() string {
+	ref := strings.TrimSpace(ae.Subject.Reference)
+	if strings.HasPrefix(ref, "Patient/") {
+		return strings.TrimPrefix(ref, "Patient/")
+	}
+	return ref
+}
+
 // EventTimeUTC returns the observation event timestamp normalized to UTC (§2.4).
 func (ae *AdverseEvent) EventTimeUTC() time.Time {
 	return ae.Date.UTC()

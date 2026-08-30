@@ -269,6 +269,37 @@ pharmacovigilance timelines) actually have to reason about "when did this happen
 across time zones — you need event time for clinical/regulatory correctness and
 ingestion time for operational monitoring, and they are not interchangeable.
 
+**Resolved 2026-08-30 — downstream consumer and watermarking (§5 Question
+1 resolved too):** a dedicated `pharos-consumer` binary reads
+`pharos.events.adverse` (decoupling its scaling from Central Ingestion's HTTP-
+bound scaling) and writes to three purpose-built Cassandra tables:
+`canonical_events` (point lookup by `idempotency_key`), `events_by_study`
+(partitioned by `study_id`, clustered by `event_time DESC` — serves "all events
+for trial X in date range Y"), and `events_by_site` (partitioned by `site_id`,
+clustered by `local_seq DESC` — serves "all events from site Z" and verifies
+continuous per-site sequence delivery). All three writes are independent,
+idempotent upserts (every table's primary key includes `idempotency_key`), run
+in parallel, gated behind the Kafka offset commit — no Cassandra-side atomicity
+machinery needed, since a partial failure just means Kafka redelivers the whole
+write set until every table reflects it.
+
+Watermarking answers "is yesterday's clinical safety data complete across all
+global trial sites?" honestly, without pulling in Flink: `W_candidate =
+min(T_p)` over partitions active in the last `IdleTimeout` (default 10m),
+falling back to `max(T_p)` if every partition has gone idle — a partition
+excluded from the `min()` the moment it stops producing prevents one offline
+site from freezing the global watermark for everyone else, the exact
+partition-tolerance scenario §2.1 exists to handle. The emitted watermark is
+`W = max(W_previous, W_candidate)`, which — this took two review rounds to get
+right — is required precisely because a reawakened partition delivering old
+backlogged data would otherwise pull the candidate (and therefore the
+watermark) backward below what was already reported. Analytical windows
+transition `OPEN → COMPLETE` once `W` passes their end, and `COMPLETE →
+REVISED` (with an immutable, deduplicated `LateArrivalAudit` trail) if data
+arrives late for an already-closed window — matching 21 CFR Part 11's
+requirement to never silently mutate a reported result, while still never
+dropping the late data itself (`is_late: true`, always persisted).
+
 ---
 
 ## 3. Planned stack
@@ -308,10 +339,17 @@ lands — do not mark anything done based on a plan or a stub.
 - [ ] Kafka topic design (partitioning strategy, retention) — partitioning by
       `site_id` done and verified (Slice 3); retention policy not yet configured
       (running on Kafka's defaults)
-- [x] Cassandra schema design — Slice 3 (`event_outbox`, `dead_letter_events`,
-      `pending_outbox`), verified against a real cluster
-- [ ] Stream processing layer (event-time ordering / watermarking) — not started,
-      next slice
+- [x] Cassandra schema design — Slice 3 outbox tables (`event_outbox`,
+      `dead_letter_events`, `pending_outbox`) + Slice 4 canonical query tables
+      (`canonical_events`, `events_by_study`, `events_by_site`), all verified
+      against a real cluster
+- [x] Stream processing layer (event-time ordering / watermarking) — Slice 4:
+      `pkg/consumer` reads `pharos.events.adverse`, tracks per-partition
+      watermarks with idle-source exclusion and a monotonic max guard,
+      manages `OPEN`/`COMPLETE`/`REVISED` window lifecycle with a
+      deduplicated late-arrival audit trail. Verified against real
+      Cassandra/Kafka, including the exact partition-reawakening-with-
+      backlog scenario that broke the first two design attempts.
 - [ ] Fault-injection test suite (network partition simulation) — not yet a
       dedicated test; this is explicitly Claude's responsibility per §6, still owed
 - [x] Fault-injection test suite (duplicate delivery) — covered by Slice 3's
@@ -342,12 +380,12 @@ lands — do not mark anything done based on a plan or a stub.
    CQL-wire-compatible alternative, but its license changed from open-source
    (AGPL) to source-available with a 10TB free-usage cap — Cassandra's Apache 2.0
    license is unconditionally free and more universally recognized in an
-   interview context, so staying with Cassandra. Sanity-check against real
-   access patterns (§ below) is still open — the *cost* question is closed, the
-   *fit* question is not.
-   - **Still open:** actual query pattern fit (e.g., "all events for trial X in
-     date range Y" may want a different partition key than "all events from site
-     Z"). Revisit once schema + top 3-5 real queries are drafted.
+   interview context, so staying with Cassandra.
+   - **RESOLVED 2026-08-30 — query pattern fit.** The two named queries ("all
+     events for trial X in date range Y" vs. "all events from site Z") did
+     need different partition keys, exactly as flagged — resolved with two
+     separate purpose-built tables (`events_by_study`, `events_by_site`)
+     rather than forcing one schema to serve both. See §2.4.
 2. ~~Edge collector local durability mechanism.~~ **RESOLVED 2026-08-29** —
    SQLite-as-WAL. See §2.1.
 3. ~~Dedup store choice.~~ **RESOLVED 2026-08-29** — Cassandra LWT, with a
