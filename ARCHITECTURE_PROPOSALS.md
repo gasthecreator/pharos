@@ -130,10 +130,11 @@ Four interconnected architectural choices closing out the pipeline from Kafka to
      - Partition State:
        - **Active**: `now - U_p <= IdleTimeout` (default `10m` production, `30s` test).
        - **Idle**: `now - U_p > IdleTimeout`.
-     - **Watermark Formula**:
-       $$W = \begin{cases} \min_{p \in \text{ActivePartitions}}(T_p) - L & \text{if ActivePartitions} \neq \emptyset \\ \max_{p}(T_p) - L & \text{if all partitions are idle} \end{cases}$$
-       where $L$ is the bounded lateness tolerance (e.g. 15 minutes).
-     - **Re-inclusion on Awakening**: The instant partition $p$ consumes a new message, $U_p$ is updated to `now`, transitioning $p$ immediately back to **Active**. Watermark $W$ is recomputed, maintaining the stream invariant that $W$ is monotonically non-decreasing ($W_t \ge W_{t-1}$).
+     - **Watermark Formula with Monotonic Guard**:
+       $$W_{candidate} = \begin{cases} \min_{p \in \text{ActivePartitions}}(T_p) - L & \text{if ActivePartitions} \neq \emptyset \\ \max_{p}(T_p) - L & \text{if all partitions are idle} \end{cases}$$
+       $$W = \max(W_{previous\_emitted}, W_{candidate})$$
+       where $L$ is the bounded lateness tolerance (e.g. 15 minutes). The outer $\max$ wrapper guarantees that the emitted watermark never regresses, even when an idle partition reawakens with an older backlogged event time.
+     - **Re-inclusion on Awakening**: The instant partition $p$ consumes a new message, $U_p$ is updated to `now`, transitioning $p$ immediately back to **Active**. Watermark $W$ is recomputed, and because $W = \max(W_{previous\_emitted}, W_{candidate})$, $W$ is strictly monotonically non-decreasing ($W_t \ge W_{t-1}$).
    - **Completeness Signal Lifecycle & Revision Policy**:
      - *Clinical Safety Decision*: When an analytical or DSMB window $[t_1, t_2)$ satisfies $W \ge t_2$, it transitions from `OPEN` to `COMPLETE`.
      - *Late Backlog Handling*: When a disconnected site reconnects and delivers a backlog with event times $t_{event} < t_2$, the records are durably written to Cassandra and marked `is_late = true`.

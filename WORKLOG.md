@@ -40,6 +40,61 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Implement Slice 4: Kafka consumer engine, canonical query tables, monotonic watermark tracker, and E2E verification
+
+**Author:** Gemini (Antigravity)
+
+**What:** Implemented full downstream consumption pipeline closing PLAN.md §2.4 (event-time ordering and watermarking) and §5 (canonical Cassandra query schemas):
+1. **Schema Migration (`migrations/002_canonical_schema.cql`)**:
+   - `pharos.canonical_events` (PRIMARY KEY: `idempotency_key`) for full audit and point lookups.
+   - `pharos.events_by_study` (PRIMARY KEY: `((study_id), event_time, idempotency_key)` CLUSTERING: `event_time DESC, idempotency_key ASC`) serving clinical range scans ("all events for trial X in date range Y").
+   - `pharos.events_by_site` (PRIMARY KEY: `((site_id), local_seq, idempotency_key)` CLUSTERING: `local_seq DESC, idempotency_key ASC`) serving site audit and continuous sequence verification ("all events from site Z").
+2. **Canonical Store (`pkg/consumer/canonical_store.go`)**:
+   - `CassandraCanonicalStore`: Implements `CanonicalStore` with `SaveEvent` executing 3 concurrent independent idempotent upserts across the canonical tables at `LOCAL_QUORUM` (single node dev `ONE`) via parallel goroutines with coordinated error aggregation.
+   - `MemoryCanonicalStore`: Thread-safe mock implementation for unit testing without live infrastructure dependencies.
+3. **Monotonic Watermark Tracker with Idle Detection (`pkg/consumer/watermark.go`)**:
+   - Tracks $T_p$ (max event time) and $U_p$ (wall-clock last activity) per partition.
+   - Excludes partitions where `now - U_p > IdleTimeout` from candidate watermark:
+     $$W_{candidate} = \min_{p \in \text{ActivePartitions}}(T_p) - L$$
+   - Enforces strict monotonic non-decrease via $W_{new} = \max(W_{previous\_emitted}, W_{candidate})$.
+   - Manages analytical window transitions: `OPEN` -> `COMPLETE` when $W \ge \text{windowEnd}$.
+   - When late data arrives for a closed window ($t_{event} < \text{windowEnd}$), durably marks records with `is_late = true`, transitions window to `REVISED`, and records audit entries in `LateArrivalAudit` for 21 CFR Part 11 electronic records traceability.
+4. **Consumer Engine (`pkg/consumer/engine.go`)**:
+   - `Engine`: Consumes from Kafka group `pharos-canonical-sink`, unmarshals wire payload, processes through `WatermarkTracker`, executes parallel Cassandra upserts, and commits offset only after successful persistence.
+   - Preserves per-site order end-to-end via Kafka `site_id` partition keying.
+   - Consumer-side idempotency: duplicate message delivery overwrites identical primary keys with zero duplicate rows.
+5. **Standalone Consumer Binary (`cmd/pharos-consumer/main.go`)**:
+   - Provides an independently deployable worker with signal handling (`SIGINT`, `SIGTERM`), environment/flag configuration, and periodic telemetry.
+6. **Tests Added & Verified**:
+   - `pkg/consumer/watermark_test.go`:
+     - `TestWatermarkTracker_MonotonicityOnPartitionReawakening`: Proves watermark never regresses when an idle partition reawakens with older backlogged events.
+     - `TestWatermarkTracker_IdlePartitionExclusion`: Proves an idle partition does not stall global watermark progression.
+     - `TestWatermarkTracker_CompleteToRevisedLifecycle`: Proves `COMPLETE` -> `REVISED` window lifecycle and audit logging upon late arrival.
+   - `pkg/consumer/engine_test.go`:
+     - `TestConsumerEngine_IdempotentRedelivery`: Asserts redelivering duplicate message yields exactly 1 row.
+     - `TestConsumerEngine_PreservesPerSiteOrdering`: Asserts per-site sequence ordering.
+     - `TestConsumerEngine_GatedCommitOnCassandraError`: Asserts uncommitted offset on database error.
+     - `TestConsumerEngine_QueryByStudyAndDateRange`: Verifies `GetEventsByStudy` range queries.
+   - `pkg/consumer/consumer_integration_test.go`:
+     - `TestCassandraCanonicalStore_RealIntegration`: Verified against live Cassandra container on port 9042.
+     - `TestConsumerEngine_RealEndToEndKafkaAndCassandra`: Verified live end-to-end publish-consume-store loop against real Kafka (9092) and Cassandra (9042).
+
+**Why:** Fulfills all Slice 4 requirements and closes PLAN.md §2.4 and §5.
+
+**Files/modules touched:**
+- `migrations/002_canonical_schema.cql` [NEW]
+- `pkg/consumer/types.go` [NEW]
+- `pkg/consumer/watermark.go` [NEW]
+- `pkg/consumer/watermark_test.go` [NEW]
+- `pkg/consumer/canonical_store.go` [NEW]
+- `pkg/consumer/engine.go` [NEW]
+- `pkg/consumer/engine_test.go` [NEW]
+- `pkg/consumer/consumer_integration_test.go` [NEW]
+- `cmd/pharos-consumer/main.go` [NEW]
+- `pkg/model/adverse_event.go` [MODIFIED]
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
 ## [2026-08-30] Claude Code review: Slice 4 watermark almost there — one monotonicity gap, then cleared straight to implementation
 
 **Author:** Claude Code
