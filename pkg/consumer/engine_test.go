@@ -256,3 +256,78 @@ func TestConsumerEngine_QueryByStudyAndDateRange(t *testing.T) {
 		}
 	}
 }
+
+// TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery tests that if SaveEvent fails
+// after ProcessEvent transitions a window to REVISED, redelivery of the identical message
+// does NOT create a duplicate LateArrivalAudit entry (21 CFR Part 11).
+func TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemoryCanonicalStore()
+	tracker := NewWatermarkTracker(0, 10*time.Minute)
+
+	baseTime := time.Date(2026, 8, 30, 12, 0, 0, 0, time.UTC)
+	windowID := "WINDOW-TEST-1"
+	tracker.RegisterWindow(Window{
+		ID:    windowID,
+		Start: baseTime,
+		End:   baseTime.Add(1 * time.Hour), // [12:00, 13:00)
+	})
+
+	// 1. Advance watermark past 13:00 to complete the window
+	tracker.ProcessEvent(0, "INIT-1", baseTime.Add(70*time.Minute), baseTime.Add(10*time.Minute))
+	w, _ := tracker.GetWindow(windowID)
+	if w.Status != WindowStatusComplete {
+		t.Fatalf("expected window COMPLETE, got %v", w.Status)
+	}
+
+	// 2. Prepare a late-arriving event for 12:30 (< 13:00)
+	lateMsg := newTestKafkaMessage("SITE-01", 99, "STUDY-A", baseTime.Add(30*time.Minute), 500)
+
+	// Inject failure on first SaveEvent attempt
+	saveAttempt := 0
+	store.SetSaveHook(func(r *CanonicalRecord) error {
+		saveAttempt++
+		if saveAttempt == 1 {
+			return errors.New("transient database failure on first attempt")
+		}
+		return nil
+	})
+
+	// Mock reader delivering the same message twice (first attempt fails SaveEvent, second succeeds)
+	reader := &mockMessageReader{
+		messages: []kafkaGo.Message{lateMsg, lateMsg},
+	}
+
+	engine := NewEngine(reader, store, tracker, DefaultEngineConfig(nil))
+
+	// Attempt 1: Step() fails on SaveEvent
+	err1 := engine.Step(ctx)
+	if err1 == nil {
+		t.Fatalf("expected error on attempt 1, got nil")
+	}
+
+	// Verify window transitioned to REVISED and 1 audit entry was recorded
+	w, _ = tracker.GetWindow(windowID)
+	if w.Status != WindowStatusRevised {
+		t.Fatalf("expected window REVISED on attempt 1, got %v", w.Status)
+	}
+	audits1 := tracker.GetLateArrivalAudits()
+	if len(audits1) != 1 {
+		t.Fatalf("expected 1 audit entry after attempt 1, got %d", len(audits1))
+	}
+
+	// Attempt 2: Redelivered message processed successfully
+	err2 := engine.Step(ctx)
+	if err2 != nil {
+		t.Fatalf("expected attempt 2 to succeed, got %v", err2)
+	}
+
+	// CRITICAL ASSERTION: Exactly one LateArrivalAudit entry exists for this (window, idempotencyKey) pair!
+	audits2 := tracker.GetLateArrivalAudits()
+	if len(audits2) != 1 {
+		t.Fatalf("CRITICAL AUDIT DUPLICATION (21 CFR Part 11): expected exactly 1 audit entry, got %d: %+v", len(audits2), audits2)
+	}
+	if audits2[0].WindowID != windowID || audits2[0].IdempotencyKey != "SITE-01:99" {
+		t.Errorf("unexpected audit entry content: %+v", audits2[0])
+	}
+}

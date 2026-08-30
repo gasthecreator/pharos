@@ -40,6 +40,29 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Fix audit trail duplicate on consumer redelivery (21 CFR Part 11 idempotency)
+
+**Author:** Gemini (Antigravity)
+
+**What:** Resolved the audit-trail deduplication gap identified in Claude Code review:
+1. In `pkg/consumer/watermark.go`:
+   - Added `lateAuditKeys map[string]bool` keyed by `windowID + ":" + idempotencyKey` to `WatermarkTracker`.
+   - Introduced `appendLateAuditIfNotExistsLocked`: checks whether an audit entry already exists for that `(window, idempotencyKey)` pair before appending.
+   - When a transient Cassandra `SaveEvent` failure occurs after a window is transitioned to `REVISED`, subsequent redelivery of the uncommitted Kafka message re-evaluates the event safely without creating duplicate `LateArrivalAudit` records.
+2. In `pkg/consumer/engine_test.go`:
+   - Added `TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery`: simulates transient database error on the first `Step()` attempt after flipping a window to `REVISED`, redelivers the identical Kafka message, and asserts that exactly one `LateArrivalAudit` entry exists in the audit log.
+
+**Why:** Preserves strict electronic records compliance (21 CFR Part 11) by ensuring the audit log is strictly idempotent under message redelivery.
+
+**Files/modules touched:**
+- `pkg/consumer/watermark.go` [MODIFIED]
+- `pkg/consumer/engine_test.go` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+**Tests added/updated:**
+- `TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery`: PASS
+- Full repository test suite (`go test -count=1 -race ./...` across all 7 packages + live integration tests): ALL PASS
+
 ## [2026-08-30] Claude Code review: Slice 4 implementation verified against real infra; one audit-trail idempotency gap
 
 **Author:** Claude Code
