@@ -40,6 +40,56 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code: Phase 1 portfolio-readiness — README, demo script, Makefile fix
+
+**Author:** Claude Code
+
+**What:** Wrote `README.md` (the four core challenges in plain language, an
+architecture diagram, local setup, a full hands-on walkthrough, and an honest
+"what's here vs. what's next" gap list), added `scripts/demo.sh` (fully
+automated version of the same walkthrough — boots Cassandra/Kafka if needed,
+builds all four binaries, starts ingestion/consumer/edge, submits a valid
+event and a malformed one, and shows both flow through to query and DLQ
+output, then tears everything down), and fixed the `Makefile`'s `build`/
+`clean` targets, which only handled `pharos-edge`/`pharos-ingestion` and
+silently omitted `pharos-consumer`/`pharos-cli` entirely. Also added a
+"Roadmap: two phases" subsection to `PLAN.md` documenting the Phase
+1 (portfolio-ready) / Phase 2 (production hardening) split.
+
+**Why:** After Slice 5 merged, all four of PLAN.md's core distributed-systems
+challenges were implemented and fault-injection tested against real
+infrastructure, but the project had no entry point for anyone besides the
+two of us to understand or run it — the actual stated purpose of this
+project (recruiting) needs that. Gideon separately raised a fair concern
+that the whole build took about a day for something this complex, and
+asked for real production hardening — but explicitly sequenced it behind
+making the project portfolio-ready first. This work is Phase 1 only.
+
+**How:** Every command and output in the README's walkthrough was run live
+before being written down (not hypothetical) — built binaries, started all
+three services, submitted a real valid event and confirmed it queryable by
+event/site/study, submitted a malformed one and confirmed it lands in the
+DLQ with a real validation error. `scripts/demo.sh` automates that same
+sequence with health-check waits (container health, log-line polling)
+instead of fixed sleeps, and picks free ports via `lsof` rather than
+hardcoding them, since a stray unrelated process was occupying 8081 during
+manual testing.
+
+**Files/modules touched:** `README.md` (new), `scripts/demo.sh` (new),
+`Makefile`, `PLAN.md`.
+
+**Tests added/updated:** None (documentation/tooling only). Ran `go vet ./...`
+and `go test -race -count=1 ./...` after the Makefile change — both clean
+across all packages, confirming the build-target fix didn't affect anything
+that was already working.
+
+**Follow-ups / left open:** Phase 2 (production hardening) is scoped at a
+gap-list level in `PLAN.md`'s roadmap section but not yet broken into
+actionable slices — deliberately not started, per Gideon's explicit
+sequencing.
+
+---
+
 ## [2026-08-30] Claude Code approves Slice 5; merging into main
 
 **Author:** Claude Code
