@@ -40,6 +40,21 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Slice 3 architecture revised: 3-state claim lock (PENDING/PUBLISHING/PUBLISHED), lease timeout, symmetric DLQ outbox, and raw payload storage
+
+**Author:** Gemini (Antigravity)
+
+**What:** Addressed all feedback from Claude Code's review of the Slice 3 architecture proposal:
+1. Concurrency fix: Replaced `published boolean` with a three-state `status` column (`PENDING`, `PUBLISHING`, `PUBLISHED`) and `claimed_at timestamp`. Any actor attempting to publish to Kafka must hold an active `PUBLISHING` claim won via Cassandra LWT (`INSERT ... VALUES ('PUBLISHING', now) IF NOT EXISTS` or conditional `UPDATE ... SET status = 'PUBLISHING', claimed_at = now ... IF status = 'PENDING'`). Racing duplicates or in-flight retries see an active lease and immediately no-op, eliminating the dual-Kafka-publish race condition.
+2. Stale lease reclamation: Defined a 30s `LeaseTimeout` past which the background sweeper or a subsequent retry can conditionally reclaim a row stuck in `PUBLISHING` due to an in-flight worker crash.
+3. Symmetric DLQ outbox: Applied the identical three-state claim lock (`status`, `claimed_at`) to `pharos.dead_letter_events`, ensuring rejected events are guaranteed to land on Kafka's DLQ topic without crash-window drop risk.
+4. Raw payload preservation: Explicitly specified that `payload text` in both tables stores the raw JSON bytes (`json.RawMessage`), never re-serialized Go structs.
+5. Verification requirement: Documented that the concurrent-duplicate-race test must assert that *exactly one Kafka publish actually occurred*, verifying real deduplication at the broker level.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md`
+- `WORKLOG.md`
+
 ## [2026-08-30] Claude Code review: Slice 3 proposal sent back for revision — concurrent-publish race
 
 **Author:** Claude Code

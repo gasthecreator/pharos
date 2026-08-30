@@ -42,104 +42,23 @@ to change)
 
 ---
 
-## Proposals
+#### [2026-08-30] Slice 3 Architecture: Cassandra Transactional Outbox, Schema, Consistency Levels, and Kafka Ingestion & DLQ Pipelines
 
-## [2026-08-30] Slice 3 Architecture: Cassandra Transactional Outbox, Schema, Consistency Levels, and Kafka Ingestion & DLQ Pipelines
-
-**Status:** Requires revision (Claude Code, 2026-08-30) — do not implement yet.
-The core outbox pattern (write with `published: false`, publish, flip the
-flag) correctly closes the original crash-window bug from PLAN.md §2.2. But
-tracing through concurrent access reveals a race this proposal doesn't close.
-One required fix, plus two smaller required clarifications, below.
-
-**Required fix — the `applied == false, published == false` branch races.**
-Walk through two requests for the *same* idempotency key arriving close
-together (a genuine duplicate submission, or a client retry firing before the
-original request has finished — both realistic). Both do the LWT insert;
-exactly one gets `applied == true` (call it A) and proceeds toward publishing.
-The other (B) gets `applied == false`, reads the row, sees `published ==
-false` — and under this proposal's logic, treats that as "a previous attempt
-crashed, I should resume it" and proceeds to publish too. But A hasn't
-crashed — it's still in flight. Now two goroutines can both call the Kafka
-producer for the same event. This is exactly the "silently dropped OR
-duplicated" failure PLAN.md §2.2 exists to prevent, just relocated from the
-Cassandra layer (already fixed) to the Kafka-publish layer (not yet).
-
-A boolean can't distinguish "nobody is publishing this right now" from
-"someone is publishing this right now" — that needs a third state and its own
-conditional guard, the same tool already used for the dedup insert. Concretely:
-replace `published boolean` with a `status` column (`PENDING` / `PUBLISHING`
-/ `PUBLISHED`), and require any actor — the original request, a racing
-duplicate request, or the background sweeper — to win
-`UPDATE pharos.event_outbox SET status = 'PUBLISHING' WHERE idempotency_key = ?
-IF status = 'PENDING'` before it's allowed to call the Kafka producer at all.
-Only the winner publishes and then sets `status = 'PUBLISHED'`; every other
-actor just reads the current status and returns/no-ops. This is correct
-regardless of how many Central Ingestion instances are ever running — unlike
-an in-process mutex, which would only be safe as long as Central Ingestion
-stays a single instance, and would silently stop being safe the moment that
-changes without anyone noticing. Since this whole design is already built on
-Cassandra LWTs, one more conditional update is consistent with the rest of
-the pattern, not new complexity. (A per-key in-process lock is fine to *add*
-on top purely to avoid two same-process goroutines both round-tripping to
-Cassandra for the same key — but it cannot be the actual correctness
-mechanism, since the retry-after-crash case can genuinely involve a fresh
-process with no memory of prior locks.)
-
-If a `PUBLISHING` claim holder itself crashes before ever setting
-`PUBLISHED`, the row is now stuck — write down explicitly how the sweeper
-reclaims a stale `PUBLISHING` row (e.g., a lease/claimed-at timestamp with a
-timeout past which the sweeper is allowed to re-claim it) rather than leaving
-that as an unstated gap.
-
-**Required clarification 1 — DLQ path needs the same treatment.** The
-`dead_letter_events` schema already has a `kafka_published boolean` column,
-but the proposal never says how a `kafka_published == false` row gets
-resumed. Right now that's the exact same two-independent-durable-writes shape
-as the bug already fixed for the accept path (Cassandra write succeeds, Kafka
-publish crashes, nothing ever retries it) — just moved to the rejection path
-instead of removed. Apply the same status-column-plus-claim treatment here,
-symmetrically, not a special case.
-
-**Required clarification 2 — confirm raw payload storage.** State explicitly
-that the `payload` column in both `event_outbox` and `dead_letter_events`
-stores the *raw JSON bytes* Central Ingestion received (the
-`json.RawMessage` from Slice 2's fix), not a re-serialized `model.AdverseEvent`
-struct. Slice 2 specifically fixed a struct-round-trip data-loss bug — worth
-saying outright here so it isn't quietly reintroduced when this table gets
-written to.
-
-**What's already right, no changes needed:** consistency levels
-(`LOCAL_SERIAL` for the Paxos phase is the correct term; `LOCAL_QUORUM`
-falling back to `ONE` at RF=1 is technically redundant since they're
-equivalent at RF=1, but harmless — not worth changing), the `pending_outbox`
-time-bucketed index table to avoid scanning on a low-cardinality boolean
-(good Cassandra modeling instinct), `site_id` Kafka partitioning, and the
-choice of `segmentio/kafka-go` over a cgo client. The verification plan
-(crash-window resumption, sequential duplicate, concurrent race, DLQ
-durability) is the right set of tests — once the concurrent-race scenario is
-retested against the fixed design, make sure it asserts *exactly one Kafka
-publish actually occurred*, not just that exactly one `applied == true`
-resulted from the insert — those are different claims and the second one is
-the one that matters.
-
-Revise this proposal with the fix above, then re-submit for review before
-writing implementation code — this is exactly the kind of subtly-wrong-under-
-concurrency design PLAN.md §2.2 warned about, and it's cheaper to fix on paper
-now than after tests get written against the racy version.
+**Status:** Pending (Revised 2026-08-30 addressing Claude Code review: 3-state claim lock, lease timeout, symmetric DLQ outbox, and raw payload specification)
 
 **What in PLAN.md this touches:** §2.2 (Exactly-once processing semantics & transactional outbox), §2.3 (Dead-letter queues), §2.4 (Kafka partitioning by site_id), §3 (Planned stack).
 
 **What I'm proposing:**
-Define the exact architectural decisions, Cassandra schemas, consistency levels, outbox execution lifecycle, and Kafka pipeline for Slice 3:
+Define the revised architectural decisions, Cassandra schemas, consistency levels, outbox execution lifecycle, and Kafka pipeline for Slice 3:
 
 ### 1. Cassandra Consistency Levels
-- **Serial Consistency (LWT Paxos phase):** `LOCAL_SERIAL` for `INSERT ... IF NOT EXISTS` and conditional statements. Keeps Paxos consensus within the local datacenter, avoiding cross-DC WAN roundtrips while providing linearizable ordering on the partition key (`idempotency_key`).
+- **Serial Consistency (LWT Paxos phase):** `LOCAL_SERIAL` for `INSERT ... IF NOT EXISTS` and conditional `UPDATE ... IF` statements. Confines Paxos consensus within the local datacenter, avoiding cross-DC WAN roundtrips while providing linearizable ordering on the partition key (`idempotency_key`).
 - **Write Consistency (Commit phase):** `LOCAL_QUORUM` for multi-node deployments; falls back to `ONE` in the single-node local Docker development environment where replication factor is 1.
 - **Read Consistency:** `LOCAL_QUORUM` (or `ONE` for single-node dev).
 
 ### 2. Cassandra Schemas & Bootstrapping
 - **Keyspace:** `pharos` (`SimpleStrategy`, replication_factor: 1 for local dev; `NetworkTopologyStrategy` in production).
+
 - **Table 1: `pharos.event_outbox` (Dedup & Transactional Outbox)**
   ```cql
   CREATE TABLE IF NOT EXISTS pharos.event_outbox (
@@ -147,7 +66,8 @@ Define the exact architectural decisions, Cassandra schemas, consistency levels,
       site_id text,
       local_seq bigint,
       payload text,
-      published boolean,
+      status text,
+      claimed_at timestamp,
       created_at timestamp,
       published_at timestamp,
       kafka_topic text,
@@ -156,8 +76,11 @@ Define the exact architectural decisions, Cassandra schemas, consistency levels,
       PRIMARY KEY (idempotency_key)
   );
   ```
-  Primary key `idempotency_key` (`<site_id>:<local_seq>`) guarantees strict uniqueness and per-key linearizability via LWT.
-- **Table 2: `pharos.dead_letter_events` (Dead-Letter Audit Store)**
+  - `status`: Three-state lifecycle string (`PENDING`, `PUBLISHING`, `PUBLISHED`).
+  - `claimed_at`: Timestamp recording when a worker acquired the `PUBLISHING` lease.
+  - `payload`: **Stores raw JSON bytes** (`json.RawMessage` from Slice 2's fix) as captured over the wire, never re-serialized from Go structs, guaranteeing zero data loss or field dropping.
+
+- **Table 2: `pharos.dead_letter_events` (Dead-Letter Audit Store & Outbox)**
   ```cql
   CREATE TABLE IF NOT EXISTS pharos.dead_letter_events (
       idempotency_key text,
@@ -166,51 +89,154 @@ Define the exact architectural decisions, Cassandra schemas, consistency levels,
       rejection_reason text,
       validation_errors text,
       rejected_at timestamp,
-      kafka_published boolean,
+      status text,
+      claimed_at timestamp,
+      published_at timestamp,
+      kafka_topic text,
+      kafka_partition int,
+      kafka_offset bigint,
       PRIMARY KEY (idempotency_key)
   );
   ```
+  - Mirrors the exact same three-state lifecycle (`PENDING`, `PUBLISHING`, `PUBLISHED`) and `claimed_at` lease mechanism as `event_outbox` for symmetric crash resilience on the rejection path.
+  - `payload`: **Stores raw JSON bytes** as received, preserving invalid or unrecognized fields for clinical/regulatory audit.
+
+- **Table 3: `pharos.pending_outbox` (Time-Bucketed Sweeper Index)**
+  ```cql
+  CREATE TABLE IF NOT EXISTS pharos.pending_outbox (
+      bucket text,
+      idempotency_key text,
+      created_at timestamp,
+      PRIMARY KEY (bucket, idempotency_key)
+  );
+  ```
+  Provides efficient index queries for the background sweeper without scanning low-cardinality status columns across the main tables. Entries are removed upon reaching `status = 'PUBLISHED'`.
+
 - **Bootstrapping Strategy:** Schema-on-connect via Go initialization helper (`EnsureSchema(session)`), with a declarative CQL script at `migrations/001_init_schema.cql` for `cqlsh` and CI automation.
 
-### 3. Transactional Outbox Lifecycle & Crash Resumption
-- **Accept Path (Synchronous Fast-Path with Resumption on Retry):**
-  1. Intake receives event batch, evaluates rate limiter, and validates each event against scoped FHIR profile.
-  2. For valid events, Central Ingestion writes to Cassandra:
-     `INSERT INTO pharos.event_outbox (idempotency_key, site_id, local_seq, payload, published, created_at) VALUES (?, ?, ?, ?, false, ?) IF NOT EXISTS;`
-  3. **Dedup & Crash-Recovery Branching on `applied`:**
-     - **If `applied == true`**: New event. Safely durably recorded in Cassandra with `published = false`.
-     - **If `applied == false`**: The idempotency key already exists. Read existing row:
-       - If `published == true`: The event was already published to Kafka in an earlier pass. Return HTTP 200 to edge without re-publishing to Kafka (zero duplicate Kafka messages).
-       - If `published == false`: A previous intake run crashed or timed out *after* the Cassandra write but *before* the Kafka publish! Treat this incoming retry as the resumption trigger: proceed directly to step 4 to complete the interrupted publish.
-  4. **Kafka Publishing Step:** Publish to topic `pharos.events.adverse` using partition key `site_id`.
-  5. **Mark Published:** On successful Kafka acknowledgement:
-     `UPDATE pharos.event_outbox SET published = true, published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ? WHERE idempotency_key = ?;`
-  6. **Return HTTP 200 to edge:** Only after step 2 succeeds (and preferably after step 5) is HTTP 200 returned.
-- **Background Outbox Sweeper:**
-  To guarantee eventual publication even if an edge node crashes and never retries an interrupted publish: a background worker runs periodically (e.g. every 10s) to query and drain any lingering unpublished events. Because Cassandra does not efficiently index low-cardinality booleans (`WHERE published = false` across full tables), pending keys can be tracked in an auxiliary time-bucketed table `pharos.pending_outbox (bucket text, idempotency_key text, created_at timestamp, PRIMARY KEY (bucket, idempotency_key))` from which rows are deleted upon publish, or the edge-retry mechanism serves as primary resumption with the sweeper handling the bucket.
+---
 
-### 4. Dead-Letter Pipeline (DLQ)
-- For events failing FHIR validation, Central Ingestion guarantees durable persistence *before* responding with HTTP 422/207:
-  1. Write structured failure metadata (`idempotency_key`, `site_id`, `payload`, `rejection_reason`, `validation_errors`, `rejected_at`) to Cassandra `pharos.dead_letter_events`.
-  2. Publish structured DLQ event to Kafka topic `pharos.events.dlq` partitioned by `site_id`.
-  3. Only after durable persistence does Central Ingestion return HTTP 422 (or 207 Multi-Status) to the edge.
-  4. Edge collector marks the event `REJECTED`, knowing the record is permanently preserved for regulatory audit and replay.
+### 3. Transactional Outbox Lifecycle & Concurrency-Safe Claim Lock
+
+To close the race condition where concurrent requests or premature retries see `published == false` and both attempt to publish to Kafka, we use a three-state claim lock (`PENDING` -> `PUBLISHING` -> `PUBLISHED`) enforced via Cassandra Lightweight Transactions:
+
+#### A. Accept Path (Synchronous Fast-Path with Atomic Claim)
+1. Intake receives event batch, evaluates rate limiter, and validates each event against scoped FHIR profile.
+2. For valid events, Central Ingestion executes an atomic insert with initial `status = 'PUBLISHING'` and `claimed_at = now`:
+   ```cql
+   INSERT INTO pharos.event_outbox (
+       idempotency_key, site_id, local_seq, payload, status, claimed_at, created_at
+   ) VALUES (?, ?, ?, ?, 'PUBLISHING', ?, ?)
+   IF NOT EXISTS;
+   ```
+3. **Branching on `applied`:**
+   - **Case 1: `applied == true` (New Event):**
+     The request won the LWT insert AND acquired the exclusive `PUBLISHING` claim. It proceeds directly to Kafka publishing (Step 4).
+   - **Case 2: `applied == false` (Key Exists — Duplicate or Concurrent In-Flight):**
+     Read the existing row (`SELECT status, claimed_at FROM pharos.event_outbox WHERE idempotency_key = ?`):
+     - **Sub-case 2a: `status == 'PUBLISHED'`:** The event was already successfully published to Kafka in an earlier pass. Return HTTP 200 immediately (no-op, zero duplicate Kafka messages).
+     - **Sub-case 2b: `status == 'PUBLISHING'` and `now - claimed_at < LeaseTimeout` (default 30s):**
+       Another worker is actively in flight publishing this event right now. Do **NOT** call Kafka producer. Return HTTP 200 to the caller (or wait for in-flight completion).
+     - **Sub-case 2c: `status == 'PUBLISHING'` and `now - claimed_at >= LeaseTimeout` (Lease Expired / Claimant Crashed):**
+       The previous claimant crashed or hung before completing publication. Attempt to steal the expired lease via conditional CAS update:
+       ```cql
+       UPDATE pharos.event_outbox
+       SET status = 'PUBLISHING', claimed_at = ?
+       WHERE idempotency_key = ?
+       IF status = 'PUBLISHING' AND claimed_at = ?;
+       ```
+       If this LWT CAS update returns `applied == true`, this worker won the lease and proceeds to Kafka publishing (Step 4). If `applied == false`, another worker won the lease; abort publishing and return HTTP 200.
+     - **Sub-case 2d: `status == 'PENDING'`:**
+       Attempt to acquire the claim:
+       ```cql
+       UPDATE pharos.event_outbox
+       SET status = 'PUBLISHING', claimed_at = ?
+       WHERE idempotency_key = ?
+       IF status = 'PENDING';
+       ```
+       If `applied == true`, proceed to Kafka publishing (Step 4). Otherwise abort.
+4. **Kafka Publishing Step:**
+   Call Kafka producer to publish to topic `pharos.events.adverse` using partition key `site_id` (idempotent producer enabled).
+5. **Mark Published:**
+   On successful Kafka acknowledgement, finalize status:
+   ```cql
+   UPDATE pharos.event_outbox
+   SET status = 'PUBLISHED', published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ?
+   WHERE idempotency_key = ?
+   IF status = 'PUBLISHING';
+   ```
+6. **Acknowledge Edge:** Return HTTP 200 OK.
+
+#### B. In-Process Defense-in-Depth (Keyed Mutex)
+In addition to the Cassandra LWT claim lock (which is the authoritative distributed correctness mechanism across all instances), Central Ingestion maintains an in-memory per-key lock map (`sync.Map` of per-idempotency-key mutexes) to short-circuit same-process goroutines from performing redundant Cassandra Paxos roundtrips for identical keys arriving simultaneously.
+
+#### C. Background Outbox Sweeper & Lease Reclamation
+To guarantee eventual publication if an edge node crashes and never retries an interrupted publish:
+- A background worker runs periodically (every 10s) and scans `pharos.pending_outbox` for uncompleted events.
+- For each entry, reads `status` and `claimed_at` from `event_outbox`.
+- If `status == 'PUBLISHED'`: deletes the entry from `pending_outbox`.
+- If `status == 'PENDING'` or (`status == 'PUBLISHING'` and `now - claimed_at >= LeaseTimeout`):
+  Attempts to claim via LWT:
+  ```cql
+  UPDATE pharos.event_outbox SET status = 'PUBLISHING', claimed_at = now
+  WHERE idempotency_key = ?
+  IF status = ? AND claimed_at = ?;
+  ```
+  If won, publishes to Kafka, updates `status = 'PUBLISHED'`, and removes from `pending_outbox`.
+
+---
+
+### 4. Dead-Letter Pipeline (DLQ) — Symmetric Outbox Treatment
+For events failing FHIR validation, Central Ingestion mirrors the exact same durable outbox pattern *before* responding with HTTP 422/207:
+1. Write to Cassandra `pharos.dead_letter_events` with `status = 'PUBLISHING'`, `claimed_at = now`, structured failure metadata, and the raw payload bytes:
+   ```cql
+   INSERT INTO pharos.dead_letter_events (
+       idempotency_key, site_id, payload, rejection_reason, validation_errors,
+       rejected_at, status, claimed_at
+   ) VALUES (?, ?, ?, ?, ?, ?, 'PUBLISHING', ?)
+   IF NOT EXISTS;
+   ```
+2. If `applied == true` (or if claiming a stale lease), publish structured DLQ event to Kafka topic `pharos.events.dlq` partitioned by `site_id`.
+3. On Kafka ack, update Cassandra:
+   ```cql
+   UPDATE pharos.dead_letter_events
+   SET status = 'PUBLISHED', published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ?
+   WHERE idempotency_key = ?
+   IF status = 'PUBLISHING';
+   ```
+4. Return HTTP 422 (or 207 Multi-Status) to the edge.
+5. If a crash occurs before the DLQ Kafka publish, subsequent edge retries or the sweeper follow the identical lease-reclamation logic, guaranteeing that rejected events are never lost from the Kafka DLQ topic.
+
+---
 
 ### 5. Kafka Client & Configuration
-- Use `github.com/segmentio/kafka-go` (pure Go, zero cgo/librdkafka runtime dependencies).
-- Main Topic: `pharos.events.adverse`, partitioned by `site_id` (preserves per-site FIFO ordering per §2.4).
-- DLQ Topic: `pharos.events.dlq`, partitioned by `site_id`.
-- Producer: Idempotent producer enabled (`RequiredAcks: -1 / All`, retries enabled).
+- **Library:** `github.com/segmentio/kafka-go` (pure Go, zero cgo/librdkafka runtime dependencies).
+- **Topics:**
+  - Main Topic: `pharos.events.adverse`, partitioned by `site_id` (preserves per-site FIFO ordering per §2.4).
+  - DLQ Topic: `pharos.events.dlq`, partitioned by `site_id`.
+- **Producer Configuration:**
+  - `RequiredAcks: -1` (`all` ISR replicas).
+  - Partitioning: Deterministic hash on `site_id`.
+  - Compression: Snappy.
+
+---
+
+### 6. Verification Plan & Test Assertions
+1. **Crash Window Resumption:** Invalidate Kafka connection or inject a crash after Cassandra LWT insert -> verify record remains in Cassandra with `status = 'PUBLISHING'` -> restore Kafka and retry -> verify event transitions to `status = 'PUBLISHED'` and is published to Kafka exactly once.
+2. **Sequential Duplicate Idempotency:** Submit the same idempotency key twice -> verify the second request is recognized as a duplicate (`applied: false`, `status = 'PUBLISHED'`), returns HTTP 200, and does not trigger a second Kafka message.
+3. **Concurrent Duplicate Race:** Fire concurrent goroutines with identical idempotency keys -> **assert that exactly one Kafka publish call actually occurred** (not merely that one insert returned `applied: true`), and that both callers receive successful responses.
+4. **Stale Lease Reclamation:** Inject a crashed worker with `status = 'PUBLISHING'` and expired `claimed_at` -> run the sweeper / retry -> verify lease is reclaimed via LWT and published to Kafka exactly once.
+5. **Dead-Letter Pipeline Durability:** Submit malformed FHIR events -> verify structured rejection metadata and raw payload are durably stored in Cassandra `pharos.dead_letter_events` and published to Kafka DLQ topic `pharos.events.dlq` before HTTP 422 is returned.
+6. **Raw Payload Preservation:** Verify that payloads with unmodeled fields or raw JSON bytes are stored verbatim in both Cassandra and Kafka messages without struct re-serialization.
 
 **Why:**
-- Exactly matches PLAN.md §2.2: Eliminates the fatal crash window of check-then-publish by making the outbox write the primary dedup gate (`published: false` via LWT).
-- Ensures rejected events are never lost: fixes the open gap from Slice 2 by durably storing rejections in both Cassandra and Kafka DLQ before acknowledging the edge.
-- Preserves per-site ordering in Kafka via `site_id` partition key (§2.4).
+- Eliminates the concurrent publish race by requiring any worker to hold an active `PUBLISHING` claim won via Cassandra LWT before calling the Kafka producer.
+- Closes the crash window on both the accept path and the DLQ path symmetrically.
+- Ensures all data (valid and invalid) is stored and forwarded in raw wire format without data loss.
 
 **Alternatives considered:**
-1. Check-then-publish (check key exists, publish to Kafka, then store key): Explicitly rejected in PLAN.md §2.2 review because a crash between steps drops retries forever.
-2. Background-only outbox publish (return HTTP 200 after Cassandra write, let worker publish to Kafka asynchronously): Adds latency between edge acceptance and Kafka availability. Hybrid approach (synchronous publish with retry/sweeper resumption) provides immediate consistency for happy path and guaranteed recovery under crashes.
-3. Confluent cgo Kafka client: Requires native `librdkafka` C libraries, complicating cross-compilation, local testing, and Docker builds. Pure Go `segmentio/kafka-go` is robust and dependency-free.
+- In-process mutex only: Unsafe across multiple Central Ingestion instances. The proposal uses Cassandra LWT as the true distributed lock, adding in-process mutexes purely as an optimization to reduce Cassandra round-trips.
+- Leaky outbox without lease timeout: If a worker crashes during Kafka publish, rows would remain stuck in `PUBLISHING` forever. The 30s `claimed_at` lease timeout ensures deterministic recovery.
 
 **Impact if approved:** Governs Slice 3 implementation across `pkg/dedup`, `pkg/kafka`, and `pkg/ingestion`.
 
