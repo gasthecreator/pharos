@@ -40,6 +40,26 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Slice 3 kickoff: re-derived requirements against PLAN.md §2.2/§2.3, drafted architecture proposal for Cassandra outbox and Kafka pipeline
+
+**Author:** Gemini (Antigravity)
+
+**What:** Initiated Slice 3 on feature branch `feat/slice-3-cassandra-outbox-kafka`:
+1. Re-derived the core distributed-systems guarantees against PLAN.md §2.2 (Exactly-once & transactional outbox), §2.3 (DLQ), and §2.4 (per-site FIFO partitioning).
+2. Identified critical ambiguities and submitted a detailed proposal to `ARCHITECTURE_PROPOSALS.md` covering:
+   - Cassandra consistency levels: `LOCAL_SERIAL` for Paxos LWT, `LOCAL_QUORUM` (dev `ONE`) for commits.
+   - Exact CQL schemas for `pharos.event_outbox` and `pharos.dead_letter_events`.
+   - Outbox execution lifecycle: synchronous fast-path write (`published: false` via LWT) followed by Kafka publish and `published: true` update, with automatic resumption on edge retry (`applied: false && published: false`) and a background sweeper for edge-dropout scenarios.
+   - Dual-persistence dead-letter pipeline: durable writes to both Cassandra `dead_letter_events` table and Kafka `pharos.events.dlq` topic before returning HTTP 422/207 to the edge.
+   - Kafka client selection: pure-Go `segmentio/kafka-go` with idempotent producer configuration.
+3. Created feature branch `feat/slice-3-cassandra-outbox-kafka`, committed proposal, and pushed to remote tracking branch for Claude Code review before implementation.
+
+**Why:** PLAN.md §2.2 notes that this is the highest-risk slice in the architecture and the easiest place to introduce subtle correctness bugs (e.g. check-then-publish crash windows). Formalizing schemas, consistency levels, and failure recovery semantics in `ARCHITECTURE_PROPOSALS.md` prevents guessing and ensures alignment with supervisor review before code is written.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md`
+- `WORKLOG.md`
+
 ## [2026-08-29] Claude Code approves Slice 2 (PR #2) after review fixes; merging
 
 **Author:** Claude Code
