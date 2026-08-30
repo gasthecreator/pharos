@@ -44,6 +44,38 @@ That maps cleanly onto edge sites reporting into a central signal that must stay
 correct under partition. Keeping the name — it's specific to what the system does,
 not generic. Reopen this if it stops feeling right once the architecture solidifies.
 
+### Roadmap: two phases, decided 2026-08-30
+
+The four core challenges in §2 are implemented and verified against real
+infrastructure (Slices 1-5), but that is **not** the same thing as this being
+production-ready — those are different bars, and conflating them would be
+dishonest about what's actually been built. Gideon wants this to genuinely
+reach production-hardening eventually, but explicitly chose to sequence it:
+
+1. **Phase 1 (now): make it portfolio-ready.** A README and a working demo
+   that let a reader/interviewer actually understand and see the system run,
+   accurately representing what exists today — including being explicit about
+   what's deliberately out of scope so far, rather than implying more
+   maturity than is real.
+2. **Phase 2 (next): real production hardening.** Concretely, what's missing
+   for that bar and not yet started: every service has only ever run as a
+   single Docker container (Cassandra at replication factor 1, one Kafka
+   broker — no multi-node cluster has ever been exercised); there is no
+   authentication or TLS anywhere (anything that can reach the HTTP ports can
+   submit or read adverse event data); nothing has been load-tested at
+   realistic throughput; there's no deployment automation (Kubernetes
+   manifests, IaC); no observability/alerting; no backup or disaster-recovery
+   plan for Cassandra; no multi-instance scaling ever tested for Central
+   Ingestion or the consumer group; and no access-audit logging or compliance
+   tooling for the clinical data itself beyond what the DLQ/outbox design
+   already provides. This is genuinely weeks of work, not a gap in rigor —
+   the four core challenges were hard distributed-systems problems solved
+   correctly; this list is a different, broader kind of engineering.
+
+Don't let Phase 2 quietly bleed into Phase 1's scope, and don't let Phase 1's
+speed be read as evidence Phase 2 will be equally fast — it won't be, and
+that's expected, not a problem to solve.
+
 ---
 
 ## 2. Core engineering challenges (design decisions)
