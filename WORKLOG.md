@@ -40,6 +40,77 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code review: Slice 4 implementation verified against real infra; one audit-trail idempotency gap
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's full Slice 4 implementation (commit `61faa88`) —
+a large round, built in one pass per the pre-approval from the prior review.
+Pulled the branch, independently scanned both `WORKLOG.md` and
+`ARCHITECTURE_PROPOSALS.md` for header corruption (none this round), ran the
+full suite myself (`go vet` clean, `-race` clean across all 7 packages), and
+separately confirmed the real Cassandra and Kafka integration tests actually
+pass against the live containers, not skip. Read the actual diffs for
+`watermark.go`, `engine.go`, and `canonical_store.go` rather than trusting
+the summary.
+
+Confirmed correct: the monotonicity fix genuinely holds —
+`advanceWatermarkLocked` only updates `previousEmitted` when the candidate
+is strictly after it, which I traced through the exact regression scenario
+from the prior review (partition reawakening with an older backlogged
+event-time) and it no longer regresses. The gated offset commit
+(`SaveEvent` must succeed before `CommitMessages` is ever called) is
+correctly implemented and covered by
+`TestConsumerEngine_GatedCommitOnCassandraError`, which asserts zero commits
+on an injected write failure. Per-site ordering is trivially preserved since
+`Engine.Run` is a single sequential consumption loop, not concurrent
+per-partition workers. `model.AdverseEvent.StudyID()` was added exactly as
+asked — mirrors `SiteID()`, defaults to `"UNKNOWN_STUDY"`. The parallel
+canonical-table writes use a hand-rolled `sync.WaitGroup` + buffered error
+channel rather than the literal `errgroup` package the commit message names
+— functionally equivalent and correct, just a naming inaccuracy, not worth
+a fix.
+
+**Why:** Found one real gap by tracing what happens on a Kafka redelivery.
+`Step()` calls `tracker.ProcessEvent()` — which updates the watermark *and*
+appends to the `LateArrivalAudit` trail on a `COMPLETE`→`REVISED`
+transition — *before* `SaveEvent()` and the offset commit. If `SaveEvent()`
+fails after `ProcessEvent()` already ran (an entirely ordinary transient
+Cassandra write failure, not an adversarial scenario), the offset correctly
+stays uncommitted and Kafka redelivers the same message later. On
+redelivery, `ProcessEvent()` runs again for the identical event: the window
+is already `REVISED` from the first attempt, so it falls into the
+"already-revised" branch and appends a *second, duplicate*
+`LateArrivalAudit` entry for what is actually the same real-world event.
+The canonical data itself stays correctly idempotent — this only pollutes
+the audit trail — but that's exactly the property this feature leans on 21
+CFR Part 11 reasoning to justify, so a duplicate-prone audit log undermines
+its own stated purpose.
+
+**How:** Not fixed by me — sent back to Gemini as a small, precisely-scoped
+fix rather than a full re-review, consistent with the "bigger tasks, less
+fragmentation" adjustment from earlier this session: before appending a
+`LateArrivalAudit`, check whether one already exists for the same
+`(WindowID, IdempotencyKey)` pair and skip if so. This is also just the
+semantically correct behavior independent of the redelivery angle — you
+never want two audit entries for "this event arrived late into this
+window," regardless of cause.
+
+**Files/modules touched:** `WORKLOG.md` only — review notes, no code
+changes by Claude this round.
+
+**Tests added/updated:** none by Claude — independently re-verified
+Gemini's 7 new `pkg/consumer` unit tests plus both real-infra integration
+tests genuinely pass (not skip).
+
+**Follow-ups / left open:**
+- Waiting on Gemini's audit-dedup fix. Once applied, this is mergeable —
+  no further design review needed.
+- Add a test alongside the fix: force a `SaveEvent` failure *after*
+  `ProcessEvent` has already caused a window to flip to `REVISED`, redeliver
+  the same message, and assert exactly one `LateArrivalAudit` entry exists
+  for that `(window, idempotency_key)` pair, not two.
+
 ## [2026-08-30] Implement Slice 4: Kafka consumer engine, canonical query tables, monotonic watermark tracker, and E2E verification
 
 **Author:** Gemini (Antigravity)
