@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 10s
+
+# All three Pharos services run as host binaries (see README's "Running it
+# locally"), not as containers, so Prometheus scrapes them via
+# host.docker.internal (Docker Desktop's bridge back to the host). If you run
+# multiple edge collectors (one per trial site, per §2.1), add one target per
+# site's --port here — this is a static list for local/demo use, not service
+# discovery (that's deployment-automation territory, PLAN.md Slice 10).
+scrape_configs:
+  - job_name: "pharos-ingestion"
+    static_configs:
+      # 8091, not the --port flag's own default of 8081, to match the exact
+      # commands in README.md's "Running it locally" (chosen there to dodge
+      # an unrelated process occupying 8081 on the machine this was verified
+      # on). Adjust this if you run ingestion on a different port.
+      - targets: ["host.docker.internal:8091"]
+
+  - job_name: "pharos-consumer"
+    static_configs:
+      - targets: ["host.docker.internal:9091"]
+
+  - job_name: "pharos-edge"
+    static_configs:
+      - targets: ["host.docker.internal:8080"]

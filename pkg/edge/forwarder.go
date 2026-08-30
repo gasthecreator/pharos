@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gasthecreator/pharos/pkg/ingestion"
+	"github.com/gasthecreator/pharos/pkg/metrics"
 )
 
 // HTTPClient interface allows mocking the network layer in tests.
@@ -128,9 +129,11 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	httpReq.Header.Set("X-Site-ID", f.cfg.SiteID)
 
 	// 3. Send HTTP request to Central Ingestion
+	metrics.ForwarderAttemptsTotal.Inc()
 	resp, err := f.client.Do(httpReq)
 	if err != nil {
 		// Network error (timeout, connection refused, unreachable network)
+		metrics.ForwarderOutcomesTotal.WithLabelValues("network_error").Inc()
 		f.handleFailure(ctx, records, fmt.Sprintf("network error: %v", err), 0)
 		return 0, err
 	}
@@ -141,6 +144,7 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	// 4. Handle response status codes
 	switch {
 	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusMultiStatus || resp.StatusCode == http.StatusUnprocessableEntity:
+		metrics.ForwarderOutcomesTotal.WithLabelValues("success").Inc()
 		var batchResp ingestion.BatchResponse
 		_ = json.Unmarshal(respBytes, &batchResp)
 
@@ -221,12 +225,14 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 	case resp.StatusCode == http.StatusTooManyRequests:
 		// Rate limited by Central Ingestion token bucket (§2.3)
+		metrics.ForwarderOutcomesTotal.WithLabelValues("rate_limited").Inc()
 		retryAfter := f.parseRetryAfter(resp.Header.Get("Retry-After"))
 		f.handleFailure(ctx, records, fmt.Sprintf("rate limited (HTTP 429): %s", string(respBytes)), retryAfter)
 		return 0, fmt.Errorf("rate limited (HTTP 429)")
 
 	default:
 		// 5xx Server Error or unexpected error
+		metrics.ForwarderOutcomesTotal.WithLabelValues("server_error").Inc()
 		errMsg := fmt.Sprintf("server error (HTTP %d): %s", resp.StatusCode, string(respBytes))
 		f.handleFailure(ctx, records, errMsg, 0)
 		return 0, fmt.Errorf("%s", errMsg)
@@ -280,7 +286,9 @@ func (f *Forwarder) CalculateBackoff(attempts int) time.Duration {
 		jittered = float64(100 * time.Millisecond)
 	}
 
-	return time.Duration(jittered)
+	result := time.Duration(jittered)
+	metrics.ForwarderLastBackoffSeconds.Set(result.Seconds())
+	return result
 }
 
 // Run starts the forwarder polling loop until the context is canceled.

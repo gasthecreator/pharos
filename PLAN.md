@@ -102,6 +102,57 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   real metrics are flowing — verified against the live `/metrics` endpoints
   and a real Grafana panel, not just "the code compiles."
 
+  **Resolved 2026-08-30 — implemented.** All three services expose
+  `/metrics` (ingestion/edge share their existing HTTP server; consumer got
+  a dedicated one on `--metrics-port`, default 9091, alongside `/healthz`)
+  via a new `pkg/metrics` package of package-level Prometheus collectors —
+  safe as globals specifically because each binary runs as exactly one
+  process per site/service, never multiple independent instances sharing a
+  process. Every metric named above is wired to a real call site (not a
+  stub): request-latency/status-code via a small `statusRecordingWriter`
+  wrapping `http.ResponseWriter` in `HandleEvents` rather than threading a
+  status variable through every existing response branch; rate-limit/
+  validation/dedup/DLQ counters sit directly next to the atomic counters
+  those events already incremented; Cassandra write latency wraps
+  `Engine.Step`'s existing `SaveEvent` call; consumer lag/watermark/
+  partition-activity are polled every 30s from the tracker's already-public
+  methods (`CurrentWatermark`, `PartitionStats`) and the kafka-go reader's
+  own `Stats().Lag`, rather than reaching into `WatermarkTracker` internals —
+  deliberately, since that logic took two review rounds to get right and
+  didn't need touching for this. Edge queue depth/oldest-pending-age poll
+  `SQLiteStore.GetStats` every 10s the same way. Confirmed against the real
+  stack, not just compilation: ran the demo flow, hit all three raw
+  `/metrics` endpoints and saw real non-zero counters, and confirmed
+  Grafana renders live data on the provisioned dashboard.
+
+  **Known limitation, caught during that same verification, not fully
+  fixed tonight:** `pkg/edge` transitively imports `pkg/ingestion` (for the
+  wire-format types `BatchRequest`/`BatchResponse`), and all three services
+  import the single shared `pkg/metrics` package directly — so every
+  binary's `/metrics` actually exposes *all* services' metric names, zero-
+  valued for whatever that binary doesn't itself touch (confirmed:
+  `pharos-edge`'s raw `/metrics` output includes `pharos_consumer_kafka_lag`
+  and `pharos_ingestion_dlq_writes_total`, both always 0). The real,
+  non-zero values are correct on their owning service's endpoint — this
+  doesn't corrupt any actual metric — but it means Prometheus stores extra
+  flat-zero time series per metric name across every job. Mitigated tonight
+  by scoping every dashboard query with an explicit `job="pharos-..."`
+  label filter (see `pharos-overview.json`) rather than doing a deeper
+  refactor at this hour on `handler.go`/`forwarder.go`, which are both
+  fault-injection-tested critical paths not worth touching for a cosmetic
+  fix under time pressure. The correct real fix, for whoever picks this up:
+  extract the wire types edge actually needs out of `pkg/ingestion` into
+  their own dependency-free package (e.g. `pkg/wire`), so `pkg/edge` no
+  longer transitively pulls in `pkg/ingestion` (and by extension anything it
+  imports) at all.
+
+  Grafana OSS is
+  AGPLv3 — free to self-host with no usage cap, same free-forever footing as
+  Cassandra's Apache 2.0, so no cost-constraint conflict. Full stack in
+  `docker-compose.yml` (`prometheus`, `grafana` services) plus
+  `observability/` (Prometheus scrape config, Grafana datasource/dashboard
+  provisioning, and the starter dashboard JSON itself).
+
 - **Slice 7 — Multi-node Cassandra + Kafka.** Every service has only ever run
   against a single-container Cassandra (RF=1) and a single Kafka broker —
   this slice is what actually proves the "distributed" in this project's
@@ -518,8 +569,11 @@ lands — do not mark anything done based on a plan or a stub.
       clustering key regardless of arrival order
 - [x] Fault-injection test suite (malformed FHIR payloads → DLQ) — covered by
       Slice 3's `TestDeadLetterPipeline_DurabilityAndRouting` and related handler tests
-- [ ] Observability (metrics on lag, dedup hit rate, DLQ volume) — in-memory
-      counters exist (`Handler.ExtendedStats`) but nothing exported/scraped yet
+- [x] Observability (metrics on lag, dedup hit rate, DLQ volume) — Phase 2
+      Slice 6: Prometheus instrumentation (`pkg/metrics`) across all three
+      services, self-hosted Grafana with a provisioned starter dashboard.
+      Verified against live `/metrics` endpoints and real Grafana panels
+      with real traffic flowing, not just that the code compiles.
 
 ---
 

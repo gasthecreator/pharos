@@ -3,19 +3,24 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/gasthecreator/pharos/pkg/consumer"
 	"github.com/gasthecreator/pharos/pkg/kafka"
+	"github.com/gasthecreator/pharos/pkg/metrics"
 )
 
 func main() {
 	kafkaBrokers := flag.String("kafka-brokers", "127.0.0.1:9092", "Comma-separated Kafka broker addresses")
+	metricsPort := flag.Int("metrics-port", 9091, "Port to serve /metrics and /healthz on")
 	kafkaTopic := flag.String("kafka-topic", kafka.MainTopic, "Kafka topic to consume")
 	kafkaGroup := flag.String("kafka-group", "pharos-canonical-sink", "Kafka consumer group ID")
 	cassandraHosts := flag.String("cassandra-hosts", "127.0.0.1", "Comma-separated Cassandra host addresses")
@@ -80,7 +85,22 @@ func main() {
 		}
 	}()
 
-	// 5. Periodic status telemetry
+	// 5. Metrics/health HTTP server (Slice 6 — §4)
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", metrics.Handler())
+	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"UP"}`))
+	})
+	metricsServer := &http.Server{Addr: fmt.Sprintf(":%d", *metricsPort), Handler: metricsMux}
+	go func() {
+		log.Printf("[pharos-consumer] Metrics endpoint listening on http://localhost:%d/metrics", *metricsPort)
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[pharos-consumer] Metrics server error: %v", err)
+		}
+	}()
+
+	// 6. Periodic status telemetry — also feeds the watermark/lag/partition-activity gauges (Slice 6)
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -90,21 +110,40 @@ func main() {
 				return
 			case <-ticker.C:
 				stats := engine.Stats()
-				wm := tracker.CurrentWatermark(time.Now().UTC())
+				now := time.Now().UTC()
+				wm := tracker.CurrentWatermark(now)
 				log.Printf("[pharos-consumer] Status: consumed=%d committed=%d late=%d errors=%d watermark=%s",
 					stats.ConsumedCount, stats.CommittedCount, stats.LateEventsCount, stats.ErrorCount,
 					wm.Format(time.RFC3339))
+
+				if !wm.IsZero() {
+					metrics.ConsumerWatermarkSeconds.Set(float64(wm.Unix()))
+				}
+				metrics.ConsumerLag.Set(float64(reader.Stats().Lag))
+				for _, ps := range tracker.PartitionStats(now) {
+					active := 0.0
+					if ps.IsActive {
+						active = 1.0
+					}
+					metrics.ConsumerPartitionActive.WithLabelValues(strconv.Itoa(ps.Partition)).Set(active)
+				}
 			}
 		}
 	}()
 
-	// 6. Handle graceful shutdown
+	// 7. Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	<-sigChan
 	log.Println("[pharos-consumer] Shutting down gracefully...")
 	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[pharos-consumer] Warning during metrics server shutdown: %v", err)
+	}
 
 	if err := engine.Close(); err != nil {
 		log.Printf("[pharos-consumer] Warning during shutdown: %v", err)

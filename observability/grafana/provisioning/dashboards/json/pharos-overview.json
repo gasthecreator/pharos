@@ -1,0 +1,229 @@
+{
+  "title": "Pharos Overview",
+  "uid": "pharos-overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "timezone": "utc",
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Ingestion request rate by status code",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "sum by (status_code) (rate(pharos_ingestion_requests_total{job=\"pharos-ingestion\"}[1m]))",
+          "legendFormat": "{{status_code}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Ingestion request latency (p95)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(pharos_ingestion_request_duration_seconds_bucket{job=\"pharos-ingestion\"}[5m])))",
+          "legendFormat": "p95"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Rate-limit rejections by site (§2.3)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "sum by (site_id) (rate(pharos_ingestion_rate_limit_rejections_total{job=\"pharos-ingestion\"}[1m]))",
+          "legendFormat": "{{site_id}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Validation failures -> DLQ rate (§2.3)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "rate(pharos_ingestion_validation_failures_total{job=\"pharos-ingestion\"}[1m])",
+          "legendFormat": "validation failures"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "rate(pharos_ingestion_dlq_writes_total{job=\"pharos-ingestion\"}[1m])",
+          "legendFormat": "dlq writes"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Dedup claim outcomes (§2.2)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "sum by (outcome) (rate(pharos_ingestion_dedup_outcomes_total{job=\"pharos-ingestion\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Outbox Kafka publish latency (p95, by topic)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, topic) (rate(pharos_ingestion_outbox_publish_duration_seconds_bucket{job=\"pharos-ingestion\"}[5m])))",
+          "legendFormat": "{{topic}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Consumer throughput: consumed / late / errors",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "rate(pharos_consumer_events_consumed_total{job=\"pharos-consumer\"}[1m])",
+          "legendFormat": "consumed/s"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "rate(pharos_consumer_late_arrivals_total{job=\"pharos-consumer\"}[1m])",
+          "legendFormat": "late arrivals/s (§2.4)"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "rate(pharos_consumer_errors_total{job=\"pharos-consumer\"}[1m])",
+          "legendFormat": "errors/s"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Consumer Kafka lag",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 24, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "pharos_consumer_kafka_lag{job=\"pharos-consumer\"}",
+          "legendFormat": "lag"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Watermark freshness (seconds behind now)",
+      "type": "timeseries",
+      "gridPos": { "x": 18, "y": 24, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "time() - pharos_consumer_watermark_unix_seconds{job=\"pharos-consumer\"}",
+          "legendFormat": "watermark age"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Canonical Cassandra write latency (p95, by outcome)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(pharos_consumer_cassandra_write_duration_seconds_bucket{job=\"pharos-consumer\"}[5m])))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Partition activity (1 = active, 0 = idle-excluded, §2.4)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "fieldConfig": { "defaults": { "min": 0, "max": 1 }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "pharos_consumer_partition_active{job=\"pharos-consumer\"}",
+          "legendFormat": "partition {{partition}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Edge queue pending records (§2.1)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 40, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "pharos_edge_queue_pending_records{job=\"pharos-edge\"}",
+          "legendFormat": "pending"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Oldest pending record age (partition duration proxy)",
+      "type": "stat",
+      "gridPos": { "x": 6, "y": 40, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "pharos_edge_queue_oldest_pending_age_seconds{job=\"pharos-edge\"}",
+          "legendFormat": "oldest pending age"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Forwarder attempt outcomes",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 40, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "pharos_prometheus" },
+          "expr": "sum by (outcome) (rate(pharos_edge_forwarder_outcomes_total{job=\"pharos-edge\"}[1m]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    }
+  ]
+}

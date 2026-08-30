@@ -40,6 +40,88 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code: Phase 2 Slice 6 — observability, built directly (background agent failed twice)
+
+**Author:** Claude Code
+
+**What:** Implemented Slice 6 end to end: a new `pkg/metrics` package of
+Prometheus collectors; `/metrics` wired into all three services
+(`pharos-ingestion`, `pharos-edge` on their existing HTTP servers,
+`pharos-consumer` on a new dedicated metrics server, `--metrics-port`
+default 9091, alongside `/healthz`); Prometheus + Grafana added to
+`docker-compose.yml` with a scrape config and a fully provisioned starter
+dashboard (`observability/`). Updated `PLAN.md`'s §4 checklist (the one item
+Phase 1 left open) and README's "what's here vs. what's next."
+
+**Why:** Closes PLAN.md's Phase 2 Slice 6 spec, itself scoped earlier
+tonight (see the entry below this one). Gideon wanted to sleep with real
+Phase 2 progress happening in the background; the original plan was to run
+this as an unattended background agent, but see Follow-ups below for why it
+ended up built directly instead.
+
+**How:** Kept every metric hook non-invasive to the correctness-critical
+paths it sits next to: request-latency/status-code uses a small
+`statusRecordingWriter` wrapper around `http.ResponseWriter` inside
+`HandleEvents` rather than threading a status variable through its many
+existing response branches; rate-limit/validation/dedup/DLQ counters are
+inserted directly beside the atomic counters those same events already
+increment in `pkg/ingestion/handler.go`; Cassandra write latency wraps the
+existing `SaveEvent` call in `Engine.Step`; consumer lag/watermark/
+partition-activity are read every 30s from `WatermarkTracker`'s already-
+public methods and the kafka-go reader's own `Stats().Lag` — deliberately
+not touching `pkg/consumer/watermark.go` internals, since that logic took
+two review rounds to get right during Slice 4 and didn't need to change
+for this. Edge queue depth/oldest-pending-age poll `SQLiteStore.GetStats`
+every 10s the same way. Full detail (including the Grafana AGPLv3
+licensing check) is in `PLAN.md`'s Slice 6 write-up rather than
+`ARCHITECTURE_PROPOSALS.md`, since there was no deviation from an
+already-agreed plan requiring that round-trip — I scoped Slice 6's spec
+myself earlier tonight and implemented my own spec, not something requiring
+a second review pass.
+
+**Files/modules touched:** `pkg/metrics/metrics.go` (new),
+`pkg/ingestion/handler.go`, `pkg/consumer/engine.go`,
+`cmd/pharos-consumer/main.go`, `cmd/pharos-ingestion/main.go`,
+`cmd/pharos-edge/main.go`, `pkg/edge/forwarder.go`, `docker-compose.yml`,
+`observability/prometheus.yml`,
+`observability/grafana/provisioning/{datasources,dashboards}/*.yml`,
+`observability/grafana/provisioning/dashboards/json/pharos-overview.json`, `PLAN.md`,
+`README.md`, `go.mod`/`go.sum` (added `prometheus/client_golang`).
+
+**Tests added/updated:** None new — this is additive instrumentation, not
+new business logic. Ran the full existing suite (`go vet ./...`,
+`go test -race -count=1 ./...`) after every meaningful change; all packages
+stayed green throughout, including `pkg/faultinjection` against real
+Cassandra/Kafka, confirming the instrumentation didn't perturb
+`CalculateBackoff` or any other timing-sensitive path it now also reports
+on. Verified against the live stack, not just compilation: ran the full
+demo flow, confirmed real non-zero counters on all three raw `/metrics`
+endpoints, and confirmed the provisioned Grafana dashboard renders live
+data end to end.
+
+One Docker Compose bug caught by actually bringing the stack up rather than
+trusting `docker compose config`'s static validation: mounting the
+dashboard JSON directory as a second bind mount *inside* the path already
+covered by the read-only `provisioning` bind mount fails at container start
+("read-only file system" trying to create the nested mountpoint) — Docker
+can't create a mountpoint inside an already-mounted read-only tree. Fixed by
+moving the dashboard JSON physically under
+`observability/grafana/provisioning/dashboards/json/` so it's part of the
+single `provisioning` mount instead of a second one nested inside it.
+
+**Follow-ups / left open:** The original plan was an unattended background
+agent per the process described in the Phase 2 scoping entry below. It
+stalled twice in a row (a stream-watchdog failure, not a content problem —
+the first stall was mid a Grafana license web-lookup, the second gave no
+output at all before failing) without writing any code either time, so
+after the second failure I built this slice directly myself instead of
+retrying a third time on a mechanism that had failed twice. No work was
+lost in either stall — both branches it touched had zero commits and were
+cleaned up. Everything else about the plan held: feature branch, PR opened
+(not merged), same verification bar as every prior slice.
+
+---
+
 ## [2026-08-30] Claude Code: Phase 2 scoped into slices 6-13; overnight kickoff
 
 **Author:** Claude Code
