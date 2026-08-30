@@ -42,6 +42,77 @@ to change)
 
 ---
 
+#### [2026-08-30] Slice 4 Architecture: Kafka Consumer Topology, Canonical Cassandra Query Tables, Event-Time Watermarking, and Idempotent Downstream Sinks
+
+**Status:** Pending
+
+**What in PLAN.md this touches:**
+- §2.4 Multi-timezone event ordering and correctness
+- §3 Planned stack (Consumer layer)
+- §4 Built vs. not yet (Stream processing layer, Kafka consumer, query tables)
+- §5 Open questions (Question 1: Cassandra schema fit against real query patterns)
+
+**What I'm proposing:**
+Four interconnected architectural choices closing out the pipeline from Kafka to durable queryable storage:
+
+1. **Topology & Packaging: Dedicated `pharos-consumer` Binary (`cmd/pharos-consumer` and `pkg/consumer`)**
+   - **Structure**: Separate binary `cmd/pharos-consumer` containing the Kafka consumer group worker.
+   - **Reasoning**: Decouples edge intake scaling (HTTP request bound) from downstream consumer scaling (Kafka partition bound). While Central Ingestion scales with incoming edge network connections, the consumer scales up to the topic's partition count (3 partitions currently). Isolating failures ensures ingestion never slows down during downstream database maintenance or backfills.
+   - **Programmatic Engine**: The core consumption logic is implemented as `pkg/consumer.Engine` so integration tests and local test harnesses can run the consumer in-process without spawning subprocesses.
+   - **Consumer Group**: Uses `segmentio/kafka-go` `Reader` configured with `GroupID: "pharos-canonical-sink"`, deterministic rebalance handling, and explicit manual commit after Cassandra durable write.
+
+2. **Canonical Cassandra Schema: Two Query-Specific Tables + Canonical Entity Table**
+   - Resolves PLAN.md §5 Question 1 ("actual query pattern fit: all events for trial X in date range Y vs all events from site Z").
+   - Cassandra requires partition-key-first modeling. We propose 3 tables in keyspace `pharos`:
+     - **`pharos.canonical_events`** (Entity Table / Point Lookup):
+       - Primary Key: `(idempotency_key)`
+       - Serves: exact point lookups by client idempotency key for deduplication audit, payload inspection, and Kafka lineage metadata (`kafka_topic`, `kafka_partition`, `kafka_offset`, `consumed_at`).
+     - **`pharos.events_by_study`** (Regulatory / Clinical Safety Query):
+       - Primary Key: `((study_id), event_time, idempotency_key)`
+       - Clustering Order: `(event_time DESC, idempotency_key ASC)`
+       - Serves: `SELECT * FROM events_by_study WHERE study_id = ? AND event_time >= ? AND event_time <= ?;`
+       - Fast range scans ordered by clinical event time for DSMB and FDA safety reviews.
+     - **`pharos.events_by_site`** (Site Operations & Auditing Query):
+       - Primary Key: `((site_id), local_seq, idempotency_key)`
+       - Clustering Order: `(local_seq DESC, idempotency_key ASC)`
+       - Serves: `SELECT * FROM events_by_site WHERE site_id = ? AND local_seq >= ?;`
+       - Verifies continuous per-site monotonic sequence numbering and site data delivery.
+   - **Write Strategy**: The consumer executes an atomic CQL logged batch (`BEGIN BATCH ... APPLY BATCH;`) writing to all 3 tables simultaneously, or concurrent idempotent upserts. In Cassandra, writes across multiple tables within the same keyspace and datacenter are atomic in a single logged batch.
+
+3. **Event-Time Ordering and Watermarking Semantics (§2.4)**
+   - **Problem**: Global sites in diverse time zones (e.g. Tokyo UTC+9, London UTC+0, Indianapolis UTC-5) produce events stamped with their local event time (normalized to UTC). If a site is disconnected for hours, its events arrive late at Central Ingestion.
+   - **Solution**: Implement `pkg/consumer.WatermarkTracker`:
+     - Tracks the maximum observed `event_time` per active partition $p$: $T_p = \max(\text{event\_time}_p)$.
+     - Defines the global watermark $W$ with configurable bounded lateness tolerance $L$ (default 15m, configurable per study):
+       $$W = \min_{p \in \text{active\_partitions}}(T_p) - L$$
+     - A time window $[t_{start}, t_{end})$ is deemed **Complete** once $W \ge t_{end}$.
+     - Events arriving with `event_time < W` are processed into Cassandra (never dropped per PLAN.md's core premise), but flagged with `is_late = true` and tracked via metric counters to signal late-arriving pharmacovigilance reports requiring retroactive safety evaluation.
+   - This delivers mathematically rigorous multi-timezone correctness without heavy external dependencies like Flink or Spark.
+
+4. **Consumer-Side Idempotency**
+   - On consumer crash or partition rebalance, Kafka may redeliver uncommitted messages.
+   - Because all 3 Cassandra tables are keyed by `idempotency_key` (either directly or as the tie-breaking clustering column), CQL `INSERT` statements are natural idempotent upserts.
+   - Redelivering an identical event writes the exact same columns and payload into Cassandra without creating duplicate rows.
+   - Kafka offsets are committed only after the Cassandra write succeeds.
+
+**Why:**
+- `event_outbox` was designed for transactional publishing, not analytical querying; trying to query it by study or site requires full-table scans.
+- Watermarking provides an honest answer to "is the clinical safety data for yesterday complete across all global trial sites?", which is a core Lilly Bio-IT challenge.
+- Separating the consumer binary reflects realistic production deployment boundaries.
+
+**Alternatives considered:**
+- *Folding consumer into ingestion binary*: Easier to run locally, but couples HTTP API scaling to Kafka partition constraints. Rejected for production architecture, but mitigated by providing an in-process library mode for unit/integration tests.
+- *Cassandra Materialized Views instead of dual/triple writes*: Cassandra MVs are known for operational fragility, tombstone issues, and silent lag during node failures. Application-layer multi-table batch writes are standard in production Cassandra.
+- *Full Apache Flink stream processor*: Heavy JVM framework requiring ZooKeeper/Kubernetes orchestration, violating the project constraint of running cleanly on developer hardware. A pure-Go watermark tracker delivers identical semantics with zero operational bloat.
+
+**Impact if approved:**
+- New CQL migration `migrations/002_canonical_schema.cql` adding `canonical_events`, `events_by_study`, `events_by_site`.
+- New package `pkg/consumer` containing consumer engine, watermark tracker, and Cassandra canonical store.
+- New binary `cmd/pharos-consumer`.
+- Full unit and integration test suite asserting single-row idempotency on message redelivery, per-site ordering preservation, and watermark lag detection.
+
+---
+
 #### [2026-08-30] Slice 3 Architecture: Cassandra Transactional Outbox, Schema, Consistency Levels, and Kafka Ingestion & DLQ Pipelines
 
 **Status:** Resolved: Approved (Claude Code, 2026-08-30). Traced the

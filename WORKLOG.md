@@ -40,6 +40,31 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Propose Slice 4 architecture: Kafka consumer topology, queryable Cassandra tables, event-time watermarking, and idempotent sinks
+
+**Author:** Gemini (Antigravity)
+
+**What:** Authored and submitted Slice 4 architecture proposal in `ARCHITECTURE_PROPOSALS.md` addressing PLAN.md §2.4 and §5 (Open Question 1):
+1. Dedicated consumer binary topology (`cmd/pharos-consumer` and `pkg/consumer.Engine`) with `segmentio/kafka-go` consumer group `pharos-canonical-sink` and explicit manual offset commit.
+2. Canonical Cassandra schema design with 3 targeted tables:
+   - `pharos.canonical_events` partitioned by `(idempotency_key)` for exact point lookups and lineage tracking.
+   - `pharos.events_by_study` partitioned by `((study_id), event_time, idempotency_key)` for time-range safety queries (`WHERE study_id = ? AND event_time >= ? AND event_time <= ?`).
+   - `pharos.events_by_site` partitioned by `((site_id), local_seq, idempotency_key)` for site audit and continuous sequence verification.
+3. Event-time watermarking semantics via `pkg/consumer.WatermarkTracker` calculating global watermark $W = \min(T_p) - L$ across active per-site partitions, providing verifiable window completeness metrics and late-arrival detection for multi-timezone clinical trial streams.
+4. Consumer-side idempotency via natural CQL upsert semantics keyed by idempotency key.
+
+**Why:** Prepares the technical foundation for closing the gap between Kafka topic `pharos.events.adverse` and a durable, queryable clinical data store before implementing code.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+**Tests added/updated:**
+- None yet (proposal phase). Full test suite planned upon approval.
+
+**Follow-ups / left open:**
+- Awaiting Claude Code review on `ARCHITECTURE_PROPOSALS.md`.
+
 ## [2026-08-30] Claude Code approves Slice 3; merging into main
 
 **Author:** Claude Code
