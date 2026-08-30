@@ -44,7 +44,77 @@ to change)
 
 #### [2026-08-30] Slice 4 Architecture: Kafka Consumer Topology, Canonical Cassandra Query Tables, Event-Time Watermarking, and Idempotent Downstream Sinks
 
-**Status:** Pending
+**Status:** Requires revision (Claude Code, 2026-08-30) — do not implement
+yet. The consumer topology, the three-table canonical schema (genuinely
+resolves the long-open §5 query-pattern question, and the idempotent-upsert
+reasoning for redelivered messages correctly holds across all three tables
+since `idempotency_key` is part of every primary key), and the decision to
+skip Flink for a pure-Go watermark tracker are all approved as-is. One
+required fix on the watermark formula itself, and one recommended change to
+the write strategy.
+
+**Required fix — the watermark formula has no idle-partition exclusion, and
+that directly undermines the feature's own stated purpose.**
+`W = min_p(T_p) - L` takes the minimum over *all* active partitions with no
+way to exclude one that's gone silent. Walk through the exact scenario this
+project exists to handle: a site (say, Nigeria) loses connectivity for three
+days — PLAN.md §2.1's own example. Under this formula, that partition's `T_p`
+stops advancing the moment the site goes offline, and since a frozen
+partition is still counted in the `min()`, the *global* watermark `W` freezes
+at that moment too — even though every other site's partition keeps
+advancing normally. The proposal's own motivating question — "is the
+clinical safety data for yesterday complete across all global trial sites?"
+— would answer "no, indefinitely" for the *entire dataset* the instant any
+single site has the exact outage this whole project is built to tolerate.
+This isn't an edge case; it's the central scenario, so a watermark design
+that hangs on it can't ship as-is.
+
+Fix: track wall-clock time since each partition's last-consumed message,
+separately from that partition's event-time progress. If a partition has
+been idle (no new messages, not merely no *recent* event-time progress)
+beyond a configurable threshold, exclude it from the `min()` computation
+until it produces again — the same idle-source-detection pattern Flink and
+Kafka Streams use for exactly this problem. Re-include a partition the
+moment it resumes producing, recomputing based on its new `T_p`. Write this
+down explicitly as part of the `WatermarkTracker` design, including what
+happens to the completeness signal for windows that were computed while the
+partition was excluded (do they get revisited once the site reconnects and
+its backlog of "late" events arrive, or stay as originally reported? PLAN.md
+already requires late events to be durably flagged rather than dropped,
+which covers the data — but the *completeness signal* itself needs the same
+scrutiny, since it's the visible artifact clinical safety staff would
+actually act on).
+
+**Recommended change — reconsider the logged batch across 3 tables.**
+`event_outbox` uses lightweight transactions because two different actors
+raced on the *same* partition key and needed a distributed compare-and-swap
+to resolve who gets to publish — a genuine correctness necessity. Writing
+`canonical_events`/`events_by_study`/`events_by_site` is a different
+situation: there's exactly one writer (the consumer processing this
+message), all three writes are individually idempotent upserts, and the
+consumer already withholds the Kafka offset commit until all three succeed
+— which already gives "retry the whole set until every table reflects it"
+without needing Cassandra's own atomicity machinery. A logged batch across
+three *different* partition keys is a well-known Cassandra throughput
+anti-pattern (the coordinator has to durably write the batch log to two
+replicas before executing statements against three different partitions'
+owning nodes) for a guarantee this design doesn't actually need — the
+retry-via-uncommitted-offset already provides it. Recommend independent
+writes (parallel, gated by an errgroup or WaitGroup before the offset
+commit) instead. Not blocking if there's a concrete reason to keep the
+logged batch — but the stated rationale ("atomic... ensures multi-table
+consistency") doesn't hold up against what the offset-commit gate already
+provides, so make the actual tradeoff explicit if you disagree rather than
+defaulting to the heavier mechanism.
+
+Minor, non-blocking: confirm how `study_id` gets extracted for
+`events_by_study`'s partition key, since `model.AdverseEvent.Study` is
+modeled as a list (`[]Reference`) — presumably `Study[0]`, matching how
+`SiteID()` already extracts from a single reference field, but say so
+explicitly rather than leaving it implicit in the consumer code.
+
+Revise the watermark design with the fix above and re-submit before writing
+implementation code.
 
 **What in PLAN.md this touches:**
 - §2.4 Multi-timezone event ordering and correctness
