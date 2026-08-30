@@ -40,6 +40,104 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code review: Slice 3 core design verified against real infra; one required fix, one recurring process bug
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 3 implementation (commit `6816a47`). Pulled
+the branch, independently confirmed `go vet` clean and the full suite passing
+with `-race`, and read the actual diff rather than trusting the summary
+alone. The core claim/lease outbox design (`pkg/dedup/cassandra_store.go`)
+is implemented correctly and — significantly — actually verified against a
+real Cassandra container and a real Kafka broker, not just mocks
+(`TestCassandraOutboxStore_RealIntegration`, `TestKafkaProducer_RealIntegration`,
+both passing). The `MapScanCAS` fix Gemini found and applied during this
+round is legitimate: Cassandra's LWT protocol returns the existing row's
+columns on a failed conditional write specifically so the client doesn't
+need a follow-up `SELECT`, and the code now correctly reads from that map
+instead of assuming a single-column scan.
+
+Found one real gap in the multi-event-batch fix from the prior review round,
+and repeated the exact same file-corruption mistake from an earlier round in
+a second file.
+
+**Why:** The multi-batch fix (no longer aborting mid-loop on an infra error)
+is real and its own test passes, but it's only half-connected end to end.
+`HandleEvents` now returns HTTP 503 whenever any event in a batch hits a
+transient infra failure, with a `StatusFailed` per-event result inside the
+`BatchResponse` body. But `pkg/edge/forwarder.go` (untouched this round —
+confirmed via `git show --stat`) only parses the response body for
+200/201/207/422; any other status code, including this new 503, falls into
+its `default:` branch, which marks the *entire* batch `FAILED` for retry
+without ever reading the body. So the granular per-event information Central
+Ingestion now produces is never actually consumed — the forwarder just
+retries the whole batch regardless, same as before the fix. Not currently a
+correctness bug: the already-published events in that batch are safe
+idempotent no-ops on retry, so nothing is lost or duplicated today. But it's
+a real latent trap: if the forwarder's switch statement is ever extended to
+parse 5xx bodies (a natural next step given the handler now exists to
+support exactly that), the existing per-event correlation logic doesn't know
+about `StatusFailed` at all — anything that isn't explicitly `StatusRejected`
+falls into an `else` branch that, for any code other than 422, marks it
+`ackIDs` (acknowledged). That would silently mark a genuinely-failed,
+never-published event as successfully delivered — real, silent data loss,
+exactly the class of bug this whole project exists to prevent.
+
+Also found: the exact same header-corruption pattern from an earlier round
+(an `ARCHITECTURE_PROPOSALS.md` entry losing its `## [date] title` line when
+a new entry was prepended above it) recurred here in `WORKLOG.md` — Gemini's
+new Slice 3 entry's insertion swallowed the header of the immediately-
+following entry (my own "Claude Code approves revised Slice 3 outbox design"
+entry). This is the second time this exact mistake has happened in a
+different file, which means it's a systematic pattern in how new entries get
+prepended, not a one-off. Restored the missing header directly.
+
+**How:** Traced the actual code path: `HandleEvents`'s status-code decision
+(`if failedCount > 0 { ...503... }`) takes priority over the 207/422/200
+branches, so ANY infra failure in a batch — even alongside successes — routes
+to 503, which the forwarder's switch statement doesn't special-case.
+Verified via `grep`/`sed` on `pkg/edge/forwarder.go`'s switch statement and
+confirmed `forwarder.go` wasn't in this commit's changed-file list at all.
+Restored the missing `WORKLOG.md` header by hand, then scanned the entire
+file (and `ARCHITECTURE_PROPOSALS.md`) programmatically for any other
+instance of an `**Author:**`/`**Status:**` line missing its preceding header
+— none found, so this was an isolated instance this round, not a chain.
+
+Also noted a minor, non-blocking inconsistency while reading: when a DLQ
+write or Kafka publish fails for an event that was already counted as
+`rejectedCount++` earlier in the loop (because it failed FHIR validation),
+`results[i].Status` correctly gets overwritten to `FAILED`, but
+`rejectedCount` itself is never decremented — so the response's top-level
+`Rejected` count can be inflated relative to how many entries in `Results`
+actually show `Status == "REJECTED"`. Not a correctness issue since a careful
+consumer should trust per-item `Results` over the aggregate counts, but worth
+tidying alongside the status-code fix.
+
+**Files/modules touched this round:** `WORKLOG.md` (header restoration).
+
+**Tests added/updated:** none by Claude this round — independently
+re-verified the existing suite (51 tests across 6 packages, `go vet` clean,
+`-race` clean) rather than adding new tests myself.
+
+**Follow-ups / left open:**
+- Required before merge: change `HandleEvents` to return 207 (not 503)
+  whenever the batch has any successfully-processed events (accepted or
+  rejected) alongside failures — reserve a bare 503 for the case where every
+  single event in the batch hit an infra failure with nothing else to
+  report. Extend `forwarder.go`'s per-event correlation logic to explicitly
+  handle `ingestion.StatusFailed` by calling the existing
+  `QueueStore.MarkFailed` on exactly those record IDs (with backoff),
+  instead of letting them fall into the ambiguous `else` branch. Add a test
+  exercising the full forwarder-receives-207-with-a-FAILED-event path, not
+  just the handler-level behavior in isolation.
+- Fix the `rejectedCount` bookkeeping nit alongside the above, same area of
+  code.
+- Process note, now confirmed recurring: whenever prepending a new entry to
+  `WORKLOG.md` or `ARCHITECTURE_PROPOSALS.md`, verify with a diff or a
+  re-read that the entry immediately below still has its own intact header
+  line before moving on. This has now silently damaged two different files
+  across two different rounds.
+
 ## [2026-08-30] Implement Slice 3: Cassandra transactional outbox, Kafka publisher, sweeper, and multi-event batch failure resilience
 
 **Author:** Gemini (Antigravity)
@@ -85,6 +183,8 @@ especially for anything touching partition handling, dedup, or ordering)
 
 **Follow-ups / left open:**
 - Ready for Slice 4 (Kafka consumer and ordered downstream processing).
+
+## [2026-08-30] Claude Code approves revised Slice 3 outbox design; cleared to implement
 
 **Author:** Claude Code
 
