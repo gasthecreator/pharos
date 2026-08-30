@@ -40,6 +40,52 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Implement Slice 5: Canonical query CLI, DLQ inspection tooling, and Kafka retention policies
+
+**Author:** Gemini (Antigravity)
+
+**What:** Closed out the remaining items in PLAN.md (§2.3, §2.4, §4, §5) for query surfaces, dead-letter inspection, and Kafka retention:
+1. **Canonical Query Service & DLQ Inspection Tooling (`pkg/query/service.go`, `pkg/query/types.go`)**:
+   - `Service` interface unifying canonical queries (`GetEvent`, `GetEventsByStudy`, `GetEventsBySite`) and DLQ queries (`GetDLQEvent`, `ListDLQEventsBySite`, `ListAllDLQEvents`).
+   - `CassandraService`: Implements queries against live Cassandra tables:
+     - Point lookup on `pharos.canonical_events` by `idempotency_key`.
+     - Time-range query on `pharos.events_by_study` by `((study_id), event_time, idempotency_key)`.
+     - Site sequence query on `pharos.events_by_site` by `((site_id), local_seq, idempotency_key)`.
+     - DLQ point lookup and site-scoped queries against `pharos.dead_letter_events`.
+   - Migration `migrations/003_dlq_site_index.cql`: Adds secondary index `dead_letter_site_idx` on `pharos.dead_letter_events (site_id)` for performant site filtering without table scans.
+   - `MemoryService`: In-memory implementation for unit testing and offline demo.
+2. **Unified Query & Inspection CLI (`cmd/pharos-cli/main.go`)**:
+   - Dedicated CLI tool for technical walkthroughs, operational inspection, and recruiting demos:
+     - `pharos-cli query study <study_id> --from <RFC3339> --to <RFC3339>`
+     - `pharos-cli query site <site_id> [--min-seq <n>]`
+     - `pharos-cli query event <idempotency_key>`
+     - `pharos-cli dlq list [--site <site_id>] [--limit <n>]`
+     - `pharos-cli dlq get <idempotency_key>`
+   - Formats output as clear ASCII tables with tabwriter, or structured JSON via `--json`. Includes `--memory` flag for instant offline demonstration.
+3. **Kafka Retention Policies (`pkg/kafka/topics.go`, `ARCHITECTURE_PROPOSALS.md`)**:
+   - `pharos.events.adverse`: **7 days (168h / 604,800,000 ms)**, 10 GB per partition. Aligned with FDA 7-day expedited safety reporting requirements under 21 CFR 312.32(c)(2), providing operational buffer for consumer maintenance without unbounded broker disk usage.
+   - `pharos.events.dlq`: **14 days (336h / 1,209,600,000 ms)**, 5 GB per partition. Provides investigative runway for site data managers to diagnose and remediate malformed submissions before log roll.
+4. **Testing & Verification**:
+   - `pkg/query/service_test.go`: Unit tests for canonical and DLQ query interfaces in memory.
+   - `pkg/query/query_integration_test.go`: Integration tests running against live Cassandra container:
+     - `TestQueryService_RealCassandraCanonicalQueries`: Validates point lookup, study date-range query, and site sequence query.
+     - `TestQueryService_RealCassandraDLQInspectionWithActualValidationFailure`: Submits an event that actually fails FHIR validation through Central Ingestion, verifying that `GetDLQEvent`, `ListDLQEventsBySite`, and `ListAllDLQEvents` surface real validation error reasons (`actuality must be 'actual': got "invalid_not_actual"`), raw wire JSON, and DLQ Kafka coordinates.
+   - Full repository test suite (`go test -count=1 -race ./...` across all packages including fault-injection suite): ALL PASS.
+
+**Why:** Closes the final open items in PLAN.md §4: canonical queries are operational, dead-letter entries are inspectable with validation failure details, and Kafka retention is formally defined and grounded.
+
+**Files/modules touched:**
+- `pkg/query/types.go` [NEW]
+- `pkg/query/service.go` [NEW]
+- `pkg/query/service_test.go` [NEW]
+- `pkg/query/query_integration_test.go` [NEW]
+- `cmd/pharos-cli/main.go` [NEW]
+- `migrations/003_dlq_site_index.cql` [NEW]
+- `pkg/kafka/topics.go` [NEW]
+- `PLAN.md` [MODIFIED]
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
 ## [2026-08-30] Claude Code builds the fault-injection test suite: network partition and out-of-order delivery
 
 **Author:** Claude Code
