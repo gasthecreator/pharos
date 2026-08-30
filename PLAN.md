@@ -166,6 +166,16 @@ bucket can be swapped in without changing callers once Central Ingestion
 actually runs multiple replicas behind a load balancer — no reason to pay that
 resource/complexity cost before it's needed.
 
+**Resolved 2026-08-29 — what a token meters:** each token is consumed per
+inbound HTTP batch request (`POST /api/v1/events`), not per individual event.
+Since the edge forwarder batches up to `BatchSize` (50) events per request
+(§2.1), the effective burst allowance is `capacity × BatchSize` — e.g. the
+100-token default permits a burst of up to 5,000 events, with sustained
+throughput up to `refill_rate × BatchSize` (500 events/sec at the default 10
+tokens/sec). This is a request-level throttle on the HTTP intake layer, not a
+precise per-event budget — full detail and the alternatives considered in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+
 **Reasoning:** A single misbehaving site (bad clock, buggy client, malformed FHIR)
 must not be able to degrade ingestion for every other site, and must not silently
 lose data — DLQ entries need to be inspectable and replayable once fixed.

@@ -40,6 +40,76 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-29] Claude Code approves Slice 2 (PR #2) after review fixes; merging
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's fixes for the two findings from the prior Slice 2
+review round. Pulled the branch locally, independently re-ran `go vet` and
+`go test -race -count=1 ./...` (25 tests, 0 failures) rather than trusting the
+summary, and read the actual diff for both fixes plus their new tests.
+
+Fix 1 (raw payload forwarding): confirmed `BatchRequest.Events` is now
+`[]json.RawMessage`, the forwarder forwards `r.Payload` verbatim with no
+struct round-trip, and `TestForwarder_PreservesRawPayloadBytes` genuinely
+proves it — it injects a custom unmodeled field directly into the stored
+payload and asserts it survives to the outbound HTTP body byte-for-byte.
+Central Ingestion's handler also gained graceful per-event handling of
+unparseable raw messages (extracts the idempotency key via a partial parse
+even when full unmarshal fails, so one corrupted event in a batch doesn't
+prevent correlating or reporting the rest) — `TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON`
+covers exactly this. Good, thorough work, not a superficial patch.
+
+Fix 2 (distinct rejection status): confirmed `StatusRejected` and
+`QueueStore.MarkRejected` exist, `FetchPending`'s query still excludes it
+(verified it isn't in either branch of the `WHERE status = ? OR (status = ?
+...)` clause), and the forwarder now correlates `BatchResponse.Results` to
+local records by idempotency key rather than array position, calling
+`MarkRejected` for actually-rejected events and `MarkAcknowledged` only for
+actually-accepted ones — tested for both the 207 mixed-batch case and the 422
+full-batch case, checking actual DB state via direct queries, not just the
+returned counts.
+
+Also reviewed and approved the rate-limiter clarification proposal Gemini
+wrote to `ARCHITECTURE_PROPOSALS.md` (tokens meter HTTP batch requests, not
+individual events — effective burst is `capacity × BatchSize`). Folded into
+`PLAN.md` §2.3, with one correction noted in the proposals file: its stated
+justification for rejecting per-event metering (avoiding parse-before-limit
+cost) doesn't hold, since the handler already parses the body before checking
+the rate limiter regardless of metering unit. Doesn't change the approval —
+the substantive conclusion (document the 50x multiplier) is correct — just
+didn't want inaccurate reasoning to read as a real security property later.
+
+**Why:** Both fixes directly closed real correctness/audit gaps identified in
+the prior review: silent data destruction on a corrupt local record, and a
+rejected event being indistinguishable from a successful delivery in the
+local queue's own state. Both are exactly the class of bug PLAN.md's charter
+(never silently lose or misrepresent data) exists to catch.
+
+**How:** No code changes this round — verification and documentation only.
+Merging PR #2 (`feat/slice-2-forwarder-ingestion`) into `main` after this
+entry lands.
+
+**Files/modules touched:** `PLAN.md` (§2.3), `ARCHITECTURE_PROPOSALS.md`
+(1 entry resolved), `WORKLOG.md`.
+
+**Tests added/updated:** none by Claude this round — independently re-verified
+Gemini's 4 new tests (`TestForwarder_PreservesRawPayloadBytes`,
+`TestForwarder_207MixedBatchCorrelation`, `TestForwarder_422FullBatchRejection`,
+`TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON`, plus
+`TestSQLiteStore_MarkRejected`) actually exercise what they claim to.
+
+**Follow-ups / left open:**
+- Slice 3 still owns the real gap underneath fix 2: Central Ingestion doesn't
+  yet persist rejected events anywhere durable (no Kafka DLQ). A `REJECTED`
+  status locally is necessary but not sufficient — Slice 3 must add durable
+  DLQ persistence before a 422/207 rejection can be considered truly final
+  per PLAN.md §2.3's "DLQ entries need to be inspectable and replayable."
+- Minor/non-blocking: `MarkRejected` (like `MarkInFlight`/`MarkAcknowledged`)
+  uses `fmt.Sprintf` to embed the status constant into the query text — same
+  pre-existing style nit noted in the Slice 1 review, not a security issue,
+  still just cosmetic cleanup for whenever that file is next touched.
+
 ## [2026-08-29] Slice 2 review fixes: raw byte forwarding without struct round-tripping, distinct StatusRejected for rejections
 
 **Author:** Gemini (Antigravity)

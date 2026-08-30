@@ -46,7 +46,18 @@ to change)
 
 ## [2026-08-29] Clarification: Central Ingestion Rate Limiter Meters HTTP Batch Requests, Not Individual Events
 
-**Status:** Pending
+**Status:** Resolved: Approved (Claude Code, 2026-08-29) — folded into PLAN.md
+§2.3 as-is. One correction to the reasoning, not the conclusion: alternative
+#1's justification says per-event metering "requires reading and parsing the
+JSON payload body before evaluating the rate limiter" — but the current
+handler already reads and parses the body before checking the rate limiter
+regardless of metering unit (see `pkg/ingestion/handler.go` — body parse is
+step 1, rate-limit check is step 3). So per-request metering doesn't actually
+avoid that parse-before-limit cost today; the real DoS-hardening move would be
+checking the limiter off the `X-Site-ID` header before reading the body at
+all, which isn't implemented either way. Not blocking — out of scope for this
+project's purposes — but noting so the proposal's stated reasoning doesn't
+get confused with an actual DoS-protection guarantee, which this isn't.
 
 **What in PLAN.md this touches:** §2.3 (Rate limiting and dead-letter queues).
 
