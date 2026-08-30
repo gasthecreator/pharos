@@ -44,6 +44,98 @@ to change)
 
 ## Proposals
 
+## [2026-08-30] Slice 3 Architecture: Cassandra Transactional Outbox, Schema, Consistency Levels, and Kafka Ingestion & DLQ Pipelines
+
+**Status:** Pending
+
+**What in PLAN.md this touches:** §2.2 (Exactly-once processing semantics & transactional outbox), §2.3 (Dead-letter queues), §2.4 (Kafka partitioning by site_id), §3 (Planned stack).
+
+**What I'm proposing:**
+Define the exact architectural decisions, Cassandra schemas, consistency levels, outbox execution lifecycle, and Kafka pipeline for Slice 3:
+
+### 1. Cassandra Consistency Levels
+- **Serial Consistency (LWT Paxos phase):** `LOCAL_SERIAL` for `INSERT ... IF NOT EXISTS` and conditional statements. Keeps Paxos consensus within the local datacenter, avoiding cross-DC WAN roundtrips while providing linearizable ordering on the partition key (`idempotency_key`).
+- **Write Consistency (Commit phase):** `LOCAL_QUORUM` for multi-node deployments; falls back to `ONE` in the single-node local Docker development environment where replication factor is 1.
+- **Read Consistency:** `LOCAL_QUORUM` (or `ONE` for single-node dev).
+
+### 2. Cassandra Schemas & Bootstrapping
+- **Keyspace:** `pharos` (`SimpleStrategy`, replication_factor: 1 for local dev; `NetworkTopologyStrategy` in production).
+- **Table 1: `pharos.event_outbox` (Dedup & Transactional Outbox)**
+  ```cql
+  CREATE TABLE IF NOT EXISTS pharos.event_outbox (
+      idempotency_key text,
+      site_id text,
+      local_seq bigint,
+      payload text,
+      published boolean,
+      created_at timestamp,
+      published_at timestamp,
+      kafka_topic text,
+      kafka_partition int,
+      kafka_offset bigint,
+      PRIMARY KEY (idempotency_key)
+  );
+  ```
+  Primary key `idempotency_key` (`<site_id>:<local_seq>`) guarantees strict uniqueness and per-key linearizability via LWT.
+- **Table 2: `pharos.dead_letter_events` (Dead-Letter Audit Store)**
+  ```cql
+  CREATE TABLE IF NOT EXISTS pharos.dead_letter_events (
+      idempotency_key text,
+      site_id text,
+      payload text,
+      rejection_reason text,
+      validation_errors text,
+      rejected_at timestamp,
+      kafka_published boolean,
+      PRIMARY KEY (idempotency_key)
+  );
+  ```
+- **Bootstrapping Strategy:** Schema-on-connect via Go initialization helper (`EnsureSchema(session)`), with a declarative CQL script at `migrations/001_init_schema.cql` for `cqlsh` and CI automation.
+
+### 3. Transactional Outbox Lifecycle & Crash Resumption
+- **Accept Path (Synchronous Fast-Path with Resumption on Retry):**
+  1. Intake receives event batch, evaluates rate limiter, and validates each event against scoped FHIR profile.
+  2. For valid events, Central Ingestion writes to Cassandra:
+     `INSERT INTO pharos.event_outbox (idempotency_key, site_id, local_seq, payload, published, created_at) VALUES (?, ?, ?, ?, false, ?) IF NOT EXISTS;`
+  3. **Dedup & Crash-Recovery Branching on `applied`:**
+     - **If `applied == true`**: New event. Safely durably recorded in Cassandra with `published = false`.
+     - **If `applied == false`**: The idempotency key already exists. Read existing row:
+       - If `published == true`: The event was already published to Kafka in an earlier pass. Return HTTP 200 to edge without re-publishing to Kafka (zero duplicate Kafka messages).
+       - If `published == false`: A previous intake run crashed or timed out *after* the Cassandra write but *before* the Kafka publish! Treat this incoming retry as the resumption trigger: proceed directly to step 4 to complete the interrupted publish.
+  4. **Kafka Publishing Step:** Publish to topic `pharos.events.adverse` using partition key `site_id`.
+  5. **Mark Published:** On successful Kafka acknowledgement:
+     `UPDATE pharos.event_outbox SET published = true, published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ? WHERE idempotency_key = ?;`
+  6. **Return HTTP 200 to edge:** Only after step 2 succeeds (and preferably after step 5) is HTTP 200 returned.
+- **Background Outbox Sweeper:**
+  To guarantee eventual publication even if an edge node crashes and never retries an interrupted publish: a background worker runs periodically (e.g. every 10s) to query and drain any lingering unpublished events. Because Cassandra does not efficiently index low-cardinality booleans (`WHERE published = false` across full tables), pending keys can be tracked in an auxiliary time-bucketed table `pharos.pending_outbox (bucket text, idempotency_key text, created_at timestamp, PRIMARY KEY (bucket, idempotency_key))` from which rows are deleted upon publish, or the edge-retry mechanism serves as primary resumption with the sweeper handling the bucket.
+
+### 4. Dead-Letter Pipeline (DLQ)
+- For events failing FHIR validation, Central Ingestion guarantees durable persistence *before* responding with HTTP 422/207:
+  1. Write structured failure metadata (`idempotency_key`, `site_id`, `payload`, `rejection_reason`, `validation_errors`, `rejected_at`) to Cassandra `pharos.dead_letter_events`.
+  2. Publish structured DLQ event to Kafka topic `pharos.events.dlq` partitioned by `site_id`.
+  3. Only after durable persistence does Central Ingestion return HTTP 422 (or 207 Multi-Status) to the edge.
+  4. Edge collector marks the event `REJECTED`, knowing the record is permanently preserved for regulatory audit and replay.
+
+### 5. Kafka Client & Configuration
+- Use `github.com/segmentio/kafka-go` (pure Go, zero cgo/librdkafka runtime dependencies).
+- Main Topic: `pharos.events.adverse`, partitioned by `site_id` (preserves per-site FIFO ordering per §2.4).
+- DLQ Topic: `pharos.events.dlq`, partitioned by `site_id`.
+- Producer: Idempotent producer enabled (`RequiredAcks: -1 / All`, retries enabled).
+
+**Why:**
+- Exactly matches PLAN.md §2.2: Eliminates the fatal crash window of check-then-publish by making the outbox write the primary dedup gate (`published: false` via LWT).
+- Ensures rejected events are never lost: fixes the open gap from Slice 2 by durably storing rejections in both Cassandra and Kafka DLQ before acknowledging the edge.
+- Preserves per-site ordering in Kafka via `site_id` partition key (§2.4).
+
+**Alternatives considered:**
+1. Check-then-publish (check key exists, publish to Kafka, then store key): Explicitly rejected in PLAN.md §2.2 review because a crash between steps drops retries forever.
+2. Background-only outbox publish (return HTTP 200 after Cassandra write, let worker publish to Kafka asynchronously): Adds latency between edge acceptance and Kafka availability. Hybrid approach (synchronous publish with retry/sweeper resumption) provides immediate consistency for happy path and guaranteed recovery under crashes.
+3. Confluent cgo Kafka client: Requires native `librdkafka` C libraries, complicating cross-compilation, local testing, and Docker builds. Pure Go `segmentio/kafka-go` is robust and dependency-free.
+
+**Impact if approved:** Governs Slice 3 implementation across `pkg/dedup`, `pkg/kafka`, and `pkg/ingestion`.
+
+---
+
 ## [2026-08-29] Clarification: Central Ingestion Rate Limiter Meters HTTP Batch Requests, Not Individual Events
 
 **Status:** Resolved: Approved (Claude Code, 2026-08-29) — folded into PLAN.md
