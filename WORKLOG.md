@@ -40,6 +40,146 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-29] Claude Code approves Slice 2 (PR #2) after review fixes; merging
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's fixes for the two findings from the prior Slice 2
+review round. Pulled the branch locally, independently re-ran `go vet` and
+`go test -race -count=1 ./...` (25 tests, 0 failures) rather than trusting the
+summary, and read the actual diff for both fixes plus their new tests.
+
+Fix 1 (raw payload forwarding): confirmed `BatchRequest.Events` is now
+`[]json.RawMessage`, the forwarder forwards `r.Payload` verbatim with no
+struct round-trip, and `TestForwarder_PreservesRawPayloadBytes` genuinely
+proves it — it injects a custom unmodeled field directly into the stored
+payload and asserts it survives to the outbound HTTP body byte-for-byte.
+Central Ingestion's handler also gained graceful per-event handling of
+unparseable raw messages (extracts the idempotency key via a partial parse
+even when full unmarshal fails, so one corrupted event in a batch doesn't
+prevent correlating or reporting the rest) — `TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON`
+covers exactly this. Good, thorough work, not a superficial patch.
+
+Fix 2 (distinct rejection status): confirmed `StatusRejected` and
+`QueueStore.MarkRejected` exist, `FetchPending`'s query still excludes it
+(verified it isn't in either branch of the `WHERE status = ? OR (status = ?
+...)` clause), and the forwarder now correlates `BatchResponse.Results` to
+local records by idempotency key rather than array position, calling
+`MarkRejected` for actually-rejected events and `MarkAcknowledged` only for
+actually-accepted ones — tested for both the 207 mixed-batch case and the 422
+full-batch case, checking actual DB state via direct queries, not just the
+returned counts.
+
+Also reviewed and approved the rate-limiter clarification proposal Gemini
+wrote to `ARCHITECTURE_PROPOSALS.md` (tokens meter HTTP batch requests, not
+individual events — effective burst is `capacity × BatchSize`). Folded into
+`PLAN.md` §2.3, with one correction noted in the proposals file: its stated
+justification for rejecting per-event metering (avoiding parse-before-limit
+cost) doesn't hold, since the handler already parses the body before checking
+the rate limiter regardless of metering unit. Doesn't change the approval —
+the substantive conclusion (document the 50x multiplier) is correct — just
+didn't want inaccurate reasoning to read as a real security property later.
+
+**Why:** Both fixes directly closed real correctness/audit gaps identified in
+the prior review: silent data destruction on a corrupt local record, and a
+rejected event being indistinguishable from a successful delivery in the
+local queue's own state. Both are exactly the class of bug PLAN.md's charter
+(never silently lose or misrepresent data) exists to catch.
+
+**How:** No code changes this round — verification and documentation only.
+Merging PR #2 (`feat/slice-2-forwarder-ingestion`) into `main` after this
+entry lands.
+
+**Files/modules touched:** `PLAN.md` (§2.3), `ARCHITECTURE_PROPOSALS.md`
+(1 entry resolved), `WORKLOG.md`.
+
+**Tests added/updated:** none by Claude this round — independently re-verified
+Gemini's 4 new tests (`TestForwarder_PreservesRawPayloadBytes`,
+`TestForwarder_207MixedBatchCorrelation`, `TestForwarder_422FullBatchRejection`,
+`TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON`, plus
+`TestSQLiteStore_MarkRejected`) actually exercise what they claim to.
+
+**Follow-ups / left open:**
+- Slice 3 still owns the real gap underneath fix 2: Central Ingestion doesn't
+  yet persist rejected events anywhere durable (no Kafka DLQ). A `REJECTED`
+  status locally is necessary but not sufficient — Slice 3 must add durable
+  DLQ persistence before a 422/207 rejection can be considered truly final
+  per PLAN.md §2.3's "DLQ entries need to be inspectable and replayable."
+- Minor/non-blocking: `MarkRejected` (like `MarkInFlight`/`MarkAcknowledged`)
+  uses `fmt.Sprintf` to embed the status constant into the query text — same
+  pre-existing style nit noted in the Slice 1 review, not a security issue,
+  still just cosmetic cleanup for whenever that file is next touched.
+
+## [2026-08-29] Slice 2 review fixes: raw byte forwarding without struct round-tripping, distinct StatusRejected for rejections
+
+**Author:** Gemini (Antigravity)
+
+**What:** Addressed two correctness and data integrity items identified during PR #2 review:
+1. Replaced struct round-tripping in the edge forwarder with direct raw-byte forwarding using `json.RawMessage` in the wire format (`ingestion.BatchRequest`). Eliminates data loss from fallback empty events on unmarshal failures and prevents stripping unmodeled fields from adverse event payloads (§2.1).
+2. Added distinct terminal `RecordStatus` (`StatusRejected`) in `pkg/edge/store.go` and `SQLiteStore.MarkRejected`. Updated `forwarder.go` to correlate per-event outcomes by `idempotency_key` (instead of array index) on HTTP 207 and HTTP 422 responses, marking rejected events as `StatusRejected` rather than conflating them with `StatusAcknowledged` (§2.2, §2.3).
+3. Added architecture proposal clarifying that Central Ingestion rate limiting meters HTTP batch requests rather than individual events, resulting in an effective event capacity of `tokens * BatchSize`.
+
+**Why:**
+- Data preservation (§2.1): Forwarder must never mutate or substitute captured data on disk; forwarding the exact captured bytes ensures high-fidelity transmission.
+- Accurate local audit trail (§2.3): The edge store must truthfully represent delivery outcomes. Marking permanently rejected events as `REJECTED` preserves diagnostic errors on disk without infinite retry loops, separate from successfully delivered `ACKNOWLEDGED` events.
+
+**Files/modules touched:**
+- `pkg/edge/store.go`
+- `pkg/edge/sqlite_store.go`, `pkg/edge/sqlite_store_test.go`
+- `pkg/edge/forwarder.go`, `pkg/edge/forwarder_test.go`
+- `pkg/ingestion/handler.go`, `pkg/ingestion/handler_test.go`
+- `ARCHITECTURE_PROPOSALS.md`
+- `WORKLOG.md`
+
+**Tests added/updated:**
+- `TestForwarder_PreservesRawPayloadBytes`: confirms unmodeled fields are retained and forwarded verbatim.
+- `TestForwarder_207MixedBatchCorrelation`: verifies mixed batches correlate by `idempotency_key`, resulting in distinct `ACKNOWLEDGED` and `REJECTED` states.
+- `TestForwarder_422FullBatchRejection`: verifies 422 responses transition all records to `StatusRejected`.
+- `TestSQLiteStore_MarkRejected`: verifies SQLite transitions records to `REJECTED`, sets `last_error`, excludes them from `FetchPending`, and tracks `RejectedCount` in stats.
+- `TestHandler_PreservesUnmodeledFieldsAndRejectsCorruptedJSON`: verifies central intake accepts payloads with extra fields and cleanly rejects non-event JSON.
+- All 25 tests pass under `-race -count=1`.
+
+## [2026-08-29] Slice 2 built: Edge HTTP capture, forwarder with exponential backoff + jitter, and Central Ingestion rate limiting + FHIR validation
+
+**Author:** Gemini (Antigravity)
+
+**What:** Closed the network loop end-to-end between the edge collector and Central Ingestion:
+1. Implemented Edge Collector HTTP capture endpoint (`pkg/edge/server.go`): site staff/EDC systems submit reports via `POST /api/v1/adverse-events`. Durably buffers records to SQLite WAL before responding with HTTP 201 Created and the client idempotency key. In strict conformance with §2.3, does NOT gate on FHIR schema validation at the edge.
+2. Implemented Edge Collector Forwarder background worker (`pkg/edge/forwarder.go`): calls `QueueStore.FetchPending`, transitions records to `IN_FLIGHT`, sends batch POST requests to Central Ingestion over HTTPS, and marks records `ACKNOWLEDGED` on success. On failures (HTTP 429, 5xx, network timeouts, connection refused), marks records `FAILED` with Exponential Backoff + Full Jitter.
+3. Implemented Central Ingestion HTTP service (`pkg/ingestion/handler.go`): handles `POST /api/v1/events` with per-site token bucket rate limiting (`pkg/ratelimit`) and validates every event against the scoped FHIR R4 AdverseEvent profile (`pkg/model.AdverseEvent.Validate()`). Returns HTTP 200 for valid batches, HTTP 207 Multi-Status for partial validation failures, and HTTP 422 Unprocessable Entity with structured rejection details (`idempotency_key`, rule violated) rather than a bare 400.
+4. Drafted two new proposals in `ARCHITECTURE_PROPOSALS.md`: Central Ingestion rate-limiter in-memory token bucket backing store, and Edge Forwarder Full Jitter retry/backoff parameters.
+5. Integrated both servers and background workers into entrypoints `cmd/pharos-edge/main.go` and `cmd/pharos-ingestion/main.go`.
+
+**Why:** Fulfills core challenges in `PLAN.md`:
+- §2.1 (Network partition tolerance): Edge store-and-forward is now active end-to-end. Events are safely buffered on local disk and forwarded asynchronously with exponential backoff and jitter across network disruptions.
+- §2.2 (Exactly-once semantics): Preserves client-stamped idempotency keys across edge capture, local storage, network serialization, and batch ingestion.
+- §2.3 (Rate limiting and validation): Enforces per-site token bucket rate limiting at central intake, isolating rogue sites. Moves FHIR schema validation to Central Ingestion, returning structured rejection metadata for future DLQ routing.
+
+**How:**
+- Rate limiting: Thread-safe in-memory token bucket (`pkg/ratelimit/limiter.go`) tracking per-site burst capacity and token refill rate. Throttled requests return HTTP 429 with `Retry-After` and `X-RateLimit-*` headers.
+- Forwarder resilience: Exponential backoff with Full Jitter (`sleep = rand(0, min(MaxBackoff, BaseBackoff * 2^attempts))`), eliminating thundering herd synchronization when Central Ingestion recovers. Handles HTTP 429 by respecting the central `Retry-After` header.
+- Poison-pill avoidance: Malformed FHIR events rejected by Central Ingestion (HTTP 422/207) are acknowledged at the edge once inspected by Central Ingestion, preventing infinite retry loops that would block valid events.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md`
+- `pkg/ratelimit/limiter.go`, `pkg/ratelimit/limiter_test.go`
+- `pkg/ingestion/handler.go`, `pkg/ingestion/handler_test.go`
+- `pkg/edge/server.go`, `pkg/edge/server_test.go`
+- `pkg/edge/forwarder.go`, `pkg/edge/forwarder_test.go`
+- `cmd/pharos-edge/main.go`
+- `cmd/pharos-ingestion/main.go`
+- `WORKLOG.md`
+
+**Tests added/updated:**
+- `pkg/ratelimit`: `TestTokenBucketLimiter_BurstAndThrottle`, `TestTokenBucketLimiter_Refill`, `TestTokenBucketLimiter_SiteIsolation`, `TestTokenBucketLimiter_ConcurrentAccess` (150 concurrent goroutines).
+- `pkg/ingestion`: `TestHandler_AllValidBatch`, `TestHandler_ValidationRejectionStructuredErrors` (HTTP 422 with structured field errors), `TestHandler_PartialValidationBatch` (HTTP 207 Multi-Status), `TestHandler_RateLimitingAndHeaders` (HTTP 429 + Retry-After), `TestHandler_MalformedJSON`, `TestHandler_MissingSiteID`.
+- `pkg/edge`: `TestServer_CaptureValidEvent`, `TestServer_CaptureMalformedFHIREvent` (verifies edge buffers invalid FHIR with HTTP 201), `TestServer_MalformedJSON`, `TestServer_EmptyBody`, `TestServer_StatsEndpoint`.
+- `pkg/edge`: `TestForwarder_HappyPathDelivery`, `TestForwarder_Server5xxRetryAndExponentialBackoff`, `TestForwarder_NetworkTimeoutAndConnectionRefused`, `TestForwarder_RateLimit429WithRetryAfter`, `TestForwarder_ValidationRejectionHandling`, `TestForwarder_EndToEndWithCentralIngestion`.
+- All tests pass with race detector: `go test -buildvcs=false -v -race -count=1 ./...` (21 tests across 4 packages, 0 failures, 0 race warnings).
+
+**Follow-ups / left open:**
+- Slice 3: Central Ingestion Kafka publishing, Dead-Letter Queue (DLQ) topic routing for rejected events, and Cassandra transactional-outbox dedup path (§2.2).
+
 ## [2026-08-29] Branch/PR workflow adopted; two Slice 2 proposals reviewed and approved; a file-corruption fix
 
 **Author:** Claude Code

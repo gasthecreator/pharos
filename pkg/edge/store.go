@@ -22,6 +22,7 @@ const (
 	StatusInFlight     RecordStatus = "IN_FLIGHT"
 	StatusAcknowledged RecordStatus = "ACKNOWLEDGED"
 	StatusFailed       RecordStatus = "FAILED"
+	StatusRejected     RecordStatus = "REJECTED"
 )
 
 // QueuedRecord represents an adverse event durably stored on the site's local disk.
@@ -46,6 +47,7 @@ type QueueStats struct {
 	InFlightCount     int64     `json:"in_flight_count"`
 	AcknowledgedCount int64     `json:"acknowledged_count"`
 	FailedCount       int64     `json:"failed_count"`
+	RejectedCount     int64     `json:"rejected_count"`
 	MaxSequence       uint64    `json:"max_sequence"`
 	OldestPendingTime time.Time `json:"oldest_pending_time,omitempty"`
 }
@@ -65,6 +67,9 @@ type QueueStore interface {
 
 	// MarkAcknowledged transitions records to ACKNOWLEDGED upon receipt of HTTP 200/201 from Central Ingestion.
 	MarkAcknowledged(ctx context.Context, ids []int64) error
+
+	// MarkRejected transitions records to REJECTED when Central Ingestion permanently rejects them (e.g. malformed FHIR).
+	MarkRejected(ctx context.Context, ids []int64, errReason string) error
 
 	// MarkFailed records a transmission failure, increments attempt count, and sets next retry timestamp.
 	MarkFailed(ctx context.Context, id int64, errReason string, retryAfter time.Duration) error
