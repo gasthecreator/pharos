@@ -212,6 +212,31 @@ Ingestion only responds 422/207 to the edge after the Cassandra write
 durably succeeds. Full schema and lifecycle in
 [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 
+**Resolved 2026-08-30 — batch response status codes are per-event-aware, not
+all-or-nothing.** A batch can have a genuine mix of outcomes: some events
+accepted, some rejected by FHIR validation, and some hit a transient
+infrastructure failure (Cassandra or Kafka unavailable) unrelated to the
+event's own validity. Collapsing all of that into a single status code loses
+information the edge needs to retry correctly. The contract: **207
+Multi-Status** whenever the batch has any successfully-processed events
+(accepted or rejected) alongside infrastructure failures — the edge forwarder
+is required to parse the body and act per-event (`MarkAcknowledged` for
+accepted, `MarkRejected` for rejected, `MarkFailed` with backoff for the
+`FAILED` status specifically introduced for this case). A bare **503** is
+reserved for the narrow case where *every* event in the batch hit an infra
+failure with nothing else to report. This was caught during review as an
+incomplete fix: an earlier version returned 503 for any infra failure
+regardless of what else succeeded, which the forwarder's response parser
+(scoped to 200/201/207/422) silently ignored — safe by accident, because
+retrying the whole batch is idempotent, but it meant the granular per-event
+information was produced and never consumed, and any status code the
+forwarder doesn't explicitly parse must never be assumed safe to fall back to
+"acknowledge everything." The forwarder's fallback for an unmapped record now
+depends on the response's own status code: 200/201 (unambiguous full success)
+defaults an unmapped record to acknowledged, but 207 and anything else
+defaults an unmapped record to `MarkFailed` with backoff — silence is never
+treated as success.
+
 **Resolved 2026-08-29 — payload schema:** rather than implementing the full FHIR
 R4 `AdverseEvent` resource (large, mostly irrelevant regulatory sub-fields for
 this project's purpose), Pharos targets a deliberately scoped, named subset:
@@ -268,23 +293,36 @@ Rust-level control (unlikely for this project's scope).
 Nothing is built yet. This section starts empty and gets checked off as real code
 lands — do not mark anything done based on a plan or a stub.
 
-- [ ] Repo scaffolding (Go module layout, linting, CI)
-- [ ] Edge collector: local durable buffering
-- [ ] Edge collector: forwarding to Central Ingestion API with retry/backoff
-- [ ] Idempotency key generation (client-side, at capture time)
-- [ ] Central ingestion service: HTTP intake (`POST /api/v1/events`)
-- [ ] Central ingestion service: FHIR schema validation (scoped profile, §2.3)
-- [ ] Dead-letter topic + DLQ inspection tooling
-- [ ] Per-site rate limiting
-- [ ] Dedup store: Cassandra LWT + transactional outbox to Kafka (§2.2)
-- [ ] Kafka topic design (partitioning strategy, retention)
-- [ ] Cassandra schema design
-- [ ] Stream processing layer (event-time ordering / watermarking)
-- [ ] Fault-injection test suite (network partition simulation)
-- [ ] Fault-injection test suite (duplicate delivery)
-- [ ] Fault-injection test suite (out-of-order delivery)
-- [ ] Fault-injection test suite (malformed FHIR payloads → DLQ)
-- [ ] Observability (metrics on lag, dedup hit rate, DLQ volume)
+- [x] Repo scaffolding (Go module layout, linting, CI) — Slice 1
+- [x] Edge collector: local durable buffering — Slice 1 (SQLite WAL)
+- [x] Edge collector: forwarding to Central Ingestion API with retry/backoff — Slice 2
+- [x] Idempotency key generation (client-side, at capture time) — Slice 1
+- [x] Central ingestion service: HTTP intake (`POST /api/v1/events`) — Slice 2
+- [x] Central ingestion service: FHIR schema validation (scoped profile, §2.3) — Slice 2
+- [ ] Dead-letter topic + DLQ inspection tooling — persistence half done (Slice 3:
+      Cassandra `dead_letter_events` + Kafka `pharos.events.dlq`, both durable
+      before responding to the edge); no dedicated inspection tooling built yet
+- [x] Per-site rate limiting — Slice 2
+- [x] Dedup store: Cassandra LWT + transactional outbox to Kafka (§2.2) — Slice 3,
+      verified against a real Cassandra cluster and a real Kafka broker, not just mocks
+- [ ] Kafka topic design (partitioning strategy, retention) — partitioning by
+      `site_id` done and verified (Slice 3); retention policy not yet configured
+      (running on Kafka's defaults)
+- [x] Cassandra schema design — Slice 3 (`event_outbox`, `dead_letter_events`,
+      `pending_outbox`), verified against a real cluster
+- [ ] Stream processing layer (event-time ordering / watermarking) — not started,
+      next slice
+- [ ] Fault-injection test suite (network partition simulation) — not yet a
+      dedicated test; this is explicitly Claude's responsibility per §6, still owed
+- [x] Fault-injection test suite (duplicate delivery) — covered by Slice 3's
+      `TestConcurrentDuplicateRaces`, `TestSequentialDuplicateIdempotency`,
+      `TestCassandraOutboxStore_RealIntegration`'s concurrent-race case
+- [ ] Fault-injection test suite (out-of-order delivery) — not yet a dedicated
+      test; still owed
+- [x] Fault-injection test suite (malformed FHIR payloads → DLQ) — covered by
+      Slice 3's `TestDeadLetterPipeline_DurabilityAndRouting` and related handler tests
+- [ ] Observability (metrics on lag, dedup hit rate, DLQ volume) — in-memory
+      counters exist (`Handler.ExtendedStats`) but nothing exported/scraped yet
 
 ---
 
