@@ -40,6 +40,47 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-29] Slice 2 built: Edge HTTP capture, forwarder with exponential backoff + jitter, and Central Ingestion rate limiting + FHIR validation
+
+**Author:** Gemini (Antigravity)
+
+**What:** Closed the network loop end-to-end between the edge collector and Central Ingestion:
+1. Implemented Edge Collector HTTP capture endpoint (`pkg/edge/server.go`): site staff/EDC systems submit reports via `POST /api/v1/adverse-events`. Durably buffers records to SQLite WAL before responding with HTTP 201 Created and the client idempotency key. In strict conformance with §2.3, does NOT gate on FHIR schema validation at the edge.
+2. Implemented Edge Collector Forwarder background worker (`pkg/edge/forwarder.go`): calls `QueueStore.FetchPending`, transitions records to `IN_FLIGHT`, sends batch POST requests to Central Ingestion over HTTPS, and marks records `ACKNOWLEDGED` on success. On failures (HTTP 429, 5xx, network timeouts, connection refused), marks records `FAILED` with Exponential Backoff + Full Jitter.
+3. Implemented Central Ingestion HTTP service (`pkg/ingestion/handler.go`): handles `POST /api/v1/events` with per-site token bucket rate limiting (`pkg/ratelimit`) and validates every event against the scoped FHIR R4 AdverseEvent profile (`pkg/model.AdverseEvent.Validate()`). Returns HTTP 200 for valid batches, HTTP 207 Multi-Status for partial validation failures, and HTTP 422 Unprocessable Entity with structured rejection details (`idempotency_key`, rule violated) rather than a bare 400.
+4. Drafted two new proposals in `ARCHITECTURE_PROPOSALS.md`: Central Ingestion rate-limiter in-memory token bucket backing store, and Edge Forwarder Full Jitter retry/backoff parameters.
+5. Integrated both servers and background workers into entrypoints `cmd/pharos-edge/main.go` and `cmd/pharos-ingestion/main.go`.
+
+**Why:** Fulfills core challenges in `PLAN.md`:
+- §2.1 (Network partition tolerance): Edge store-and-forward is now active end-to-end. Events are safely buffered on local disk and forwarded asynchronously with exponential backoff and jitter across network disruptions.
+- §2.2 (Exactly-once semantics): Preserves client-stamped idempotency keys across edge capture, local storage, network serialization, and batch ingestion.
+- §2.3 (Rate limiting and validation): Enforces per-site token bucket rate limiting at central intake, isolating rogue sites. Moves FHIR schema validation to Central Ingestion, returning structured rejection metadata for future DLQ routing.
+
+**How:**
+- Rate limiting: Thread-safe in-memory token bucket (`pkg/ratelimit/limiter.go`) tracking per-site burst capacity and token refill rate. Throttled requests return HTTP 429 with `Retry-After` and `X-RateLimit-*` headers.
+- Forwarder resilience: Exponential backoff with Full Jitter (`sleep = rand(0, min(MaxBackoff, BaseBackoff * 2^attempts))`), eliminating thundering herd synchronization when Central Ingestion recovers. Handles HTTP 429 by respecting the central `Retry-After` header.
+- Poison-pill avoidance: Malformed FHIR events rejected by Central Ingestion (HTTP 422/207) are acknowledged at the edge once inspected by Central Ingestion, preventing infinite retry loops that would block valid events.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md`
+- `pkg/ratelimit/limiter.go`, `pkg/ratelimit/limiter_test.go`
+- `pkg/ingestion/handler.go`, `pkg/ingestion/handler_test.go`
+- `pkg/edge/server.go`, `pkg/edge/server_test.go`
+- `pkg/edge/forwarder.go`, `pkg/edge/forwarder_test.go`
+- `cmd/pharos-edge/main.go`
+- `cmd/pharos-ingestion/main.go`
+- `WORKLOG.md`
+
+**Tests added/updated:**
+- `pkg/ratelimit`: `TestTokenBucketLimiter_BurstAndThrottle`, `TestTokenBucketLimiter_Refill`, `TestTokenBucketLimiter_SiteIsolation`, `TestTokenBucketLimiter_ConcurrentAccess` (150 concurrent goroutines).
+- `pkg/ingestion`: `TestHandler_AllValidBatch`, `TestHandler_ValidationRejectionStructuredErrors` (HTTP 422 with structured field errors), `TestHandler_PartialValidationBatch` (HTTP 207 Multi-Status), `TestHandler_RateLimitingAndHeaders` (HTTP 429 + Retry-After), `TestHandler_MalformedJSON`, `TestHandler_MissingSiteID`.
+- `pkg/edge`: `TestServer_CaptureValidEvent`, `TestServer_CaptureMalformedFHIREvent` (verifies edge buffers invalid FHIR with HTTP 201), `TestServer_MalformedJSON`, `TestServer_EmptyBody`, `TestServer_StatsEndpoint`.
+- `pkg/edge`: `TestForwarder_HappyPathDelivery`, `TestForwarder_Server5xxRetryAndExponentialBackoff`, `TestForwarder_NetworkTimeoutAndConnectionRefused`, `TestForwarder_RateLimit429WithRetryAfter`, `TestForwarder_ValidationRejectionHandling`, `TestForwarder_EndToEndWithCentralIngestion`.
+- All tests pass with race detector: `go test -buildvcs=false -v -race -count=1 ./...` (21 tests across 4 packages, 0 failures, 0 race warnings).
+
+**Follow-ups / left open:**
+- Slice 3: Central Ingestion Kafka publishing, Dead-Letter Queue (DLQ) topic routing for rejected events, and Cassandra transactional-outbox dedup path (§2.2).
+
 ## [2026-08-29] Claude Code review of Slice 1: fixed edge-side validation conflicting with PLAN.md §2.3
 
 **Author:** Claude Code
