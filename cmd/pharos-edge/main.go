@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gasthecreator/pharos/pkg/edge"
+	"github.com/gasthecreator/pharos/pkg/metrics"
 )
 
 func main() {
@@ -60,10 +61,35 @@ func main() {
 		}
 	}()
 
+	// Periodic queue-depth gauge (Slice 6 — §4): a proxy for how long this site
+	// has been effectively partitioned, per §2.1's store-and-forward design.
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				stats, err := store.GetStats(ctx)
+				if err != nil {
+					continue
+				}
+				metrics.EdgeQueueDepth.Set(float64(stats.PendingCount))
+				if !stats.OldestPendingTime.IsZero() {
+					metrics.EdgeQueueOldestPendingSeconds.Set(time.Since(stats.OldestPendingTime).Seconds())
+				} else {
+					metrics.EdgeQueueOldestPendingSeconds.Set(0)
+				}
+			}
+		}
+	}()
+
 	// 3. Start local HTTP capture server for site staff/EDC systems
 	edgeServer := edge.NewServer(store, *siteID)
 	mux := http.NewServeMux()
 	edgeServer.RegisterRoutes(mux)
+	mux.Handle("/metrics", metrics.Handler())
 
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),

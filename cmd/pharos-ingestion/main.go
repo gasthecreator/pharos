@@ -15,6 +15,7 @@ import (
 	"github.com/gasthecreator/pharos/pkg/dedup"
 	"github.com/gasthecreator/pharos/pkg/ingestion"
 	"github.com/gasthecreator/pharos/pkg/kafka"
+	"github.com/gasthecreator/pharos/pkg/metrics"
 	"github.com/gasthecreator/pharos/pkg/ratelimit"
 )
 
@@ -82,6 +83,7 @@ func main() {
 	handler := ingestion.NewHandlerWithOutbox(limiter, outboxStore, producer, *leaseTimeout)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
+	mux.Handle("/metrics", metrics.Handler())
 
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),

@@ -113,7 +113,11 @@ Every decision, review finding, and fix is in `WORKLOG.md` and `ARCHITECTURE_PRO
 
 ## What's here vs. what's next
 
-This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. Everything above has only ever run as a single Docker container per service (Cassandra at replication factor 1, one Kafka broker); there's no authentication or TLS anywhere; nothing has been load-tested at real throughput; there's no deployment automation, observability/alerting, backup/DR plan, or multi-instance scaling ever exercised. Closing that gap is the next phase of this project, not a gap in what's already been built — see `PLAN.md`'s roadmap section for the specifics.
+This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. Everything above has only ever run as a single Docker container per service (Cassandra at replication factor 1, one Kafka broker); there's no authentication or TLS anywhere; nothing has been load-tested at real throughput; there's no deployment automation, backup/DR plan, or multi-instance scaling ever exercised. Observability is real as of Phase 2 Slice 6 (Prometheus + Grafana, see below) — closing the rest of the gap is ongoing work, not a gap in what's already been built; see `PLAN.md`'s roadmap section for the specifics.
+
+### Observability
+
+`docker compose up -d` also brings up Prometheus (`:9090`) and Grafana (`:3000`, anonymous viewer access enabled for local use). All three services expose `/metrics` (ingestion and edge on their normal HTTP port; the consumer on `--metrics-port`, default `9091`, alongside `/healthz`). Grafana comes pre-provisioned with a "Pharos Overview" dashboard — request rates and latency, rate-limit/validation/dedup/DLQ counters, Kafka consumer lag and watermark freshness, Cassandra write latency, and edge queue depth/forwarder outcomes — no manual setup required, just open `http://localhost:3000` once traffic is flowing (e.g. via `scripts/demo.sh`).
 
 ## Repo layout
 

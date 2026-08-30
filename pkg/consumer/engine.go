@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gasthecreator/pharos/pkg/kafka"
+	"github.com/gasthecreator/pharos/pkg/metrics"
 	"github.com/gasthecreator/pharos/pkg/model"
 	kafkaGo "github.com/segmentio/kafka-go"
 )
@@ -111,6 +112,7 @@ func (e *Engine) Step(ctx context.Context) error {
 			return ctx.Err()
 		}
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
+		metrics.ConsumerErrorsTotal.Inc()
 		return fmt.Errorf("failed to fetch message from kafka: %w", err)
 	}
 
@@ -118,6 +120,7 @@ func (e *Engine) Step(ctx context.Context) error {
 	var event model.AdverseEvent
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
+		metrics.ConsumerErrorsTotal.Inc()
 		return fmt.Errorf("failed to unmarshal message payload: %w", err)
 	}
 
@@ -161,6 +164,7 @@ func (e *Engine) Step(ctx context.Context) error {
 	isLate, _ := e.tracker.ProcessEvent(msg.Partition, keyStr, eventTime, now)
 	if isLate {
 		atomic.AddUint64(&e.stats.LateEventsCount, 1)
+		metrics.ConsumerLateArrivalsTotal.Inc()
 	}
 
 	// 4. Construct canonical record
@@ -184,20 +188,26 @@ func (e *Engine) Step(ctx context.Context) error {
 	}
 
 	// 5. Durable parallel upsert to Cassandra query tables
+	saveStart := time.Now()
 	if err := e.store.SaveEvent(ctx, record); err != nil {
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
+		metrics.ConsumerErrorsTotal.Inc()
+		metrics.CassandraWriteDuration.WithLabelValues("error").Observe(time.Since(saveStart).Seconds())
 		// DO NOT COMMIT: uncommitted offset ensures Kafka redelivers on retry (§2.4)
 		return fmt.Errorf("failed to save canonical event (offset uncommitted): %w", err)
 	}
+	metrics.CassandraWriteDuration.WithLabelValues("success").Observe(time.Since(saveStart).Seconds())
 
 	// 6. Explicit manual offset commit after successful Cassandra write
 	if err := e.reader.CommitMessages(ctx, msg); err != nil {
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
+		metrics.ConsumerErrorsTotal.Inc()
 		return fmt.Errorf("failed to commit kafka offset: %w", err)
 	}
 
 	atomic.AddUint64(&e.stats.ConsumedCount, 1)
 	atomic.AddUint64(&e.stats.CommittedCount, 1)
+	metrics.ConsumerEventsConsumedTotal.Inc()
 	return nil
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/gasthecreator/pharos/pkg/dedup"
 	"github.com/gasthecreator/pharos/pkg/kafka"
+	"github.com/gasthecreator/pharos/pkg/metrics"
 	"github.com/gasthecreator/pharos/pkg/model"
 	"github.com/gasthecreator/pharos/pkg/ratelimit"
 )
@@ -108,8 +109,29 @@ func (h *Handler) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"status":"UP"}`))
 }
 
+// statusRecordingWriter captures the status code ultimately written so callers
+// can record it as a metric label without threading a variable through every
+// response branch below.
+type statusRecordingWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (w *statusRecordingWriter) WriteHeader(code int) {
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
 // HandleEvents processes batch ingestion requests with per-site rate limiting and FHIR validation.
 func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rw := &statusRecordingWriter{ResponseWriter: w, statusCode: http.StatusOK}
+	w = rw
+	defer func() {
+		metrics.IngestionRequestsTotal.WithLabelValues(strconv.Itoa(rw.statusCode)).Inc()
+		metrics.IngestionRequestDuration.Observe(time.Since(start).Seconds())
+	}()
+
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
@@ -189,6 +211,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 
 	if !allowed {
 		atomic.AddUint64(&h.throttledReqs, 1)
+		metrics.RateLimitRejectionsTotal.WithLabelValues(siteID).Inc()
 		resetSecs := int(limitRes.ResetAfter.Seconds())
 		if resetSecs < 1 {
 			resetSecs = 1
@@ -238,6 +261,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 
 		if unmarshalErr != nil {
 			rejectedCount++
+			metrics.ValidationFailuresTotal.Inc()
 			errMsg := "malformed event payload: " + unmarshalErr.Error()
 			results[i] = EventResult{
 				IdempotencyKey: keyStr,
@@ -269,11 +293,13 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 				}
 				if claim.Acquired {
 					if h.producer != nil {
+						publishStart := time.Now()
 						meta, pErr := h.producer.Publish(r.Context(), kafka.DLQTopic, []byte(siteID), raw, map[string]string{
 							"idempotency_key":  keyStr,
 							"site_id":          siteID,
 							"rejection_reason": "malformed JSON payload",
 						})
+						metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
 						if pErr != nil {
 							unlock()
 							rejectedCount-- // Reclassified from rejected to failed
@@ -290,6 +316,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 						_ = h.outboxStore.MarkDLQPublished(r.Context(), keyStr, kafka.DLQTopic, 0, 0)
 					}
 					atomic.AddUint64(&h.dlqCount, 1)
+					metrics.DLQWritesTotal.Inc()
 				}
 				unlock()
 			}
@@ -299,6 +326,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 		valErr := ev.Validate()
 		if valErr != nil {
 			rejectedCount++
+			metrics.ValidationFailuresTotal.Inc()
 			results[i] = EventResult{
 				IdempotencyKey: keyStr,
 				Status:         StatusRejected,
@@ -329,11 +357,13 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 				}
 				if claim.Acquired {
 					if h.producer != nil {
+						publishStart := time.Now()
 						meta, pErr := h.producer.Publish(r.Context(), kafka.DLQTopic, []byte(siteID), raw, map[string]string{
 							"idempotency_key":  keyStr,
 							"site_id":          siteID,
 							"rejection_reason": valErr.Error(),
 						})
+						metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
 						if pErr != nil {
 							unlock()
 							rejectedCount-- // Reclassified from rejected to failed
@@ -350,6 +380,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 						_ = h.outboxStore.MarkDLQPublished(r.Context(), keyStr, kafka.DLQTopic, 0, 0)
 					}
 					atomic.AddUint64(&h.dlqCount, 1)
+					metrics.DLQWritesTotal.Inc()
 				}
 				unlock()
 			}
@@ -379,11 +410,14 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 				}
 
 				if claim.Acquired {
+					metrics.DedupOutcomesTotal.WithLabelValues("new_claim").Inc()
 					if h.producer != nil {
+						publishStart := time.Now()
 						meta, pErr := h.producer.Publish(r.Context(), kafka.MainTopic, []byte(siteID), raw, map[string]string{
 							"idempotency_key": keyStr,
 							"site_id":         siteID,
 						})
+						metrics.OutboxPublishDuration.WithLabelValues(kafka.MainTopic).Observe(time.Since(publishStart).Seconds())
 						if pErr != nil {
 							unlock()
 							failedCount++
@@ -402,6 +436,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 					// Duplicate or concurrent in-flight
 					if claim.Status == dedup.StatusPublished {
 						atomic.AddUint64(&h.dedupHits, 1)
+						metrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
 					}
 				}
 				unlock()
