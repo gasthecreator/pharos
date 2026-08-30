@@ -40,6 +40,23 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Connect multi-batch StatusFailed to forwarder and return 207 on partial batch failure
+
+**Author:** Gemini (Antigravity)
+
+**What:** Closed the loop between Central Ingestion's per-event infrastructure failure reporting and Edge Forwarder state tracking:
+1. In `pkg/ingestion/handler.go`:
+   - Updated HTTP status decision so HTTP 207 Multi-Status is returned whenever a batch contains any successfully processed events (accepted or rejected) alongside infrastructure failures. Reserved HTTP 503 for the case where every single event in the batch hit an infrastructure failure with nothing else to report.
+   - Fixed bookkeeping discrepancy where DLQ outbox storage or DLQ Kafka publish errors reclassify the event as `StatusFailed` but previously left `rejectedCount` inflated. Decremented `rejectedCount--` upon reclassification so top-level `resp.Rejected` strictly matches the count of `StatusRejected` entries in `resp.Results`.
+2. In `pkg/edge/forwarder.go`:
+   - Extended the per-event correlation logic to explicitly check `res.Status == ingestion.StatusFailed`. Instead of falling through into the acknowledgment branch, failed events call `store.MarkFailed(ctx, r.ID, reason, retryAfter)` with exponential backoff.
+   - Hardened unmapped item fallback in 207 Multi-Status responses to mark records failed with backoff rather than silently acknowledging them.
+3. Tests added/updated:
+   - `pkg/edge/forwarder_test.go`: Added `TestForwarder_207MixedBatchWithFailedStatus` verifying a 3-event batch receiving HTTP 207 with ACCEPTED, REJECTED, and FAILED correctly transitions each record locally into ACKNOWLEDGED, REJECTED (with last_error), and FAILED (with next_retry_at backoff).
+   - `pkg/ingestion/outbox_test.go`: Updated `TestMultiEventBatch_MiddleEventInfraFailureContinuesProcessing` to assert HTTP 207 for mixed outcomes, and added `TestFullBatchInfraFailure_Returns503` asserting HTTP 503 when all events fail.
+
+**Why:** Prevents silent data loss. Without explicit `StatusFailed` handling in the forwarder, extending the forwarder to parse 5xx/207 bodies would have caused failed events to fall through to the acceptance branch and be marked as delivered despite never reaching Kafka.
+
 ## [2026-08-30] Claude Code review: Slice 3 core design verified against real infra; one required fix, one recurring process bug
 
 **Author:** Claude Code

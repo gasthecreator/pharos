@@ -258,6 +258,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 				claim, err := h.outboxStore.InsertDLQClaim(r.Context(), dlqRec, h.leaseTimeout)
 				if err != nil {
 					unlock()
+					rejectedCount-- // Reclassified from rejected to failed
 					failedCount++
 					results[i] = EventResult{
 						IdempotencyKey: keyStr,
@@ -275,6 +276,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 						})
 						if pErr != nil {
 							unlock()
+							rejectedCount-- // Reclassified from rejected to failed
 							failedCount++
 							results[i] = EventResult{
 								IdempotencyKey: keyStr,
@@ -316,6 +318,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 				claim, err := h.outboxStore.InsertDLQClaim(r.Context(), dlqRec, h.leaseTimeout)
 				if err != nil {
 					unlock()
+					rejectedCount-- // Reclassified from rejected to failed
 					failedCount++
 					results[i] = EventResult{
 						IdempotencyKey: keyStr,
@@ -333,6 +336,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 						})
 						if pErr != nil {
 							unlock()
+							rejectedCount-- // Reclassified from rejected to failed
 							failedCount++
 							results[i] = EventResult{
 								IdempotencyKey: keyStr,
@@ -425,10 +429,15 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// 5. Determine HTTP response code
-	if failedCount > 0 {
-		// Individual events experienced transient infrastructure failures (Cassandra/Kafka).
-		// Return HTTP 503 Service Unavailable so edge forwarder retries with backoff (§2.1).
-		// Succeeded events were durably stored/published and will be safe dedup no-ops on retry.
+	if failedCount > 0 && (acceptedCount > 0 || rejectedCount > 0) {
+		// Mixed outcome with failures: some events were successfully processed (accepted or rejected),
+		// while others hit infrastructure failures. Return 207 Multi-Status so the edge forwarder inspects
+		// per-event results, acknowledging successes and retrying failed events (§2.1, §2.2).
+		resp.Error = fmt.Sprintf("%d of %d events encountered infrastructure failures and require retry", failedCount, len(rawEvents))
+		w.WriteHeader(http.StatusMultiStatus)
+	} else if failedCount > 0 && acceptedCount == 0 && rejectedCount == 0 {
+		// Every event in the batch hit an infrastructure failure with nothing else to report:
+		// Return 503 Service Unavailable so edge forwarder retries the entire batch with backoff (§2.1).
 		resp.Error = fmt.Sprintf("%d of %d events encountered infrastructure failures and require retry", failedCount, len(rawEvents))
 		w.WriteHeader(http.StatusServiceUnavailable)
 	} else if acceptedCount == 0 && rejectedCount > 0 {

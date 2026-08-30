@@ -475,9 +475,10 @@ func TestMultiEventBatch_MiddleEventInfraFailureContinuesProcessing(t *testing.T
 	w := httptest.NewRecorder()
 	handler.HandleEvents(w, req)
 
-	// 1. HTTP status code must be 503 Service Unavailable to trigger edge forwarder backoff/retry
-	if w.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected HTTP 503 Service Unavailable for partial infrastructure failure, got %d: %s", w.Code, w.Body.String())
+	// 1. HTTP status code must be 207 Multi-Status for mixed outcome (accepted + failed)
+	// so that edge forwarder inspects the body for per-item outcomes (§2.1, §2.2).
+	if w.Code != http.StatusMultiStatus {
+		t.Fatalf("expected HTTP 207 Multi-Status for partial infrastructure failure, got %d: %s", w.Code, w.Body.String())
 	}
 
 	// 2. Decode the complete, accurate BatchResponse
@@ -536,5 +537,40 @@ func TestMultiEventBatch_MiddleEventInfraFailureContinuesProcessing(t *testing.T
 	// 4. Verify Kafka publish counts: exactly 1 publish for key0, 0 for key1, 1 for key2
 	if mockProducer.TotalPublishes() != 2 {
 		t.Fatalf("expected exactly 2 total Kafka publishes, got %d", mockProducer.TotalPublishes())
+	}
+}
+
+// TestFullBatchInfraFailure_Returns503 verifies that when every event in a batch encounters
+// an infrastructure failure (nothing accepted or rejected), the handler returns bare 503.
+func TestFullBatchInfraFailure_Returns503(t *testing.T) {
+	store := dedup.NewMemoryOutboxStore()
+	mockProducer := kafka.NewMockProducer()
+	mockProducer.FailNext(10) // Fail all publishes
+	limiter := ratelimit.NewTokenBucketLimiter(100, 100)
+
+	handler := NewHandlerWithOutbox(limiter, store, mockProducer, 30*time.Second)
+
+	siteID := "SITE-FAIL-ALL"
+	ev0 := createValidTestEventJSON(siteID, 1, "e1")
+	ev1 := createValidTestEventJSON(siteID, 2, "e2")
+
+	reqBody := BatchRequest{
+		SiteID: siteID,
+		Events: []json.RawMessage{ev0, ev1},
+	}
+	bodyBytes, _ := json.Marshal(reqBody)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", bytes.NewReader(bodyBytes))
+	w := httptest.NewRecorder()
+	handler.HandleEvents(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 Service Unavailable when all events fail, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp BatchResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.Failed != 2 || resp.Accepted != 0 || resp.Rejected != 0 {
+		t.Errorf("expected failed=2, accepted=0, rejected=0, got %+v", resp)
 	}
 }

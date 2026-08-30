@@ -154,6 +154,12 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 		var ackIDs []int64
 		rejectedByReason := make(map[string][]int64)
+		type failedRecord struct {
+			id         int64
+			reason     string
+			retryAfter time.Duration
+		}
+		var failedRecords []failedRecord
 
 		for _, r := range records {
 			res, found := resultsByKey[r.IdempotencyKey]
@@ -165,6 +171,13 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 				rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
 			} else if found && res.Status == ingestion.StatusAccepted {
 				ackIDs = append(ackIDs, r.ID)
+			} else if found && res.Status == ingestion.StatusFailed {
+				reason := res.Error
+				if reason == "" {
+					reason = "infrastructure failure during ingestion"
+				}
+				retryAfter := f.CalculateBackoff(r.Attempts)
+				failedRecords = append(failedRecords, failedRecord{id: r.ID, reason: reason, retryAfter: retryAfter})
 			} else {
 				// Fallback if not found in results map
 				if resp.StatusCode == http.StatusUnprocessableEntity {
@@ -173,8 +186,15 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 						reason = "batch rejected by central ingestion (HTTP 422)"
 					}
 					rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
-				} else {
+				} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+					// Full batch acceptance (HTTP 200/201)
 					ackIDs = append(ackIDs, r.ID)
+				} else {
+					// Conservative fallback for unmapped records in partial/multi-status responses:
+					// Never silently acknowledge unmapped records; mark as failed for retry with backoff (§2.1).
+					reason := "event result missing from central ingestion response"
+					retryAfter := f.CalculateBackoff(r.Attempts)
+					failedRecords = append(failedRecords, failedRecord{id: r.ID, reason: reason, retryAfter: retryAfter})
 				}
 			}
 		}
@@ -188,6 +208,12 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 		for reason, rejIDs := range rejectedByReason {
 			if err := f.store.MarkRejected(ctx, rejIDs, reason); err != nil {
 				return 0, fmt.Errorf("failed to mark records rejected: %w", err)
+			}
+		}
+
+		for _, fr := range failedRecords {
+			if err := f.store.MarkFailed(ctx, fr.id, fr.reason, fr.retryAfter); err != nil {
+				return 0, fmt.Errorf("failed to mark record failed: %w", err)
 			}
 		}
 
