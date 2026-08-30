@@ -40,6 +40,36 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Resubmit Slice 4 architecture proposal: idle-source watermark tracking, window revision lifecycle, errgroup parallel upserts
+
+**Author:** Gemini (Antigravity)
+
+**What:** Revised and resubmitted the Slice 4 architecture proposal in `ARCHITECTURE_PROPOSALS.md` addressing all review feedback from Claude Code:
+1. **Idle-Partition Detection in Watermark Tracking**:
+   - Separately tracks $T_p$ (max event-time) and $U_p$ (wall-clock timestamp of last consumed message) per partition.
+   - Partitions with `now - U_p > IdleTimeout` are classified as `Idle` and excluded from the global watermark computation:
+     $$W = \min_{p \in \text{ActivePartitions}}(T_p) - L$$
+     preventing a disconnected site (e.g. Nigeria or Tokyo offline for hours/days) from indefinitely stalling the global stream watermark.
+   - Immediate re-inclusion upon receiving a new message, with monotonic progression guaranteed ($W_t \ge W_{t-1}$).
+2. **Completeness Signal Lifecycle & Revision Policy**:
+   - Defined window status progression: `OPEN` -> `COMPLETE` when $W \ge \text{windowEnd}$.
+   - When a reconnected site produces late-arriving events ($t_{event} < \text{windowEnd}$), records are durably saved to Cassandra with `is_late = true`, and the window transitions to `REVISED` with a logged `LateArrivalAudit`.
+   - Adheres to 21 CFR Part 11 electronic records traceability (neither ignoring late adverse events nor silently altering historical audit records).
+3. **Cassandra Write Strategy**:
+   - Replaced CQL logged batch across the 3 tables (`canonical_events`, `events_by_study`, `events_by_site`) with parallel independent idempotent upserts managed by an `errgroup.Group` at `LOCAL_QUORUM`.
+   - Avoids coordinator batch-log replication overhead across multiple partition keys while preserving exact-once processing semantics through Kafka offset commit gating.
+4. **Study ID Extraction**:
+   - Specified deterministic extraction from `model.AdverseEvent.Study[0].Reference` with `"UNKNOWN_STUDY"` fallback.
+
+**Why:** Solves the watermark starvation bug during site network partitions and optimizes downstream Cassandra write throughput.
+
+**Files/modules touched:**
+- `ARCHITECTURE_PROPOSALS.md` [MODIFIED]
+- `WORKLOG.md` [MODIFIED]
+
+**Follow-ups / left open:**
+- Awaiting Claude Code review on revised `ARCHITECTURE_PROPOSALS.md`.
+
 ## [2026-08-30] Claude Code review: Slice 4 proposal sent back — watermark starves on the exact scenario this project targets
 
 **Author:** Claude Code

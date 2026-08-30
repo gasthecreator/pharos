@@ -44,77 +44,7 @@ to change)
 
 #### [2026-08-30] Slice 4 Architecture: Kafka Consumer Topology, Canonical Cassandra Query Tables, Event-Time Watermarking, and Idempotent Downstream Sinks
 
-**Status:** Requires revision (Claude Code, 2026-08-30) — do not implement
-yet. The consumer topology, the three-table canonical schema (genuinely
-resolves the long-open §5 query-pattern question, and the idempotent-upsert
-reasoning for redelivered messages correctly holds across all three tables
-since `idempotency_key` is part of every primary key), and the decision to
-skip Flink for a pure-Go watermark tracker are all approved as-is. One
-required fix on the watermark formula itself, and one recommended change to
-the write strategy.
-
-**Required fix — the watermark formula has no idle-partition exclusion, and
-that directly undermines the feature's own stated purpose.**
-`W = min_p(T_p) - L` takes the minimum over *all* active partitions with no
-way to exclude one that's gone silent. Walk through the exact scenario this
-project exists to handle: a site (say, Nigeria) loses connectivity for three
-days — PLAN.md §2.1's own example. Under this formula, that partition's `T_p`
-stops advancing the moment the site goes offline, and since a frozen
-partition is still counted in the `min()`, the *global* watermark `W` freezes
-at that moment too — even though every other site's partition keeps
-advancing normally. The proposal's own motivating question — "is the
-clinical safety data for yesterday complete across all global trial sites?"
-— would answer "no, indefinitely" for the *entire dataset* the instant any
-single site has the exact outage this whole project is built to tolerate.
-This isn't an edge case; it's the central scenario, so a watermark design
-that hangs on it can't ship as-is.
-
-Fix: track wall-clock time since each partition's last-consumed message,
-separately from that partition's event-time progress. If a partition has
-been idle (no new messages, not merely no *recent* event-time progress)
-beyond a configurable threshold, exclude it from the `min()` computation
-until it produces again — the same idle-source-detection pattern Flink and
-Kafka Streams use for exactly this problem. Re-include a partition the
-moment it resumes producing, recomputing based on its new `T_p`. Write this
-down explicitly as part of the `WatermarkTracker` design, including what
-happens to the completeness signal for windows that were computed while the
-partition was excluded (do they get revisited once the site reconnects and
-its backlog of "late" events arrive, or stay as originally reported? PLAN.md
-already requires late events to be durably flagged rather than dropped,
-which covers the data — but the *completeness signal* itself needs the same
-scrutiny, since it's the visible artifact clinical safety staff would
-actually act on).
-
-**Recommended change — reconsider the logged batch across 3 tables.**
-`event_outbox` uses lightweight transactions because two different actors
-raced on the *same* partition key and needed a distributed compare-and-swap
-to resolve who gets to publish — a genuine correctness necessity. Writing
-`canonical_events`/`events_by_study`/`events_by_site` is a different
-situation: there's exactly one writer (the consumer processing this
-message), all three writes are individually idempotent upserts, and the
-consumer already withholds the Kafka offset commit until all three succeed
-— which already gives "retry the whole set until every table reflects it"
-without needing Cassandra's own atomicity machinery. A logged batch across
-three *different* partition keys is a well-known Cassandra throughput
-anti-pattern (the coordinator has to durably write the batch log to two
-replicas before executing statements against three different partitions'
-owning nodes) for a guarantee this design doesn't actually need — the
-retry-via-uncommitted-offset already provides it. Recommend independent
-writes (parallel, gated by an errgroup or WaitGroup before the offset
-commit) instead. Not blocking if there's a concrete reason to keep the
-logged batch — but the stated rationale ("atomic... ensures multi-table
-consistency") doesn't hold up against what the offset-commit gate already
-provides, so make the actual tradeoff explicit if you disagree rather than
-defaulting to the heavier mechanism.
-
-Minor, non-blocking: confirm how `study_id` gets extracted for
-`events_by_study`'s partition key, since `model.AdverseEvent.Study` is
-modeled as a list (`[]Reference`) — presumably `Study[0]`, matching how
-`SiteID()` already extracts from a single reference field, but say so
-explicitly rather than leaving it implicit in the consumer code.
-
-Revise the watermark design with the fix above and re-submit before writing
-implementation code.
+**Status:** Resubmitted for Review (2026-08-30) — revised per Claude Code review feedback (idle partition exclusion, completeness signal revision lifecycle, errgroup parallel upserts, and explicit study_id extraction).
 
 **What in PLAN.md this touches:**
 - §2.4 Multi-timezone event ordering and correctness
@@ -147,17 +77,30 @@ Four interconnected architectural choices closing out the pipeline from Kafka to
        - Clustering Order: `(local_seq DESC, idempotency_key ASC)`
        - Serves: `SELECT * FROM events_by_site WHERE site_id = ? AND local_seq >= ?;`
        - Verifies continuous per-site monotonic sequence numbering and site data delivery.
-   - **Write Strategy**: The consumer executes an atomic CQL logged batch (`BEGIN BATCH ... APPLY BATCH;`) writing to all 3 tables simultaneously, or concurrent idempotent upserts. In Cassandra, writes across multiple tables within the same keyspace and datacenter are atomic in a single logged batch.
+   - **Study ID Extraction**:
+     - `study_id` is extracted deterministically from `model.AdverseEvent.Study[0].Reference` (e.g. `"ResearchStudy/STUDY-001"` -> `"STUDY-001"`). If `Study` is empty or missing, it defaults to `"UNKNOWN_STUDY"`. This matches how `SiteID()` already extracts from a single reference field.
+   - **Write Strategy (Revised per Review)**:
+     - Replaced the logged batch with **concurrent independent idempotent upserts** executed via `errgroup.Group` (or parallel goroutines) across the 3 tables at `ConsistencyLevel: LOCAL_QUORUM`.
+     - *Tradeoff Rationale*: Logged batches across different partition keys incur heavy coordinator batch-log replication overhead across nodes for a guarantee the consumer does not need. Because there is a single consumer worker per partition, all 3 table writes are naturally idempotent upserts, and the Kafka offset is committed *only* when all three writes succeed, Kafka uncommitted offset redelivery already guarantees that any partial write failure is re-attempted until all 3 tables reflect the record, with zero risk of duplicate rows.
 
-3. **Event-Time Ordering and Watermarking Semantics (§2.4)**
-   - **Problem**: Global sites in diverse time zones (e.g. Tokyo UTC+9, London UTC+0, Indianapolis UTC-5) produce events stamped with their local event time (normalized to UTC). If a site is disconnected for hours, its events arrive late at Central Ingestion.
-   - **Solution**: Implement `pkg/consumer.WatermarkTracker`:
-     - Tracks the maximum observed `event_time` per active partition $p$: $T_p = \max(\text{event\_time}_p)$.
-     - Defines the global watermark $W$ with configurable bounded lateness tolerance $L$ (default 15m, configurable per study):
-       $$W = \min_{p \in \text{active\_partitions}}(T_p) - L$$
-     - A time window $[t_{start}, t_{end})$ is deemed **Complete** once $W \ge t_{end}$.
-     - Events arriving with `event_time < W` are processed into Cassandra (never dropped per PLAN.md's core premise), but flagged with `is_late = true` and tracked via metric counters to signal late-arriving pharmacovigilance reports requiring retroactive safety evaluation.
-   - This delivers mathematically rigorous multi-timezone correctness without heavy external dependencies like Flink or Spark.
+3. **Event-Time Ordering and Watermarking Semantics with Idle-Partition Detection (§2.4)**
+   - **Problem Addressed**: Global trial sites across time zones (e.g. Tokyo UTC+9, London UTC+0, Indianapolis UTC-5) produce events with local event times. If an offline site (e.g. Nigeria disconnected for 3 days) freezes its partition, a naive $W = \min(T_p) - L$ would freeze the global watermark indefinitely across all sites.
+   - **Idle Source Detection**:
+     - For every partition $p$, `pkg/consumer.WatermarkTracker` tracks:
+       1. $T_p$: the highest event-time observed in consumed events on partition $p$.
+       2. $U_p$: the local wall-clock timestamp (`time.Now().UTC()`) when a message was last consumed on partition $p$.
+     - Partition State:
+       - **Active**: `now - U_p <= IdleTimeout` (default `10m` production, `30s` test).
+       - **Idle**: `now - U_p > IdleTimeout`.
+     - **Watermark Formula**:
+       $$W = \begin{cases} \min_{p \in \text{ActivePartitions}}(T_p) - L & \text{if ActivePartitions} \neq \emptyset \\ \max_{p}(T_p) - L & \text{if all partitions are idle} \end{cases}$$
+       where $L$ is the bounded lateness tolerance (e.g. 15 minutes).
+     - **Re-inclusion on Awakening**: The instant partition $p$ consumes a new message, $U_p$ is updated to `now`, transitioning $p$ immediately back to **Active**. Watermark $W$ is recomputed, maintaining the stream invariant that $W$ is monotonically non-decreasing ($W_t \ge W_{t-1}$).
+   - **Completeness Signal Lifecycle & Revision Policy**:
+     - *Clinical Safety Decision*: When an analytical or DSMB window $[t_1, t_2)$ satisfies $W \ge t_2$, it transitions from `OPEN` to `COMPLETE`.
+     - *Late Backlog Handling*: When a disconnected site reconnects and delivers a backlog with event times $t_{event} < t_2$, the records are durably written to Cassandra and marked `is_late = true`.
+     - Crucially, the window status itself is transitioned from `COMPLETE` to `REVISED` (accompanied by an emitted `LateArrivalAudit` log detailing newly ingested late records).
+     - *Rationale*: In pharmacovigilance and 21 CFR Part 11 electronic records, once safety staff or DSMB members act on a "complete" window report, retroactively mutating past results without an audit trail is a regulatory violation, while ignoring late adverse events is a patient safety violation. Transitioning the window status to `REVISED` preserves an immutable audit trail of what was originally reported vs what arrived late.
 
 4. **Consumer-Side Idempotency**
    - On consumer crash or partition rebalance, Kafka may redeliver uncommitted messages.
@@ -167,19 +110,20 @@ Four interconnected architectural choices closing out the pipeline from Kafka to
 
 **Why:**
 - `event_outbox` was designed for transactional publishing, not analytical querying; trying to query it by study or site requires full-table scans.
-- Watermarking provides an honest answer to "is the clinical safety data for yesterday complete across all global trial sites?", which is a core Lilly Bio-IT challenge.
-- Separating the consumer binary reflects realistic production deployment boundaries.
+- Watermarking with idle partition detection provides an honest answer to "is the clinical safety data for yesterday complete across all global trial sites?", tolerating network partitions without stalling the global watermark.
+- Parallel upserts with offset commit gating maximize Cassandra write throughput while preserving exact-once processing semantics downstream.
 
 **Alternatives considered:**
-- *Folding consumer into ingestion binary*: Easier to run locally, but couples HTTP API scaling to Kafka partition constraints. Rejected for production architecture, but mitigated by providing an in-process library mode for unit/integration tests.
-- *Cassandra Materialized Views instead of dual/triple writes*: Cassandra MVs are known for operational fragility, tombstone issues, and silent lag during node failures. Application-layer multi-table batch writes are standard in production Cassandra.
-- *Full Apache Flink stream processor*: Heavy JVM framework requiring ZooKeeper/Kubernetes orchestration, violating the project constraint of running cleanly on developer hardware. A pure-Go watermark tracker delivers identical semantics with zero operational bloat.
+- *Static watermarks without idle detection*: Fails the project's central scenario (a site going offline freezes global watermarks indefinitely). Rejected.
+- *Discarding late data on reconnected partitions*: Violates core clinical safety premise (never drop adverse events). Rejected.
+- *Silently modifying closed windows without status revision*: Violates 21 CFR Part 11 regulatory auditability. Rejected in favor of the `COMPLETE` -> `REVISED` lifecycle.
+- *CQL Logged Batches*: Unnecessary coordination bottleneck across distinct partition keys; offset-commit gating delivers identical durability with much higher throughput.
 
 **Impact if approved:**
 - New CQL migration `migrations/002_canonical_schema.cql` adding `canonical_events`, `events_by_study`, `events_by_site`.
-- New package `pkg/consumer` containing consumer engine, watermark tracker, and Cassandra canonical store.
+- New package `pkg/consumer` containing consumer engine, watermark tracker (with idle detection and window revision tracking), and Cassandra canonical store.
 - New binary `cmd/pharos-consumer`.
-- Full unit and integration test suite asserting single-row idempotency on message redelivery, per-site ordering preservation, and watermark lag detection.
+- Full unit and integration test suite asserting single-row idempotency on message redelivery, per-site ordering preservation, idle-partition watermark progression, and late-arrival window revision.
 
 ---
 
