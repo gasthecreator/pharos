@@ -40,6 +40,82 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-30] Claude Code builds the fault-injection test suite: network partition and out-of-order delivery
+
+**Author:** Claude Code
+
+**What:** Wrote the two fault-injection test categories explicitly assigned
+to Claude per §6 and outstanding since the Slice 3 review — network
+partition simulation and out-of-order delivery. New package
+`pkg/faultinjection`, two tests, both running against real Cassandra and
+real Kafka (not mocks), matching how the rest of this project verifies its
+distributed-systems claims:
+
+- `TestNetworkPartition_EdgeBuffersAndDrainsWithoutLossOrDuplication`: a real
+  edge (SQLite store + forwarder) talking to a real Central Ingestion
+  handler (real Cassandra outbox + real Kafka producer) through a
+  controllable transport. Goes through three phases: (1) total outage — the
+  request never leaves the edge, verifying zero loss and zero premature
+  acknowledgment; (2) asymmetric healing — Central Ingestion *fully
+  processes* the request (real Cassandra write, real Kafka publish) but the
+  response never reaches the edge, forcing a retry of a write that already
+  durably succeeded server-side; (3) full healing — the retry gets a real
+  response. Final assertion: every event is `PUBLISHED` exactly once in
+  Cassandra, and — via a `countingProducer` wrapper around the real Kafka
+  producer — exactly one Kafka publish per idempotency key across the whole
+  sequence, not just "eventually delivered."
+- `TestOutOfOrderDelivery_QueryLayerOrdersCorrectlyRegardlessOfArrival`:
+  submits one site's events to a real Central Ingestion handler in
+  deliberately scrambled `local_seq` order in a single batch, drains them
+  through a real consumer engine into real Cassandra, and verifies
+  `events_by_site` returns them correctly ordered by the schema's clustering
+  key regardless of arrival order.
+
+**Why:** This is the one piece of the project's verification story that had
+been flagged as outstanding across three consecutive slice reviews without
+action — and it's specifically the test suite that proves the two named
+core challenges (PLAN.md Core Challenge #1: partition tolerance; §2.4:
+ordering) actually hold, rather than being individually plausible from
+component-level tests alone. The asymmetric-healing phase in the partition
+test is the harder and more valuable case: it isn't enough to prove data
+survives an outage, since the actual risk this project's outbox design
+exists to prevent is a *retry of a write that already succeeded* — exactly
+what happens when a partition heals one-directionally.
+
+**How:** Found and fixed a bug in my own first draft, not in the
+application code: `Forwarder.CalculateBackoff` floors every computed retry
+backoff at 100ms regardless of the configured `BaseBackoff`/`MaxBackoff` —
+a detail not documented anywhere I'd read before writing this test. My
+first attempt slept only 30ms between retries in the test, which meant
+`FetchPending` correctly declined to re-select records still inside that
+floor, and the test failed in a way that initially looked like an
+application bug (`Step()` returning `(0, nil)` on the second call). Traced
+it with targeted instrumentation (call-count tracking on the mock
+transport) rather than guessing, confirmed the 100ms floor was the actual
+cause, and fixed the test's timing rather than touching `forwarder.go`
+(which behaves correctly and is unrelated to this).
+
+**Files/modules touched:** `pkg/faultinjection/helpers_test.go` (new),
+`pkg/faultinjection/network_partition_test.go` (new),
+`pkg/faultinjection/out_of_order_test.go` (new), `PLAN.md` (§4 checklist).
+
+**Tests added/updated:**
+`TestNetworkPartition_EdgeBuffersAndDrainsWithoutLossOrDuplication` and
+`TestOutOfOrderDelivery_QueryLayerOrdersCorrectlyRegardlessOfArrival`, both
+run 3x consecutively with `-race` to check for timing-related flakiness
+before considering them done (none observed). Full repo suite (`go vet` +
+`go test -race -count=1 ./...`) re-verified green after adding this package.
+
+**Follow-ups / left open:**
+- DLQ inspection tooling and Kafka retention policy remain undecided
+  (unchanged from earlier follow-up lists).
+- Next natural slice: something actually reads the canonical query tables
+  beyond integration tests (an API or CLI for "all events for study X in
+  range Y" / "all events from site Z").
+- Committing this on its own branch (`test/fault-injection-partition-and-
+  ordering`) and opening a PR, same discipline as everything else in this
+  repo — including work that's Claude's own rather than Gemini's.
+
 ## [2026-08-30] Claude Code approves Slice 4; merging into main
 
 **Author:** Claude Code
