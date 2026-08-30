@@ -40,6 +40,114 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-29] Claude Code review of Slice 1: fixed edge-side validation conflicting with PLAN.md §2.3
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's Slice 1 build. Independently re-ran `go vet` and
+`go test -race ./...` rather than trusting the summary — confirmed clean vet
+and all tests passing. Found one real conformance bug: `SQLiteStore.Enqueue`
+(`pkg/edge/sqlite_store.go`) called `event.Validate()` and rolled back the
+entire transaction — i.e. refused to persist the record at all — if the
+payload failed the scoped FHIR profile's structural validation. Removed that
+call, with a comment explaining why, and added
+`TestSQLiteStore_EnqueuePersistsMalformedEvent` to `sqlite_store_test.go` to
+lock in the corrected behavior.
+
+**Why:** PLAN.md §2.3 is explicit: FHIR validation happens at Central
+Ingestion, "not at the edge collector — sites should be able to buffer even
+malformed-looking data rather than lose it locally." The as-built edge
+collector did the opposite. Concrete failure scenario: a site's local software
+sends a payload with, say, an unrecognized severity code — under the old code
+that record never entered the durable queue, produced no DLQ record, and left
+no audit trail. That's a silent, permanent data loss in a system whose entire
+premise is never losing adverse-event data. It's also fragile specifically in
+the partition scenario this project targets: an edge site offline for months
+may be running an older binary whose validation rules have drifted from what
+Central Ingestion currently expects — the edge should never be the thing
+deciding a record isn't worth keeping.
+
+**How:** Deleted the `if err := event.Validate(); err != nil { return ... }`
+gate from `Enqueue` (it ran after idempotency-key stamping, inside the same
+DB transaction as the sequence-number allocation — removing it doesn't affect
+sequence/idempotency correctness, verified by the existing concurrency and
+durability tests still passing unchanged). Left a comment pointing at PLAN.md
+§2.3 so a future edit doesn't reintroduce this silently. This was small and
+contained enough to fix directly rather than sending back to Gemini, per the
+working agreement's "fix directly or tell Gideon what to tell Antigravity"
+split.
+
+**Files/modules touched:** `pkg/edge/sqlite_store.go`,
+`pkg/edge/sqlite_store_test.go`.
+
+**Tests added/updated:** `TestSQLiteStore_EnqueuePersistsMalformedEvent` (new)
+— builds an event that fails `AdverseEvent.Validate()` (missing subject,
+invalid severity) and asserts `Enqueue` still durably persists and returns it
+from `FetchPending`. All 6 existing `pkg/edge` tests re-verified passing
+(`-race`) after the change.
+
+**Follow-ups / left open:**
+- Central Ingestion (Slice 2+) is where FHIR validation actually needs to live
+  — routing failures to the Kafka DLQ per PLAN.md §2.3, not implemented yet.
+- Minor/non-blocking style nit spotted in review: `MarkInFlight` and
+  `MarkAcknowledged` in `sqlite_store.go` build SQL via `fmt.Sprintf` to embed
+  status constants directly into the query text, inconsistent with the
+  parameterized-query style used everywhere else in the file. Not a security
+  issue (values are compile-time constants, never user input) — just
+  inconsistent. Not fixed now; flag for cleanup whenever that file is next
+  touched.
+- Nothing from Slice 1 has been committed/pushed yet — pending Gideon's
+  go-ahead, same as the rest of the repo.
+
+## [2026-08-29] Slice 1 built: repo scaffolding, domain models, client idempotency keys, and SQLite-WAL edge durability
+
+**Author:** Gemini (Antigravity)
+
+**What:** Implemented the entire first slice of Pharos as planned and approved:
+1. Local infrastructure orchestration via `docker-compose.yml` hosting Apache Kafka 3.8.0 in KRaft mode and Apache Cassandra 5.0 with constrained JVM heaps (`-Xms512M -Xmx1G`) for zero-cloud-spend self-hosting.
+2. Standard Go module layout (`go.mod`, `go.sum`, `Makefile`, `.gitignore`).
+3. Domain models in `pkg/model`: scoped FHIR R4 `AdverseEvent` resource profile with validation methods, and client-assigned `IdempotencyKey` (`site_id:local_seq_number`) with canonical wire parsing/formatting.
+4. Embedded SQLite Write-Ahead Logging (`WAL`) local queue in `pkg/edge` implementing `QueueStore`: atomic monotonic sequence generation per trial site, transactional persistence before network exposure, FIFO ordered batch retrieval, and state transitions (`PENDING -> IN_FLIGHT -> ACKNOWLEDGED` / `FAILED` with exponential retry backoff).
+5. Minimal entrypoint binaries in `cmd/pharos-edge` and `cmd/pharos-ingestion` with graceful shutdown handling.
+
+**Why:** Fulfills the foundational requirements of `PLAN.md`:
+- §2.1 (Network partition tolerance): Provides the durable edge boundary on local disk via SQLite WAL. Bytes are guaranteed to be fsynced locally before any upstream forwarding attempt.
+- §2.2 (Exactly-once semantics): Enforces client-side idempotency key stamping at capture time, ensuring retries from reconnecting sites retain identical keys.
+- §2.3 (Rate limiting and DLQ preparation): Implements the approved scoped FHIR R4 AdverseEvent profile and strict validation rules.
+- §4 checklist items: "Repo scaffolding", "Idempotency key generation", and "Edge collector: local durable buffering".
+
+**How:**
+- Pure Go SQLite (`modernc.org/sqlite`) was chosen to eliminate CGO dependencies, enabling cross-compilation and hassle-free local execution.
+- Configured SQLite with `PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;` and serialized write transactions (`SetMaxOpenConns(1)` + mutex lock) to prevent database lock contention.
+- `Enqueue` runs in an atomic transaction that bumps `site_sequence`, formats `IdempotencyKey`, attaches it to the event payload, validates the FHIR profile, and inserts into `queued_events`.
+- Docker Compose configures Kafka in KRaft mode without Zookeeper, and tunes Cassandra memory to prevent dev machine exhaustion.
+
+**Files/modules touched:**
+- `go.mod`, `go.sum`
+- `.gitignore`
+- `Makefile`
+- `docker-compose.yml`
+- `pkg/model/idempotency.go`, `pkg/model/idempotency_test.go`
+- `pkg/model/adverse_event.go`, `pkg/model/adverse_event_test.go`
+- `pkg/edge/store.go`, `pkg/edge/sqlite_store.go`, `pkg/edge/sqlite_store_test.go`
+- `cmd/pharos-edge/main.go`
+- `cmd/pharos-ingestion/main.go`
+- `WORKLOG.md`
+
+**Tests added/updated:**
+- `pkg/model/TestNewIdempotencyKey`, `TestParseIdempotencyKey`: validates boundary conditions, invalid formats, non-numeric or negative sequence numbers, and whitespace handling.
+- `pkg/model/TestAdverseEvent_Validate`, `TestAdverseEvent_JSONRoundtrip`, `TestAdverseEvent_TimeNormalization`: validates FHIR R4 structural conformity, UTC normalization, and JSON roundtrip.
+- `pkg/edge/TestSQLiteStore_EnqueueAndFetch`: verifies basic local enqueue and queue retrieval.
+- `pkg/edge/TestSQLiteStore_DurabilityAcrossRestart`: simulates an abrupt edge collector process restart/crash, reopening the SQLite file and verifying 100% record retention and monotonic sequence resumption.
+- `pkg/edge/TestSQLiteStore_ConcurrentEnqueueMonotonicSequences`: fires 50 concurrent goroutines against `Enqueue`; verifies zero race conditions, zero sequence collisions or gaps, strictly enforcing §2.2 idempotency invariants.
+- `pkg/edge/TestSQLiteStore_StateTransitionsAndBackoff`: verifies `PENDING -> IN_FLIGHT -> ACKNOWLEDGED` and `FAILED` with retry backoff filtering.
+- `pkg/edge/TestSQLiteStore_FIFOOrder`: verifies strict ascending sequence order retrieval across multiple batch fetches.
+- All tests pass with race detector enabled (`go test -buildvcs=false -v -race ./...`).
+
+**Follow-ups / left open:**
+- Slice 2: Edge collector forwarder daemon with exponential backoff and jitter streaming batches to Central Ingestion HTTP endpoint (`POST /api/v1/events`).
+- Central Ingestion HTTP service intake and token-bucket rate limiting per site.
+
 ## [2026-08-29] Claude Code review: 4 proposals approved (1 with a required fix), Slice 1 plan cleared to build
 
 **Author:** Claude Code

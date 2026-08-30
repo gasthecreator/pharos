@@ -1,0 +1,27 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.out
+*.test
+coverage.html
+
+# Local data & SQLite files
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
