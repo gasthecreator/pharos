@@ -4,7 +4,7 @@
 progress. Both Antigravity and Claude Code read this before touching code. Keep it
 updated as decisions change — do not let it go stale.
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
 
 ---
 
@@ -66,10 +66,24 @@ moment the event is captured. The edge collector's local durability is the actua
 reliability boundary — Kafka's replication guarantees only start once bytes leave
 the site.
 
-**Open question:** what does the edge collector's local durable queue look like —
-embedded WAL, SQLite, or an embedded Kafka-compatible log (e.g. Redpanda in
-single-node mode)? Leaning SQLite-as-WAL for simplicity of a single deployable Go
-binary; revisit once the edge collector's exact write pattern is designed.
+**Resolved 2026-08-29 — edge collector shape and storage:** the edge collector is
+a standalone Go binary per trial site (not a shared multi-tenant service — this
+keeps the partition-tolerance story simple: one process, one local disk, one
+site's worth of blast radius), using embedded SQLite in WAL mode
+(`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) as its local durable
+queue. Chosen over a custom file WAL (reinvents crash recovery/indexing for no
+benefit) or an embedded Kafka-compatible log like Redpanda (too heavy for an
+edge agent, complicates deployment on site workstations). Resolves former Open
+Questions 2 and 5 — full comparison in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+
+**Resolved 2026-08-29 — topology:** the edge collector never connects directly
+to Kafka brokers. Trial-site network policies routinely block raw broker ports,
+and a direct connection would also bypass per-site rate limiting and payload
+validation, which have to happen centrally (§2.3). Instead the edge collector
+forwards queued batches to the Central Ingestion service over an HTTPS API
+(`POST /api/v1/events`) with retry/backoff; Central Ingestion is the only thing
+that writes to Kafka.
 
 ### 2.2 Exactly-once processing semantics
 
@@ -81,13 +95,36 @@ enforced with an application-level idempotency key.
 - Each adverse event report carries a client-generated idempotency key
   (`site_id + local_sequence_number`, assigned at the moment of capture, before
   any network attempt).
-- The edge collector and the central ingestion service both dedup on that key —
-  ingestion does an insert-if-not-exists against the dedup store before
-  publishing to Kafka, so a retried/duplicate send from a reconnecting site is a
-  no-op, not a duplicate record.
+- The edge collector and the central ingestion service both dedup on that key.
+  Central Ingestion's pipeline order is: intake → rate-limit → FHIR validation →
+  dedup check → publish to Kafka (§2.3).
 - Internal stream processing (ingestion → validation → storage) uses Kafka's
   idempotent producer + transactional writes to get effectively-once *within* the
   pipeline.
+
+**Resolved 2026-08-29 — dedup store:** Cassandra, via a lightweight-transaction
+insert (`INSERT ... IF NOT EXISTS`) into a `processed_idempotency_keys` table.
+Chosen over Redis+TTL because a TTL risks re-processing a duplicate that arrives
+after a very long site outage — exactly the partition scenario §2.1 exists to
+tolerate — where Cassandra gives a permanent, non-expiring dedup record instead.
+Kept behind a `DedupStore` interface in case Redis is added later purely as a
+cache in front of it. Resolves former Open Question 3 — full comparison in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+
+**Required correctness pattern — transactional outbox, not check-then-publish:**
+the dedup-key insert and the Kafka publish must not be two independent steps with
+a crash window between them. If the LWT insert succeeds and the process then
+crashes or loses connectivity *before* publishing to Kafka, a naive
+implementation would treat every future retry of that same event as an
+already-seen duplicate and silently drop it forever — precisely the "silently
+dropped" failure mode this section exists to prevent. Instead: write the event
+(with its idempotency key and a `published: false` flag) into Cassandra in one
+statement, then have a separate, retriable step publish it to Kafka and flip
+`published: true` — so an interrupted publish is *resumable*, not lost. This
+mirrors the store-then-forward shape already used at the edge (§2.1). Any dedup
+implementation that does "insert key, then publish" as two unrelated steps
+without a resumable outbox in between does not satisfy this section and should
+be sent back for revision.
 
 **Reasoning:** A severe adverse event must never be silently dropped *or*
 duplicated, even under retries. Retries are guaranteed to happen (that's the whole
@@ -115,6 +152,17 @@ multiple instances behind a load balancer.
 **Reasoning:** A single misbehaving site (bad clock, buggy client, malformed FHIR)
 must not be able to degrade ingestion for every other site, and must not silently
 lose data — DLQ entries need to be inspectable and replayable once fixed.
+
+**Resolved 2026-08-29 — payload schema:** rather than implementing the full FHIR
+R4 `AdverseEvent` resource (large, mostly irrelevant regulatory sub-fields for
+this project's purpose), Pharos targets a deliberately scoped, named subset:
+`resourceType`, `identifier` (carrying the idempotency key), `actuality`,
+`subject`, `event` (MedDRA-coded), `date` (event time, zone-aware) /
+`recordedDate` (capture time), `seriousness`, `severity`, `study`, `location`,
+`suspectEntity`. Being an explicit, documented subset — not an ad hoc shape —
+means it reads as a deliberate scoping decision rather than an incomplete FHIR
+implementation in a technical walkthrough. Resolves former Open Question 4; full
+field list in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 
 ### 2.4 Multi-timezone event ordering and correctness
 
@@ -147,7 +195,7 @@ ingestion time for operational monitoring, and they are not interchangeable.
 | Central ingestion service | Go | same reasoning |
 | Event backbone | Apache Kafka | fairly confident fit |
 | Primary storage | Apache Cassandra, self-hosted via Docker | **resolved 2026-08-28 — see §5.1** |
-| Dedup store | TBD (Redis vs Cassandra LWT) | open question, tied to 2.2 |
+| Dedup store | Cassandra (LWT insert + transactional outbox to Kafka) | resolved 2026-08-29 — see §2.2 |
 | Rate limiter backing store | Redis (leading candidate) | not yet validated |
 
 Go vs Rust: no strong reason yet to reach for Rust's stricter guarantees over Go's
@@ -163,13 +211,13 @@ lands — do not mark anything done based on a plan or a stub.
 
 - [ ] Repo scaffolding (Go module layout, linting, CI)
 - [ ] Edge collector: local durable buffering
-- [ ] Edge collector: forwarding to Kafka with retry/backoff
+- [ ] Edge collector: forwarding to Central Ingestion API with retry/backoff
 - [ ] Idempotency key generation (client-side, at capture time)
-- [ ] Central ingestion service: HTTP/gRPC intake
-- [ ] Central ingestion service: FHIR schema validation
+- [ ] Central ingestion service: HTTP intake (`POST /api/v1/events`)
+- [ ] Central ingestion service: FHIR schema validation (scoped profile, §2.3)
 - [ ] Dead-letter topic + DLQ inspection tooling
 - [ ] Per-site rate limiting
-- [ ] Dedup store + insert-if-not-exists path
+- [ ] Dedup store: Cassandra LWT + transactional outbox to Kafka (§2.2)
 - [ ] Kafka topic design (partitioning strategy, retention)
 - [ ] Cassandra schema design
 - [ ] Stream processing layer (event-time ordering / watermarking)
@@ -203,18 +251,17 @@ lands — do not mark anything done based on a plan or a stub.
    - **Still open:** actual query pattern fit (e.g., "all events for trial X in
      date range Y" may want a different partition key than "all events from site
      Z"). Revisit once schema + top 3-5 real queries are drafted.
-2. Edge collector local durability mechanism — SQLite-as-WAL vs. embedded
-   log-structured store (see 2.1).
-3. Dedup store choice — Redis (fast, needs TTL tuning to not evict a key before a
-   slow retry arrives) vs. Cassandra lightweight transactions (consistent with
-   primary storage, but LWTs are expensive at Cassandra's usual write volume).
-4. Exact FHIR resource profile to target (full FHIR AdverseEvent resource is
-   large — likely want a deliberately scoped subset for this project, documented
-   explicitly so it doesn't read as an incomplete FHIR implementation).
-5. Whether the edge collector should be one Go binary per site or a shared
-   multi-tenant service the site talks to over a local network — affects the
-   partition-tolerance story materially and should be decided before any code
-   exists for 2.1.
+2. ~~Edge collector local durability mechanism.~~ **RESOLVED 2026-08-29** —
+   SQLite-as-WAL. See §2.1.
+3. ~~Dedup store choice.~~ **RESOLVED 2026-08-29** — Cassandra LWT, with a
+   mandatory transactional-outbox pattern to the Kafka publish step (not a bare
+   check-then-publish). See §2.2. Approved with this one required modification
+   to Gemini's original proposal — see
+   [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md) for the full review.
+4. ~~Exact FHIR resource profile to target.~~ **RESOLVED 2026-08-29** — scoped
+   named subset of FHIR R4 `AdverseEvent`. See §2.3.
+5. ~~One Go binary per site vs. shared multi-tenant edge service.~~
+   **RESOLVED 2026-08-29** — one binary per site. See §2.1.
 
 ---
 

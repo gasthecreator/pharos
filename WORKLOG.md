@@ -40,6 +40,83 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-29] Claude Code review: 4 proposals approved (1 with a required fix), Slice 1 plan cleared to build
+
+**Author:** Claude Code
+
+**What:** Reviewed Gemini's four architecture proposals in `ARCHITECTURE_PROPOSALS.md`
+and the Slice 1 implementation plan Gemini produced. Approved three proposals
+as-is (ingress topology via Central Ingestion HTTPS API; SQLite-WAL edge
+durability as a per-site binary; the scoped FHIR R4 profile) and folded all
+three into `PLAN.md` §2.1/§2.3, resolving former Open Questions 2, 4, and 5.
+Approved the fourth (Cassandra LWT as the dedup store) with one required
+modification, also folded into `PLAN.md` §2.2, resolving former Open Question 3.
+
+**Why:** The dedup proposal as written implied a two-step "insert idempotency
+key, then publish to Kafka" sequence with no atomicity between the steps. If the
+LWT insert succeeds and the process crashes or partitions before the Kafka
+publish completes, every future retry of that event would be seen as an
+already-processed duplicate and silently dropped forever — exactly the failure
+mode PLAN.md §2.2 flags as the easiest thing to get subtly wrong here. This is
+a correctness gap, not a style preference, so it couldn't be waved through.
+
+**How:** Required a transactional-outbox pattern instead: write the event with
+its idempotency key and a `published: false` flag into Cassandra in one
+statement (the LWT `IF NOT EXISTS` on that insert is the dedup check), then a
+separate retriable step publishes to Kafka and flips `published: true`. An
+interrupted publish becomes resumable instead of lost, and the shape matches
+the store-then-forward pattern already used at the edge (§2.1). Also reviewed
+Gemini's Slice 1 implementation plan (repo scaffolding, domain models,
+client-side idempotency keys, SQLite-WAL edge queue) — it correctly defers both
+the dedup/outbox logic and the Central Ingestion Kafka-publish path to a later
+slice, so nothing in Slice 1 needed to change; cleared it to build as written.
+
+**Files/modules touched:** `PLAN.md` (§2.1, §2.2, §2.3, §3, §4, §5),
+`ARCHITECTURE_PROPOSALS.md` (all four entries marked resolved).
+
+**Tests added/updated:** none — review only, no code exists yet.
+
+**Follow-ups / left open:**
+- Gemini: proceed with Slice 1 as planned (repo scaffolding, domain models,
+  idempotency keys, SQLite-WAL edge store) — no changes needed there.
+- Whoever builds Central Ingestion's dedup path (later slice) must implement it
+  against the outbox pattern in `PLAN.md` §2.2, not against the original
+  proposal text in `ARCHITECTURE_PROPOSALS.md`.
+- Rate limiter backing store (Redis, tentative) is still unvalidated — not
+  addressed by this round of proposals.
+- Cassandra schema fit against real query patterns (PLAN.md §5) is still open.
+- Claude Code's fault-injection test suite (partition/duplicate/out-of-order)
+  can start once Slice 1's SQLite store lands — the concurrent-writer and
+  crash-recovery tests Gemini already scoped in `sqlite_store_test.go` are a
+  reasonable foundation to build on rather than duplicate.
+
+## [2026-08-29] Architecture Review, Requirements Re-Derivation, and Ingress/Storage Proposals
+
+**Author:** Gemini (Antigravity)
+
+**What:** Conducted a comprehensive review of `PLAN.md`, `ARCHITECTURE_PROPOSALS.md`, and `WORKLOG.md`. Re-derived the four core distributed engineering challenges and resolved ambiguities by drafting four formal architecture proposals in `ARCHITECTURE_PROPOSALS.md`:
+1. Ingress Topology Clarification: Edge forwards to Central Ingestion HTTPS API, not direct Kafka over WAN.
+2. Edge Collector Local Durability: Embedded SQLite in WAL mode for crash-resilient store-and-forward.
+3. Scoped FHIR R4 AdverseEvent Schema Profile: Formal contract for validation and dead-letter routing.
+4. Central Dedup Store: Cassandra LWT table with a pluggable Go interface for optional Redis caching.
+Produced a concrete implementation plan for the first development slice (scaffolding, domain models, client-side idempotency keys, and edge store-and-forward queue).
+
+**Why:** Directly addresses all four core engineering challenges in `PLAN.md` (§2.1 Network partition tolerance, §2.2 Exactly-once processing semantics, §2.3 Rate limiting and DLQ, §2.4 Multi-timezone event ordering) and resolves open questions in §5. Adheres strictly to the non-negotiable process agreement: never edit `PLAN.md` directly; capture architectural ambiguities/proposals for Claude Code and Gideon review before implementing deviations.
+
+**How:** 
+- Analyzed the distributed systems boundaries: Kafka's transactional guarantees only protect internal pipeline hops; client-to-sink exactly-once requires client-assigned idempotency keys (`site_id:local_seq`) and atomic persistence before network attempts.
+- Identified the network topology mismatch between edge sites and Kafka brokers across international WAN; formalized the DMZ role of the Central Ingestion HTTP service.
+- Evaluated embedded storage options for the edge binary, selecting SQLite with WAL mode (`PRAGMA synchronous = NORMAL; PRAGMA journal_mode = WAL;`) for atomic sequence assignment, transactional status updates, and single-binary zero-external-daemon deployment.
+- Structured the initial implementation slice for local execution with Docker Compose (Kafka KRaft mode + Apache Cassandra) with zero cloud spend.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md`, `WORKLOG.md`, `implementation_plan.md` (artifact).
+
+**Tests added/updated:** None yet — planning and architecture review phase.
+
+**Follow-ups / left open:**
+- Claude Code and Gideon review of the four proposals in `ARCHITECTURE_PROPOSALS.md`.
+- User approval of Implementation Plan for Slice 1 to begin scaffolding and code implementation.
+
 ## [2026-08-28] Repo created, PLAN.md written, storage cost/licensing resolved
 
 **Author:** Claude Code
