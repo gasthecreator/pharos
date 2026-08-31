@@ -11,8 +11,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gasthecreator/pharos/pkg/edge"
-	"github.com/gasthecreator/pharos/pkg/metrics"
+	"github.com/gasthecreator/pharos/internal/edge"
+	"github.com/gasthecreator/pharos/internal/metrics"
 )
 
 func main() {

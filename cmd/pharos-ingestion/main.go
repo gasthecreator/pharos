@@ -12,11 +12,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gasthecreator/pharos/pkg/dedup"
-	"github.com/gasthecreator/pharos/pkg/ingestion"
-	"github.com/gasthecreator/pharos/pkg/kafka"
-	"github.com/gasthecreator/pharos/pkg/metrics"
-	"github.com/gasthecreator/pharos/pkg/ratelimit"
+	"github.com/gasthecreator/pharos/internal/dedup"
+	"github.com/gasthecreator/pharos/internal/ingestion"
+	"github.com/gasthecreator/pharos/internal/kafka"
+	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/ratelimit"
 )
 
 func main() {

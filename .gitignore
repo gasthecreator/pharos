@@ -25,3 +25,18 @@ data/
 *.swo
 *~
 .DS_Store
+
+# AI tooling config (local to each contributor, not part of the project)
+.claude/
+.cursor/
+.antigravity/
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Editor/agent scratch output
+*.log
+/tmp/

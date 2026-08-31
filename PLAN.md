@@ -105,7 +105,7 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   **Resolved 2026-08-30 — implemented.** All three services expose
   `/metrics` (ingestion/edge share their existing HTTP server; consumer got
   a dedicated one on `--metrics-port`, default 9091, alongside `/healthz`)
-  via a new `pkg/metrics` package of package-level Prometheus collectors —
+  via a new `internal/metrics` package of package-level Prometheus collectors —
   safe as globals specifically because each binary runs as exactly one
   process per site/service, never multiple independent instances sharing a
   process. Every metric named above is wired to a real call site (not a
@@ -126,9 +126,9 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   Grafana renders live data on the provisioned dashboard.
 
   **Known limitation, caught during that same verification, not fully
-  fixed tonight:** `pkg/edge` transitively imports `pkg/ingestion` (for the
+  fixed tonight:** `internal/edge` transitively imports `internal/ingestion` (for the
   wire-format types `BatchRequest`/`BatchResponse`), and all three services
-  import the single shared `pkg/metrics` package directly — so every
+  import the single shared `internal/metrics` package directly — so every
   binary's `/metrics` actually exposes *all* services' metric names, zero-
   valued for whatever that binary doesn't itself touch (confirmed:
   `pharos-edge`'s raw `/metrics` output includes `pharos_consumer_kafka_lag`
@@ -141,9 +141,9 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   refactor at this hour on `handler.go`/`forwarder.go`, which are both
   fault-injection-tested critical paths not worth touching for a cosmetic
   fix under time pressure. The correct real fix, for whoever picks this up:
-  extract the wire types edge actually needs out of `pkg/ingestion` into
-  their own dependency-free package (e.g. `pkg/wire`), so `pkg/edge` no
-  longer transitively pulls in `pkg/ingestion` (and by extension anything it
+  extract the wire types edge actually needs out of `internal/ingestion` into
+  their own dependency-free package (e.g. `internal/wire`), so `internal/edge` no
+  longer transitively pulls in `internal/ingestion` (and by extension anything it
   imports) at all.
 
   Grafana OSS is
@@ -164,7 +164,7 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   plain reads/writes around them). 3-broker Kafka cluster, still KRaft mode
   (no ZooKeeper), topic replication factor 3, `min.insync.replicas=2`.
   `gocql`/`kafka-go` client configs need multiple contact points/broker
-  addresses. Full existing test suite (including `pkg/faultinjection`) must
+  addresses. Full existing test suite (including `internal/faultinjection`) must
   pass unchanged against the multi-node setup before this slice is done —
   that's the actual proof, not a new feature. **New node-failure
   fault-injection scenarios (kill one Cassandra node or one Kafka broker
@@ -183,7 +183,7 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   cluster competing for the same Docker Desktop memory, in
   [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet` clean;
   `go test -race -count=1 ./...` passed twice against the real 3-node
-  Cassandra / 3-broker Kafka cluster, including `pkg/faultinjection`.
+  Cassandra / 3-broker Kafka cluster, including `internal/faultinjection`.
   `nodetool status` confirms all 3 nodes `UN`; both Kafka topics confirmed
   at `ReplicationFactor: 3` with `Isr` covering all 3 brokers on every
   partition, checked directly against the live cluster.
@@ -435,7 +435,7 @@ implementation in a technical walkthrough. Resolves former Open Question 4; full
 field list in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 
 **Resolved 2026-08-30 — DLQ inspection & query tooling:** Surfaced through
-`pkg/query.Service` and `cmd/pharos-cli dlq list/get`. Migration
+`internal/query.Service` and `cmd/pharos-cli dlq list/get`. Migration
 `migrations/003_dlq_site_index.cql` adds a secondary index on
 `dead_letter_events (site_id)`, allowing site-scoped queries without table scans.
 Inspection displays the exact structured FHIR validation errors, wire payload,
@@ -493,7 +493,7 @@ arrives late for an already-closed window — matching 21 CFR Part 11's
 requirement to never silently mutate a reported result, while still never
 dropping the late data itself (`is_late: true`, always persisted).
 
-**Resolved 2026-08-30 — Canonical query surface:** Answered via `pkg/query.Service`
+**Resolved 2026-08-30 — Canonical query surface:** Answered via `internal/query.Service`
 and `cmd/pharos-cli query study|site|event`. Answers both named queries against
 real Cassandra tables ("all events for trial X in date range Y" via
 `events_by_study` and "all events from site Z" via `events_by_site`), plus single-event
@@ -532,7 +532,7 @@ lands — do not mark anything done based on a plan or a stub.
 - [x] Dead-letter topic + DLQ inspection tooling — persistence in Cassandra
       `dead_letter_events` + Kafka `pharos.events.dlq` (Slice 3) and CLI
       inspection tooling (Slice 5: `cmd/pharos-cli dlq list/get` and
-      `pkg/query.Service`), verified against real Cassandra with actual
+      `internal/query.Service`), verified against real Cassandra with actual
       validation failure details. Site-scoped lookups go through a dedicated
       `dead_letter_events_by_site` table (partition-key-first, matching
       `events_by_site`'s pattern) rather than a secondary index — the first
@@ -547,7 +547,7 @@ lands — do not mark anything done based on a plan or a stub.
       `site_id` done and verified (Slice 3). Retention (7 days / 10GB for
       `pharos.events.adverse`, grounded in FDA 21 CFR 312.32(c)(2) expedited
       safety reporting; 14 days / 5GB for `pharos.events.dlq`) is enforced by
-      an `EnsureTopics()` bootstrap in `pkg/kafka/topics.go`, mirroring how
+      an `EnsureTopics()` bootstrap in `internal/kafka/topics.go`, mirroring how
       Cassandra schema already gets ensured on connect, called from
       `cmd/pharos-ingestion` and `cmd/pharos-consumer` startup. The first
       draft only defined the values as unused Go constants without ever
@@ -561,13 +561,13 @@ lands — do not mark anything done based on a plan or a stub.
       (`canonical_events`, `events_by_study`, `events_by_site`), all verified
       against a real cluster
 - [x] Stream processing layer (event-time ordering / watermarking) — Slice 4:
-      `pkg/consumer` reads `pharos.events.adverse`, tracks per-partition
+      `internal/consumer` reads `pharos.events.adverse`, tracks per-partition
       watermarks with idle-source exclusion and a monotonic max guard,
       manages `OPEN`/`COMPLETE`/`REVISED` window lifecycle with a
       deduplicated late-arrival audit trail. Verified against real
       Cassandra/Kafka, including the exact partition-reawakening-with-
       backlog scenario that broke the first two design attempts.
-- [x] Fault-injection test suite (network partition simulation) — `pkg/faultinjection`,
+- [x] Fault-injection test suite (network partition simulation) — `internal/faultinjection`,
       Claude's own work per §6. Real edge + real Central Ingestion + real
       Cassandra + real Kafka: a site loses connectivity entirely (buffers
       locally, zero loss), then the partition heals *asymmetrically* (Central
@@ -578,7 +578,7 @@ lands — do not mark anything done based on a plan or a stub.
 - [x] Fault-injection test suite (duplicate delivery) — covered by Slice 3's
       `TestConcurrentDuplicateRaces`, `TestSequentialDuplicateIdempotency`,
       `TestCassandraOutboxStore_RealIntegration`'s concurrent-race case
-- [x] Fault-injection test suite (out-of-order delivery) — `pkg/faultinjection`,
+- [x] Fault-injection test suite (out-of-order delivery) — `internal/faultinjection`,
       Claude's own work per §6. Submits one site's events to Central Ingestion
       in scrambled local_seq order, drains through the real consumer, and
       verifies `events_by_site` returns them correctly ordered by the schema's
@@ -586,7 +586,7 @@ lands — do not mark anything done based on a plan or a stub.
 - [x] Fault-injection test suite (malformed FHIR payloads → DLQ) — covered by
       Slice 3's `TestDeadLetterPipeline_DurabilityAndRouting` and related handler tests
 - [x] Observability (metrics on lag, dedup hit rate, DLQ volume) — Phase 2
-      Slice 6: Prometheus instrumentation (`pkg/metrics`) across all three
+      Slice 6: Prometheus instrumentation (`internal/metrics`) across all three
       services, self-hosted Grafana with a provisioned starter dashboard.
       Verified against live `/metrics` endpoints and real Grafana panels
       with real traffic flowing, not just that the code compiles.
