@@ -40,6 +40,110 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-31] Claude Code: scoped Slice 22 (simulation testing) and Slice 23 (Chaos Control Panel)
+
+**Author:** Claude Code
+
+**What:** Appended two new slices to `PLAN.md`'s Phase 2 breakdown, after
+Slice 21. Slice 22: property-based testing of the claim/lease and
+watermark invariants (`pgregory.net/rapid`), staged toward a full
+deterministic simulation harness in FoundationDB's style — `Clock`/`Network`
+abstractions letting the whole pipeline run against simulated,
+seed-controlled time and message delivery, so a CI job can explore tens of
+thousands of interleavings a second instead of the handful of hand-picked
+scenarios fault-injection tests can afford. Slice 23: a "Chaos Control
+Panel" extending the Slice 21 dashboard — real chaos actions (partition a
+site, kill a Cassandra node, inject a duplicate, skew a clock) triggered
+against the live running cluster, next to a live "Correctness Ledger"
+panel proving the system stays correct while it's being deliberately hurt.
+
+**Why:** Gideon asked for genuinely novel ideas beyond incremental
+production-hardening — something that would make the project stand out,
+not just close gaps. Two ideas, aimed at two different audiences: Slice 22
+is the one that earns credibility with engineers who know what FoundationDB
+did and why it mattered (a handful of hand-written fault-injection
+scenarios proves less than most people assume — this project's own history
+of real bugs found in review were all interleavings nobody thought to
+write down by hand). Slice 23 is the one that's actually shareable — most
+"we tested for partition tolerance" claims live in a doc a reader has to
+trust; this one lets them press a button and watch it happen.
+
+**How:** Sequenced deliberately: Slice 22 doesn't block anything and is
+best built once Slice 8/9's wire-format changes land so its invariant
+checks target the final contract. Slice 23 needs Slice 21 to exist as a
+host, and its individual chaos actions unlock incrementally as their
+underlying capability lands elsewhere (site-partition chaos could ship
+immediately, since `internal/faultinjection` already has the transport-
+blocking pattern; region-partition chaos naturally waits for Slice 14).
+Gave Slice 23 an explicit safety requirement — chaos actions must be
+opt-in via a startup flag, not silently trusted to be safe just because
+the project has no auth yet — rather than leaving that as an unstated
+assumption.
+
+**Files/modules touched:** `PLAN.md` only — scoping, no code yet.
+
+**Tests added/updated:** None (scoping only).
+
+**Follow-ups / left open:** Neither slice has a build session started yet.
+Slice 22 Stage A (property-based tests) is well-scoped enough to hand to
+Gemini as a standalone task if that's preferred over Claude doing all of
+Slice 22 directly.
+
+---
+
+## [2026-08-31] Claude Code: re-scoped PLAN.md — 7 new core-pipeline slices inserted ahead of production hardening
+
+**Author:** Claude Code
+
+**What:** Inserted seven new slices (8-14) into `PLAN.md`'s Phase 2
+breakdown, ahead of the previously-planned Auth/TLS-through-dashboard work,
+which is renumbered Slice 15-21 with no change to its own content: Slice 8
+(idempotency key resilience), Slice 9 (wire-format schema versioning),
+Slice 10 (DLQ replay & reprocessing), Slice 11 (data retention & lifecycle),
+Slice 12 (edge collector durability hardening), Slice 13 (consumer
+crash/restart fault-injection for watermark continuity — Claude's own),
+Slice 14 (multi-region Cassandra + Kafka, simulated on a single machine
+via `NetworkTopologyStrategy`, Kafka rack-awareness + MirrorMaker 2, and
+`tc netem`-induced WAN latency/partition).
+
+**Why:** Gideon asked directly whether the core pipeline (not just the
+already-tracked production-hardening gaps) had real holes, and whether
+anything was excluded specifically because of the "portfolio" framing.
+Answered honestly: yes. The headline finding is Slice 8 — not speculative,
+an empirically observed failure mode. The idempotency key is
+`site_id:local_seq` only; a trial site's disk failing and being replaced
+with the same site_id resets `local_seq` to 1, colliding with real prior
+submissions' keys, and the dedup layer (correctly, by its own logic) treats
+the new genuinely-new events as already-published duplicates and silently
+drops them. This was hit firsthand during Slice 6 verification and
+initially mistaken for a test artifact. Gideon's response was to fix all
+seven gaps before continuing to the previously-planned Slice 8-14, and
+explicitly not to skip multi-region despite having no physical
+multi-region hardware — simulate it rigorously instead of skipping the
+problem.
+
+**How:** Renumbered by inserting the new content and shifting the old
+Slice 8-14 headers to 15-21, adding cross-references where the reordering
+actually changes something (Slice 16/18's text now note they benefit from
+Slice 14's multi-region topology; Slice 20 now notes DLQ-replay audit
+belongs in the same trail as query audit once Slice 10 exists). Also fixed
+two stale `pkg/query.Service` references in the dashboard slice (now
+Slice 21) left over from the `pkg/`→`internal/` rename.
+
+**Files/modules touched:** `PLAN.md` only — scoping, no code yet.
+
+**Tests added/updated:** None (scoping only).
+
+**Follow-ups / left open:** Slice 8 and Slice 9 both change the wire format
+and need proposals in `ARCHITECTURE_PROPOSALS.md` before implementation,
+per the standing rule for anything not already fully resolved here. Slice
+14 is the largest single slice in this project's history — worth
+confirming its sub-scope (Cassandra NetworkTopologyStrategy vs. also
+standing up a second MirrorMaker-replicated Kafka cluster) isn't too much
+for one PR before building starts.
+
+---
+
 ## [2026-08-31] Claude Code: scoped Slice 14 — web dashboard
 
 **Author:** Claude Code
