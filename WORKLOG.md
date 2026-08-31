@@ -38,7 +38,61 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ---
 
-## Log
+## [2026-08-31] Claude Code: Slice 8 architecture proposal — idempotency key resilience
+
+**Author:** Claude Code
+
+**What:** Wrote and self-approved the Slice 8 proposal in
+`ARCHITECTURE_PROPOSALS.md` (authored directly by Claude, not Gemini, since
+Gideon asked for it explicitly and the design fell out of investigating
+the underlying bug). Folded the approved design into `PLAN.md`'s Slice 8
+entry.
+
+**Why:** Slice 8 fixes a real, empirically-observed gap: a trial site's
+disk failing and being replaced resets the edge's local `local_seq`
+counter, colliding with real prior submissions' idempotency keys and
+causing the dedup layer to silently drop genuinely new events.
+
+**How:** The design that shipped in the proposal is *not* the one
+originally sketched in PLAN.md's Slice 8 description (a three-part wire
+key, `site_id:instance_id:local_seq`) — writing the actual proposal
+surfaced that `ParseIdempotencyKey`'s existing tail-heuristic (everything
+before the last colon is `site_id`, specifically to tolerate site IDs
+containing colons) makes a third wire segment genuinely ambiguous against
+old 2-part keys. The approved design instead encodes a per-instance epoch
+into the numeric value of `local_seq` itself
+(`local_seq = (instance_epoch << 32) | counter`), confined entirely to
+`internal/edge/sqlite_store.go` — zero changes to `IdempotencyKey`,
+parsing, the wire format, any Cassandra schema, or any downstream
+consumer, since none of them interpret `local_seq`'s internal structure.
+Caught a real boundary-condition risk before it could ship: `local_seq` is
+stored as Cassandra `bigint` (signed 64-bit) in the canonical tables, and
+raw Unix seconds in the epoch component would overflow into the sign bit
+in January 2038 (the classic Y2038 boundary) well within this project's
+intended lifetime — using minutes since a 2026 project epoch instead of
+raw Unix seconds buys ~4,083 years of headroom in the same 31 bits, for
+the cost of one subtraction and one division. Existing, already-running
+sites see zero disruption: the new `instance_epoch` column defaults to 0
+for pre-existing rows, making their `local_seq` numerically identical to
+today, mid-sequence, with no renumbering.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry),
+`PLAN.md` (Slice 8 updated with the resolved design, superseding its
+original three-part-key sketch).
+
+**Tests added/updated:** None yet (proposal only) — a new fault-injection
+test (delete/replace an edge's SQLite file mid-stream, assert new
+submissions claim as `new_claim` not `duplicate_hit`) is specified in the
+proposal as required before this slice is done, not yet written.
+
+**Follow-ups / left open:** Implementation itself (the `sqlite_store.go`
+changes and the fault-injection test) hasn't started. Doesn't need Docker
+running to begin — the code change and its unit-level reasoning don't
+touch live infrastructure; the new fault-injection test will need the
+real stack up to actually verify the fix, consistent with this project's
+standing "verified against real infrastructure" bar.
+
+---
 
 ## [2026-08-31] Claude Code: scoped Slice 22 (simulation testing) and Slice 23 (Chaos Control Panel)
 

@@ -15,6 +15,141 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-08-31] Slice 8: Idempotency Key Resilience Across Edge Instance Loss
+
+**Status:** Resolved: Approved (Claude Code, 2026-08-31). Authored directly
+by Claude rather than proposed by Gemini first, since the design fell out
+of investigating the bug itself — presented here for the same review
+rigor as any other proposal, not implemented unreviewed.
+
+**What in PLAN.md this touches:** §2.2 (Exactly-once processing semantics),
+§2.1 (edge collector durability), Phase 2 Slice 8.
+
+**The bug, precisely:** the idempotency key is `site_id:local_seq`
+(`internal/model/idempotency.go`), and `local_seq` is allocated purely by
+`internal/edge/sqlite_store.go`'s `site_sequence` table, starting at 1 for
+any site_id that table has never seen. A trial site's disk failing and
+being replaced with the same `--site-id` flag produces a brand-new, empty
+`site_sequence` table — the next event that site submits gets
+`local_seq=1` again, identical to the very first event that site *ever*
+submitted, months or years earlier. Central Ingestion's outbox
+(`internal/dedup`) sees that idempotency key already has a `PUBLISHED`
+claim from the original submission and — correctly, by its own logic —
+treats the new event as an already-processed duplicate. It is never
+published to Kafka. **A genuinely new adverse event is silently dropped**,
+not from a bug in the claim/lease mechanism, but because that mechanism
+rests on an assumption (`local_seq` is monotonic per site, forever) that a
+hardware replacement quietly violates. This was hit empirically during
+Slice 6 verification and initially mistaken for a test artifact.
+
+**What I'm proposing:** encode a per-instance epoch into the numeric value
+of `local_seq` itself, computed entirely inside `SQLiteStore.Enqueue`, with
+**zero changes to `IdempotencyKey`, `ParseIdempotencyKey`, the wire format,
+any Cassandra schema, or any downstream consumer** (`internal/ingestion`,
+`internal/consumer`, `internal/query`, `pharos-cli` all already only ever
+read `LocalSeq` off a parsed key as an opaque `uint64` — none of them
+interpret its internal structure).
+
+Concretely:
+- Add one column to the edge's local `site_sequence` table:
+  `instance_epoch INTEGER NOT NULL DEFAULT 0`.
+- The existing allocation query gains one bound parameter, and is
+  otherwise unchanged:
+  ```sql
+  INSERT INTO site_sequence (site_id, last_seq, instance_epoch) VALUES (?, 1, ?)
+  ON CONFLICT(site_id) DO UPDATE SET last_seq = last_seq + 1;
+  ```
+  The `instance_epoch` value passed is only ever *used* on the `INSERT`
+  branch — the `ON CONFLICT` branch's `SET` clause doesn't mention it, so
+  it's left untouched on every subsequent call. This means the exact
+  moment a site_id gets a row in `site_sequence` for the *first time this
+  local database file has ever seen it* is the exact moment a fresh epoch
+  gets minted — which is precisely the signal needed, with no separate
+  "is this a fresh file" bookkeeping required.
+- That stamped `instance_epoch` is minutes since a fixed project epoch
+  (`2026-01-01T00:00:00Z`), not raw Unix seconds — computed once, at
+  `INSERT` time, as `(time.Now().UTC().Unix() - projectEpochUnix) / 60`.
+- The `local_seq` value actually stamped onto the outgoing
+  `IdempotencyKey` becomes `(instance_epoch << 32) | counter`, computed in
+  Go immediately after reading both columns back — the stored `counter`
+  column keeps incrementing 1-by-1 exactly as `last_seq` does today.
+
+**Why the bit widths are chosen deliberately, not just "big enough for
+now":** `internal/consumer`'s canonical tables store `local_seq` as
+Cassandra `bigint` — a **signed** 64-bit integer, max
+`9,223,372,036,854,775,807` (2^63 - 1). Reserving 32 bits for the counter
+(4.29 billion events per instance-lifetime — absurd headroom for adverse-
+event volumes) leaves 31 bits for the epoch. Raw Unix seconds hits 2^31
+in January 2038 — using it directly would silently overflow into the sign
+bit within this project's realistic lifetime, corrupting `local_seq` into
+a negative `bigint`. Using minutes since a 2026 project epoch instead of
+raw Unix seconds buys roughly **4,083 years** of headroom in the same 31
+bits, for the cost of one subtraction and one division. `31 + 32 = 63`
+bits total, always leaving bit 63 (the sign bit) at zero — the composite
+value can never overflow into negative range, by construction, not by
+convention.
+
+**Why existing, already-running sites see zero disruption:** the new
+column defaults to `0` for every `site_sequence` row that already exists
+before this ships (`ALTER TABLE ... ADD COLUMN instance_epoch INTEGER NOT
+NULL DEFAULT 0`). For those rows, `(0 << 32) | counter == counter` — every
+currently-healthy site's `local_seq` values are numerically identical to
+what they are today, mid-sequence, with no renumbering and no
+discontinuity in already-issued keys. Only a site_id that's genuinely new
+to a given local database file — a brand-new site standing up for the
+first time, or a disk-replaced site's fresh file re-encountering "its"
+site_id for the first time from that file's perspective — gets a nonzero,
+collision-resistant epoch. That second case is exactly the bug this
+proposal fixes.
+
+**Alternatives considered:**
+- **A three-part wire key (`site_id:instance_id:local_seq`), my own first
+  instinct before writing this up.** Rejected on closer inspection:
+  `ParseIdempotencyKey` currently treats everything before the *last*
+  colon as `site_id` specifically to tolerate site IDs containing colons —
+  inserting a third segment with the same separator creates a genuine
+  parsing ambiguity between an old 2-part key and a new 3-part one that
+  isn't resolvable from structure alone, and would require either a
+  different separator, a schema-visible version marker, or dual-format
+  parsing logic threaded through every place a key gets parsed. The
+  epoch-in-`local_seq` approach achieves the identical correctness goal —
+  a fresh instance can never collide with a prior one's keys — while
+  touching a single file (`sqlite_store.go`) and changing zero parsing
+  logic anywhere else in the system. When two designs deliver the same
+  guarantee, the one that doesn't touch the wire contract wins.
+- **Detecting a "suspicious reset" by asking Central Ingestion for the
+  site's last-known sequence on edge startup.** Rejected: requires a new
+  RPC/API surface, a race between that check and normal traffic, and a
+  policy decision for what to do on mismatch (refuse to start? warn and
+  proceed?) that's messier than a construction that makes the collision
+  structurally impossible in the first place.
+- **Manual operator bootstrap** (an operator manually sets a starting
+  sequence number when reprovisioning a site). Rejected: operationally
+  heavy, and exactly the kind of manual step that gets skipped under the
+  time pressure of an actual hardware failure at a trial site — the fix
+  needs to require zero operator action to be reliable.
+
+**Impact if approved:**
+- `internal/edge/sqlite_store.go`: new column, modified allocation query,
+  compute the composite `local_seq` before calling `model.NewIdempotencyKey`.
+- No changes anywhere else — `internal/model`, `internal/ingestion`,
+  `internal/consumer`, `internal/query`, `pharos-cli`, and every Cassandra
+  migration stay exactly as they are.
+- New fault-injection test (`internal/faultinjection`): delete/replace an
+  edge's SQLite file mid-stream (simulating the disk-replacement scenario
+  directly), submit new events under the same `site_id`, and assert the
+  outbox claim outcome for those events is `new_claim` — never
+  `duplicate_hit` — proving the exact failure mode this proposal exists to
+  close is actually closed, not just plausible on paper.
+- One minor, deliberate cosmetic tradeoff worth stating plainly: a
+  freshly-created site's `local_seq` (and therefore its idempotency keys)
+  will be a large, opaque-looking number rather than a small friendly
+  counter starting at 1. It was never a human-facing identifier in any
+  other sense, so this doesn't change how anything is *used* — just how
+  it looks in a raw `pharos-cli dlq list` dump for new sites.
+
+---
+
 ## How to write a proposal
 
 Copy this template for each new entry:

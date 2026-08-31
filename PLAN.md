@@ -216,18 +216,36 @@ with no change to their own content or intent.
   because it's built on an assumption (`local_seq` is monotonic per site,
   forever) that a hardware swap quietly breaks. This was hit firsthand
   during Slice 6 verification and initially mistaken for a test artifact —
-  it isn't. **Decision:** extend the key to `site_id:instance_id:local_seq`,
-  where `instance_id` is generated once and persisted the first time a
-  site's SQLite file is created. A replaced/reset file gets a new
-  `instance_id`, so it can never collide with a prior instance's keys, while
-  `local_seq` still gives strict per-instance ordering. Needs a proposal in
-  ARCHITECTURE_PROPOSALS.md before implementation — this changes the wire
-  format used by every service, and needs an explicit answer for how
-  existing 2-part keys already in Cassandra coexist with new 3-part ones
-  (they don't need a uniform format, just an unambiguous parse). New
-  fault-injection test: wipe/replace an edge's SQLite file mid-stream,
-  confirm subsequent genuinely-new submissions are never treated as
-  duplicates of the old instance's events.
+  it isn't.
+
+  **Resolved 2026-08-31 — design: encode a per-instance epoch into
+  `local_seq` itself, not the wire key.** The original sketch above
+  (extend the wire key to `site_id:instance_id:local_seq`) didn't survive
+  contact with the actual parsing code — `ParseIdempotencyKey` already
+  treats everything before the *last* colon as `site_id` specifically to
+  tolerate site IDs containing colons, and a third segment creates a real
+  ambiguity between old 2-part and new 3-part keys that isn't resolvable
+  from structure alone. The approved design instead computes
+  `local_seq = (instance_epoch << 32) | counter` entirely inside
+  `internal/edge/sqlite_store.go` — `IdempotencyKey`,
+  `ParseIdempotencyKey`, the wire format, every Cassandra schema, and
+  every downstream consumer are untouched, since none of them interpret
+  `local_seq`'s internal structure, only its value. `instance_epoch` is
+  stamped once, in minutes since a fixed 2026-01-01 project epoch (not raw
+  Unix seconds — that would hit 2^31 and overflow into Cassandra
+  `bigint`'s sign bit in January 2038; minutes-since-project-epoch buys
+  ~4,083 years in the same 31 bits), at the exact moment a `site_id` gets
+  a row in the edge's local `site_sequence` table for the first time that
+  local database file has ever seen it — which is precisely the signal
+  for "this is either a brand-new site or a disk-replaced one," with no
+  separate detection needed. Existing sites see zero disruption: their
+  already-existing rows default `instance_epoch` to 0, making their
+  `local_seq` numerically identical to today. Full reasoning, the bit-width
+  derivation, and rejected alternatives in
+  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). New
+  fault-injection test (still needed, unchanged from the original plan):
+  wipe/replace an edge's SQLite file mid-stream, confirm subsequent
+  genuinely-new submissions land as `new_claim`, never `duplicate_hit`.
 
 - **Slice 9 — Wire-format schema versioning.** Forward-looking hardening,
   not a fix for an existing bug: the AdverseEvent wire schema hasn't changed
