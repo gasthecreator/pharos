@@ -10,8 +10,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/gasthecreator/pharos/pkg/consumer"
-	"github.com/gasthecreator/pharos/pkg/query"
+	"github.com/gasthecreator/pharos/internal/consumer"
+	"github.com/gasthecreator/pharos/internal/query"
 )
 
 func printUsage() {

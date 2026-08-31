@@ -99,7 +99,7 @@ Add `--memory` to any `pharos-cli` command to try it with built-in sample data, 
 
 ## How this was actually verified
 
-Every one of the four core challenges is tested against real Cassandra and real Kafka — not mocks — including dedicated fault-injection tests (`pkg/faultinjection`) for a total network partition, a partition healing *asymmetrically* (Central Ingestion finishes a write but the edge never sees the response, forcing a retry of an already-completed write), and out-of-order delivery.
+Every one of the four core challenges is tested against real Cassandra and real Kafka — not mocks — including dedicated fault-injection tests (`internal/faultinjection`) for a total network partition, a partition healing *asymmetrically* (Central Ingestion finishes a write but the edge never sees the response, forcing a retry of an already-completed write), and out-of-order delivery.
 
 Structured design review across the build caught real correctness bugs before they shipped, not after — five of the more notable ones:
 
@@ -126,9 +126,16 @@ cmd/pharos-edge         Per-site collector: HTTP capture + SQLite WAL + forwarde
 cmd/pharos-ingestion    Central Ingestion: rate-limit, validate, dedup/outbox, publish
 cmd/pharos-consumer     Kafka consumer: watermarking, canonical Cassandra writes
 cmd/pharos-cli          Query & DLQ inspection CLI
-pkg/                    Implementation packages, one per concern above plus faultinjection
+internal/               Implementation packages, one per concern above plus faultinjection
 migrations/             Cassandra schema (bootstrapped automatically at startup too)
+docs/api/               OpenAPI specs for the edge and Central Ingestion HTTP APIs
 PLAN.md                 Living architecture doc — source of truth for every design decision
 ARCHITECTURE_PROPOSALS.md   Proposal/review trail for every non-trivial design change
 WORKLOG.md              Dated log of every implementation session, by whoever did it
+CONTRIBUTING.md         Branch/PR/proposal-review workflow
+SECURITY.md             Security policy and known, deliberate gaps
 ```
+
+## License
+
+[MIT](LICENSE)

@@ -1,0 +1,132 @@
+openapi: 3.0.3
+info:
+  title: Pharos Central Ingestion API
+  version: "1.0"
+  description: >
+    The only service that talks to Kafka (PLAN.md §2.1). Its `/api/v1/events`
+    endpoint is primarily an internal wire contract that edge collectors call
+    — it is not intended for direct use by trial sites — but it's a real,
+    independently addressable HTTP API, documented as such. Per-site rate
+    limiting, FHIR validation, and dedup/outbox claim all happen here (§2.2,
+    §2.3) before anything reaches Kafka.
+servers:
+  - url: http://localhost:8091
+    description: Default local Central Ingestion instance (--port 8091; the README uses this port specifically to dodge a port-8081 conflict some machines have — see README.md)
+
+paths:
+  /api/v1/events:
+    post:
+      summary: Submit a batch of adverse events from an edge collector
+      description: >
+        Per-event-aware batch semantics (PLAN.md §2.3) — a single batch can
+        have a genuine mix of accepted, rejected, and transiently-failed
+        events. 207 is returned whenever the batch has any mix of outcomes;
+        a bare 503 is reserved for the case where every event in the batch
+        hit an infrastructure failure with nothing else to report.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchRequest"
+      responses:
+        "200":
+          description: Every event in the batch was accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "207":
+          description: Multi-status — a mix of accepted/rejected/failed outcomes in one batch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "422":
+          description: Every event in the batch failed FHIR validation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "429":
+          description: Per-site rate limit exceeded
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+            X-RateLimit-Limit:
+              schema:
+                type: integer
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+            X-RateLimit-Reset:
+              schema:
+                type: integer
+        "503":
+          description: Every event in the batch hit an infrastructure failure (Cassandra/Kafka unavailable) — safe to retry the whole batch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Service is up
+
+  /metrics:
+    get:
+      summary: Prometheus metrics (request/status counts, rate-limit rejections, dedup outcomes, DLQ writes, outbox publish latency)
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+    BatchRequest:
+      type: object
+      required: [events]
+      properties:
+        site_id:
+          type: string
+        events:
+          type: array
+          description: Raw FHIR-shaped adverse event JSON, forwarded byte-for-byte from the edge — see edge-openapi.yaml's AdverseEvent schema.
+          items:
+            type: object
+
+    BatchResponse:
+      type: object
+      properties:
+        total:
+          type: integer
+        accepted:
+          type: integer
+        rejected:
+          type: integer
+        failed:
+          type: integer
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventResult"
+        error:
+          type: string
+
+    EventResult:
+      type: object
+      properties:
+        idempotency_key:
+          type: string
+        status:
+          type: string
+          enum: [ACCEPTED, REJECTED, FAILED]
+        error:
+          type: string

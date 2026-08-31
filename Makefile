@@ -1,4 +1,4 @@
-.PHONY: build test lint clean up down ps
+.PHONY: build test lint fmt fmt-check clean up down ps
 
 BIN_DIR := bin
 EDGE_BIN := $(BIN_DIR)/pharos-edge
@@ -17,6 +17,15 @@ test:
 
 lint:
 	go vet -buildvcs=false ./...
+
+fmt:
+	gofmt -w .
+
+fmt-check:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "Not gofmt-formatted:"; echo "$$unformatted"; exit 1; \
+	fi
 
 clean:
 	rm -f $(EDGE_BIN) $(INGESTION_BIN) $(CONSUMER_BIN) $(CLI_BIN) *.db *.db-wal *.db-shm *.db-journal coverage.out

@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gasthecreator/pharos/pkg/consumer"
-	"github.com/gasthecreator/pharos/pkg/kafka"
-	"github.com/gasthecreator/pharos/pkg/metrics"
+	"github.com/gasthecreator/pharos/internal/consumer"
+	"github.com/gasthecreator/pharos/internal/kafka"
+	"github.com/gasthecreator/pharos/internal/metrics"
 )
 
 func main() {

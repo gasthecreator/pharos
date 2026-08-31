@@ -1,0 +1,33 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - staticcheck
+  settings:
+    errcheck:
+      exclude-functions:
+        - (io.Closer).Close
+        - (net/http.ResponseWriter).Write
+  exclusions:
+    rules:
+      # Ignoring the error from a deferred Close() is standard, accepted Go
+      # idiom in this codebase — the resource is being torn down, not relied
+      # on for its result. Flagging every one adds noise, not safety.
+      - path: _test\.go
+        linters:
+          - errcheck
+        text: "Error return value of .*Close. is not checked"
+      - linters:
+          - errcheck
+        text: "Error return value of .*Close. is not checked"
+      # Table/output formatting to stdout in the CLI — a write failure here
+      # isn't something the tool can meaningfully recover from or that's
+      # worth checking on every line of a table.
+      - path: cmd/pharos-cli/
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
