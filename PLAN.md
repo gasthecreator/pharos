@@ -172,6 +172,22 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   per §6 — this slice delivers the multi-node infra and confirms the
   existing suite survives it, not new fault-injection tests.**
 
+  **Done 2026-08-31.** Shipped with two real deviations from the plan above,
+  both because the literal spec didn't survive contact with a real cluster:
+  Kafka runs a single KRaft controller (broker 1) rather than all three
+  brokers as controller-quorum voters (3-way election contention thrashed
+  under load), and all three Kafka brokers — not just broker 1 — expose a
+  host port, since unlike Cassandra, Kafka clients dial partition leaders
+  directly rather than going through a proxying coordinator. Full detail,
+  including a real OOM root-caused to a *different* project's Kubernetes
+  cluster competing for the same Docker Desktop memory, in
+  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet` clean;
+  `go test -race -count=1 ./...` passed twice against the real 3-node
+  Cassandra / 3-broker Kafka cluster, including `pkg/faultinjection`.
+  `nodetool status` confirms all 3 nodes `UN`; both Kafka topics confirmed
+  at `ReplicationFactor: 3` with `Isr` covering all 3 brokers on every
+  partition, checked directly against the live cluster.
+
 - **Slice 8 — Auth & TLS.** Nothing in this system authenticates or encrypts
   anything today — any process that can reach the HTTP ports can submit or
   read adverse event data, which is disqualifying for anything claiming

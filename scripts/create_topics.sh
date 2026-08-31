@@ -17,6 +17,9 @@ if command -v kafka-topics &> /dev/null; then
 elif [ -f "/opt/kafka/bin/kafka-topics.sh" ]; then
     KAFKA_TOPICS="/opt/kafka/bin/kafka-topics.sh"
     KAFKA_CONFIGS="/opt/kafka/bin/kafka-configs.sh"
+elif docker ps --format '{{.Names}}' | grep -q "^pharos-kafka-1$"; then
+    KAFKA_TOPICS="docker exec pharos-kafka-1 /opt/kafka/bin/kafka-topics.sh"
+    KAFKA_CONFIGS="docker exec pharos-kafka-1 /opt/kafka/bin/kafka-configs.sh"
 elif docker ps --format '{{.Names}}' | grep -q "^pharos-kafka$"; then
     KAFKA_TOPICS="docker exec pharos-kafka /opt/kafka/bin/kafka-topics.sh"
     KAFKA_CONFIGS="docker exec pharos-kafka /opt/kafka/bin/kafka-configs.sh"
@@ -30,7 +33,7 @@ echo "Ensuring topic pharos.events.adverse..."
 $KAFKA_TOPICS --bootstrap-server "${BOOTSTRAP_SERVER}" --create --if-not-exists \
     --topic pharos.events.adverse \
     --partitions 3 \
-    --replication-factor 1 \
+    --replication-factor 3 \
     --config retention.ms=604800000 \
     --config retention.bytes=10737418240
 
@@ -42,7 +45,7 @@ echo "Ensuring topic pharos.events.dlq..."
 $KAFKA_TOPICS --bootstrap-server "${BOOTSTRAP_SERVER}" --create --if-not-exists \
     --topic pharos.events.dlq \
     --partitions 3 \
-    --replication-factor 1 \
+    --replication-factor 3 \
     --config retention.ms=1209600000 \
     --config retention.bytes=5368709120
 

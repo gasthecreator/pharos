@@ -41,7 +41,7 @@ func DefaultTopicConfigs() []TopicConfig {
 		{
 			Name:        MainTopic,
 			Partitions:  3,
-			Replication: 1, // Single-node local Kafka dev default; 3 in clustered production
+			Replication: 3, // RF=3 across 3-broker cluster (Slice 7, §2.4)
 			Retention:   MainTopicRetention,
 			RetentionMs: MainTopicRetentionMs,
 			MaxBytes:    MainTopicMaxBytes,
@@ -49,7 +49,7 @@ func DefaultTopicConfigs() []TopicConfig {
 		{
 			Name:        DLQTopic,
 			Partitions:  3,
-			Replication: 1,
+			Replication: 3, // RF=3 across 3-broker cluster (Slice 7, §2.3)
 			Retention:   DLQTopicRetention,
 			RetentionMs: DLQTopicRetentionMs,
 			MaxBytes:    DLQTopicMaxBytes,

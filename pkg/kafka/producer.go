@@ -42,7 +42,7 @@ type Config struct {
 // DefaultConfig provides production-ready idempotent producer defaults.
 func DefaultConfig(brokers []string) Config {
 	if len(brokers) == 0 {
-		brokers = []string{"127.0.0.1:9092"}
+		brokers = []string{"127.0.0.1:9092", "127.0.0.1:9094", "127.0.0.1:9095"}
 	}
 	return Config{
 		Brokers:         brokers,

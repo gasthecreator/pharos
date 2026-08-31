@@ -2,7 +2,7 @@
 -- Defines the keyspace and tables for the transactional outbox, dead-letter pipeline, and sweeper index.
 
 CREATE KEYSPACE IF NOT EXISTS pharos
-WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
 
 -- 1. Dedup & Transactional Outbox
 -- Primary key idempotency_key (<site_id>:<local_seq>) guarantees strict uniqueness via LWT.

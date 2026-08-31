@@ -42,6 +42,126 @@ to change)
 
 ---
 
+#### [2026-08-30] Slice 7 Architecture: Multi-node Cassandra (3-node RF 3 LOCAL_QUORUM) + Kafka (3-broker KRaft RF 3) Cluster Topology
+
+**Status:** Resolved: Approved, with corrections (Claude Code, 2026-08-31). Gemini's
+first-draft version of this entry (an unreviewed overnight judgment call) described
+a design that was superseded during the same session's debugging — see "What
+actually shipped" below, which is what's in `docker-compose.yml` and verified
+working. Approving the final design, not the superseded draft.
+
+**What in PLAN.md this touches:**
+- Phase 2 slice breakdown: "Slice 7 — Multi-node Cassandra + Kafka"
+- §2.2 Exactly-once processing semantics (Cassandra outbox store consistency)
+- §2.4 Multi-timezone event ordering and correctness (Canonical query store consistency, Kafka topic replication)
+- §5.1 Cassandra cluster hosting & Docker topology
+
+**What actually shipped (verified against the running cluster, not just the
+config):**
+
+1. **Cassandra:** 3-node cluster (`pharos-cassandra-1/2/3`, `cassandra:5.0`,
+   `GossipingPropertyFileSnitch`, `datacenter1`), node 1 as gossip seed, nodes
+   2 and 3 gated behind `depends_on: condition: service_healthy` on the
+   previous node so they join the ring sequentially rather than racing each
+   other. Only node 1 exposes `9042` to the host — gocql's
+   `DisableInitialHostLookup: true` keeps the driver routing everything
+   through that one contact point, and Cassandra's coordinator proxies to
+   the other two replicas internally, so this is sufficient. Heap tuned to
+   `MAX_HEAP_SIZE: 256M` / `HEAP_NEWSIZE: 64M` **plus
+   `JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"`** — the direct-memory cap
+   was the fix for a real OOM (see below); heap size alone wasn't the
+   problem.
+2. **Kafka: single KRaft controller, not three.** `KAFKA_CONTROLLER_QUORUM_VOTERS`
+   points at broker 1 only (`"1@pharos-kafka-1:9093"`); brokers 2 and 3 run
+   `KAFKA_PROCESS_ROLES: "broker"` (no controller role). All 3 brokers are
+   still full data-plane members — topics are created with replication
+   factor 3 across all three — but only broker 1 participates in KRaft
+   metadata consensus. Also unlike the first draft: **all three brokers
+   expose a host port** (`9092`, `9094`, `9095`), each advertising its own
+   `EXTERNAL://127.0.0.1:<port>`. See "What the first draft got wrong" for
+   why both of these differ from Gemini's original proposal.
+3. **Application consistency:** `LOCAL_QUORUM` reads/writes across
+   `dedup.CassandraOutboxStore`, `consumer.CassandraCanonicalStore`, and
+   `query.CassandraService`; Paxos LWTs keep `SerialConsistency: LocalSerial`
+   (unchanged — already local-DC scoped). Removed the hardcoded per-query
+   `.Consistency(gocql.One)` overrides in `pkg/query/service.go` so nothing
+   silently reads at a weaker level than the session default.
+4. **Replication:** keyspace `pharos` at `replication_factor: 3`; both Kafka
+   topics at `replication_factor: 3`, `min.insync.replicas: 2` — confirmed
+   directly against the live cluster (`kafka-topics.sh --describe` shows
+   `Isr` covering all 3 brokers on every partition, not just configured).
+
+**What the first draft got wrong, and why (this is the actual engineering
+content of this slice — leaving it in per WORKLOG.md's "if it's not logged,
+it didn't happen" norm):**
+
+- **3-controller KRaft thrashed under load.** With all three brokers as
+  controller-quorum voters and Cassandra's 3 nodes competing for the same
+  CPU/memory, the default ~1.8s election timeout kept expiring before votes
+  could be exchanged, producing a live-lock of repeated candidate elections
+  that never converged (visible in `docker logs` as a stream of
+  `VoteRequestData` / `CandidateState` transitions with no leader ever
+  settling). A 3-broker Kafka cluster does **not** require 3 controllers —
+  a single dedicated controller (broker 1) with all 3 as data-plane brokers
+  is standard and sidesteps the election contention entirely, since a
+  1-node quorum elects itself instantly.
+- **Kafka clients need direct access to every partition leader; Cassandra
+  clients don't.** The first draft only exposed broker 1's port on the
+  host, reasoning by analogy to Cassandra (where `DisableInitialHostLookup`
+  lets one contact point work because the coordinator proxies to replicas
+  internally). Kafka has no equivalent proxy: when a partition's leader is
+  broker 2 or 3, the client dials that broker's *advertised* address
+  directly. If broker 2/3 only advertise their internal Docker-network
+  address, a host-side client can never reach it — writes to that
+  partition silently point at an unreachable address until they exceed
+  the client's own metadata retry/timeout. Fixed by giving every broker
+  its own host port and its own `EXTERNAL://127.0.0.1:<port>` advertised
+  listener.
+- **JVM-backed health checks need JVM-scale timeouts.** The health check
+  (`kafka-broker-api-versions.sh`) spawns a full JVM per invocation, which
+  took 4-6s on this machine — longer than the original `timeout: 5s`. Every
+  check failed on timeout, so brokers never reported healthy, which (via
+  `depends_on: condition: service_healthy`) blocked dependent containers
+  from ever starting — a health check config bug masquerading as a cluster
+  formation failure. Fixed with `timeout: 15s` and a cheaper check
+  (`kafka-topics.sh --list` against each broker's own external port)
+  instead of `kafka-broker-api-versions.sh` against the internal one.
+- **The real OOM root cause was host-level, not a Cassandra heap
+  misconfiguration.** `cascade-operator` (a *different* project's `kind`
+  Kubernetes cluster, running concurrently in the same Docker Desktop VM)
+  was consuming 2+ GB and 700-1200% CPU, on an 8GB Mac with Docker capped
+  at 5.29GB. That, not Cassandra's heap size, is what triggered the Linux
+  OOM killer against `pharos-cassandra-1` (exit 137) repeatedly. Capping
+  Cassandra's `MaxDirectMemorySize` (off-heap Netty/memtable buffers were
+  otherwise uncapped and could grow well past the JVM heap setting) helped
+  reduce Pharos's own footprint, but the cluster only became reliably
+  stable once `cascade-operator-control-plane` was stopped. **This is a
+  host-capacity constraint, not a Pharos code or config defect** — worth
+  remembering if this flares up again on the same machine.
+
+**Alternatives considered:** `QUORUM` vs `LOCAL_QUORUM` for reads/writes —
+`LOCAL_QUORUM` keeps consensus scoped to the single datacenter this project
+actually runs in, with identical guarantees to `QUORUM` in a single-DC
+topology, at lower latency; kept.
+
+**Verified before approval:** `go vet ./...` clean; `go test -race -count=1
+./...` passed twice in a row (including `pkg/faultinjection` against the
+real multi-node cluster) after `cascade-operator` was stopped — the one
+failure seen mid-session (`Operation timed out - received only 1
+responses` on a Cassandra LWT) did not reproduce once host contention was
+removed, confirming it was resource contention, not a race in the outbox
+claim/lease logic itself. `nodetool status` shows all 3 nodes `UN`
+(Up/Normal); both Kafka topics show `ReplicationFactor: 3` with `Isr`
+covering all 3 brokers on every partition, checked directly against the
+live cluster rather than trusted from config.
+
+**Impact:** All tests and binaries now default to clustered RF=3 and
+LOCAL_QUORUM consistency. Node-failure fault-injection scenarios (kill a
+Cassandra node / Kafka broker mid-write) remain Claude's to add, per §6 —
+not part of this slice.
+
+---
+
 #### [2026-08-30] Slice 5 Architecture: Query Surface (CLI & Service), DLQ Inspection, and Kafka Topic Retention Policies
 
 **Status:** Resolved: Approved (Claude Code, 2026-08-30). Both required fixes

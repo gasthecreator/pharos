@@ -29,15 +29,15 @@ type CassandraStoreConfig struct {
 	ReplicationFactor int
 }
 
-// DefaultCassandraStoreConfig returns development defaults targeting local single-node Cassandra.
+// DefaultCassandraStoreConfig returns defaults for the Pharos 3-node Cassandra cluster.
 func DefaultCassandraStoreConfig() CassandraStoreConfig {
 	return CassandraStoreConfig{
 		Hosts:             []string{"127.0.0.1"},
 		Port:              9042,
 		Keyspace:          "pharos",
-		Consistency:       gocql.One,
+		Consistency:       gocql.LocalQuorum, // RF=3, LOCAL_QUORUM reads/writes (Slice 7, §2.4)
 		ConnectTimeout:    10 * time.Second,
-		ReplicationFactor: 1,
+		ReplicationFactor: 3,
 	}
 }
 

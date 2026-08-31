@@ -1,53 +1,190 @@
 services:
-  kafka:
-    image: apache/kafka:3.8.0
-    container_name: pharos-kafka
-    ports:
-      - "9092:9092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: "broker,controller"
-      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
-      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
-      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://localhost:9092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
-      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
-      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    volumes:
-      - kafka-data:/var/lib/kafka/data
-    healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1 || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 15s
-
-  cassandra:
+  # ── Cassandra 3-node cluster ──────────────────────────────────────────
+  # Seed: cassandra-1. Nodes 2 & 3 join via CASSANDRA_SEEDS.
+  # Node 1 exposes port 9042 to the host; gocql with DisableInitialHostLookup=true
+  # routes queries through the seed, which coordinates with replicas across pharos-net.
+  cassandra-1:
     image: cassandra:5.0
-    container_name: pharos-cassandra
+    container_name: pharos-cassandra-1
     ports:
       - "9042:9042"
     environment:
       CASSANDRA_CLUSTER_NAME: "PharosCluster"
       CASSANDRA_DC: "datacenter1"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
-      MAX_HEAP_SIZE: "512M"
-      HEAP_NEWSIZE: "128M"
+      CASSANDRA_SEEDS: "pharos-cassandra-1"
+      MAX_HEAP_SIZE: "256M"
+      HEAP_NEWSIZE: "64M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"
     volumes:
-      - cassandra-data:/var/lib/cassandra
+      - cassandra-data-1:/var/lib/cassandra
     healthcheck:
-      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 8
-      start_period: 40s
+      test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 90s
+    networks:
+      - pharos-net
 
+  cassandra-2:
+    image: cassandra:5.0
+    container_name: pharos-cassandra-2
+    environment:
+      CASSANDRA_CLUSTER_NAME: "PharosCluster"
+      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
+      CASSANDRA_SEEDS: "pharos-cassandra-1"
+      MAX_HEAP_SIZE: "256M"
+      HEAP_NEWSIZE: "64M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"
+    volumes:
+      - cassandra-data-2:/var/lib/cassandra
+    depends_on:
+      cassandra-1:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 90s
+    networks:
+      - pharos-net
+
+  cassandra-3:
+    image: cassandra:5.0
+    container_name: pharos-cassandra-3
+    environment:
+      CASSANDRA_CLUSTER_NAME: "PharosCluster"
+      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
+      CASSANDRA_SEEDS: "pharos-cassandra-1"
+      MAX_HEAP_SIZE: "256M"
+      HEAP_NEWSIZE: "64M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"
+    volumes:
+      - cassandra-data-3:/var/lib/cassandra
+    depends_on:
+      cassandra-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 90s
+    networks:
+      - pharos-net
+
+  # ── Kafka 3-broker KRaft cluster ──────────────────────────────────────
+  # Broker 1 is broker+controller. Brokers 2 and 3 are brokers.
+  # External ports 9092, 9094, 9095 are mapped to the host so host-side clients
+  # can connect to partition leaders across all 3 brokers.
+  # Inter-broker communication uses the internal PLAINTEXT listener on port 19092.
+  kafka-1:
+    image: apache/kafka:3.8.0
+    container_name: pharos-kafka-1
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://pharos-kafka-1:19092,EXTERNAL://127.0.0.1:9092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "pharos-kraft-cluster-01"
+    volumes:
+      - kafka-data-1:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - pharos-net
+
+  kafka-2:
+    image: apache/kafka:3.8.0
+    container_name: pharos-kafka-2
+    ports:
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 2
+      KAFKA_PROCESS_ROLES: "broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://pharos-kafka-2:19092,EXTERNAL://127.0.0.1:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "pharos-kraft-cluster-01"
+    volumes:
+      - kafka-data-2:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9094 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - pharos-net
+
+  kafka-3:
+    image: apache/kafka:3.8.0
+    container_name: pharos-kafka-3
+    ports:
+      - "9095:9095"
+    environment:
+      KAFKA_NODE_ID: 3
+      KAFKA_PROCESS_ROLES: "broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9095"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://pharos-kafka-3:19092,EXTERNAL://127.0.0.1:9095"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "pharos-kraft-cluster-01"
+    volumes:
+      - kafka-data-3:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9095 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - pharos-net
+
+  # ── Observability ─────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.55.1
     container_name: pharos-prometheus
@@ -64,6 +201,8 @@ services:
       start_period: 10s
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - pharos-net
 
   grafana:
     image: grafana/grafana-oss:11.3.1
@@ -79,9 +218,19 @@ services:
       - grafana-data:/var/lib/grafana
     depends_on:
       - prometheus
+    networks:
+      - pharos-net
+
+networks:
+  pharos-net:
+    driver: bridge
 
 volumes:
-  kafka-data:
-  cassandra-data:
+  cassandra-data-1:
+  cassandra-data-2:
+  cassandra-data-3:
+  kafka-data-1:
+  kafka-data-2:
+  kafka-data-3:
   prometheus-data:
   grafana-data:
