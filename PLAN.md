@@ -188,66 +188,201 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   at `ReplicationFactor: 3` with `Isr` covering all 3 brokers on every
   partition, checked directly against the live cluster.
 
-- **Slice 8 — Auth & TLS.** Nothing in this system authenticates or encrypts
-  anything today — any process that can reach the HTTP ports can submit or
-  read adverse event data, which is disqualifying for anything claiming
-  production-readiness with clinical data. Needs a proposal in
-  ARCHITECTURE_PROPOSALS.md before implementation (genuinely open: per-site
-  API keys vs. mTLS for edge→ingestion; TLS termination approach for
-  Cassandra/Kafka inter-node and client traffic) — this is exactly the kind
-  of decision that shouldn't get made unattended overnight, so treat it as
+### Re-scoped 2026-08-31 — core pipeline hardening inserted ahead of Slices 15-21
+
+A design-review pass asked directly: setting the not-yet-started slices
+aside, does the *already-built* core pipeline (§2.1-§2.4) actually have
+gaps, or is production-hardening the only thing left? It found real ones —
+one of them (Slice 8 below) isn't speculative, it's a failure mode this
+project's own testing accidentally reproduced. Gideon's call: fix these
+before Auth/TLS through the dashboard, and don't skip multi-region just
+because there's no physical multi-region hardware available — simulate it
+as rigorously as a single machine allows instead of skipping the problem.
+That reprioritized the numbering: the seven slices below are new and come
+first; everything previously numbered Slice 8-14 is renumbered Slice 15-21
+with no change to their own content or intent.
+
+- **Slice 8 — Idempotency key resilience (queue-instance identity).** A
+  real, empirically-observed gap, not a hypothetical: the idempotency key
+  is purely `site_id:local_seq` (`internal/model/idempotency.go`), and
+  `local_seq` lives only in the edge's local SQLite file. Replace a site's
+  hardware (a disk failure at a trial site is not a theoretical event) with
+  the same `--site-id` and a fresh empty database, and `local_seq` restarts
+  at 1 — regenerating keys that collide with genuinely different events
+  submitted months earlier from the original hardware. Central Ingestion's
+  dedup layer, working exactly as designed, treats the new events as
+  already-published duplicates and never republishes them: a real adverse
+  event silently dropped, not because the claim/lease logic is wrong, but
+  because it's built on an assumption (`local_seq` is monotonic per site,
+  forever) that a hardware swap quietly breaks. This was hit firsthand
+  during Slice 6 verification and initially mistaken for a test artifact —
+  it isn't. **Decision:** extend the key to `site_id:instance_id:local_seq`,
+  where `instance_id` is generated once and persisted the first time a
+  site's SQLite file is created. A replaced/reset file gets a new
+  `instance_id`, so it can never collide with a prior instance's keys, while
+  `local_seq` still gives strict per-instance ordering. Needs a proposal in
+  ARCHITECTURE_PROPOSALS.md before implementation — this changes the wire
+  format used by every service, and needs an explicit answer for how
+  existing 2-part keys already in Cassandra coexist with new 3-part ones
+  (they don't need a uniform format, just an unambiguous parse). New
+  fault-injection test: wipe/replace an edge's SQLite file mid-stream,
+  confirm subsequent genuinely-new submissions are never treated as
+  duplicates of the old instance's events.
+
+- **Slice 9 — Wire-format schema versioning.** Forward-looking hardening,
+  not a fix for an existing bug: the AdverseEvent wire schema hasn't changed
+  since Slice 1, but a system meant to run for years with independently
+  updated edge binaries across many sites needs a version story *before*
+  the first real schema change, not after. Add an explicit integer
+  `schemaVersion` field; Central Ingestion's handler dispatches validation
+  by version, and an unrecognized version is a clean, specific DLQ
+  rejection — never a crash or a silent misparse. Sequenced right after
+  Slice 8 since both are wire-format changes worth reviewing together.
+
+- **Slice 10 — DLQ replay & reprocessing.** The DLQ is fully inspectable
+  (`pharos-cli dlq list/get`) but has no path back into the pipeline — once
+  whatever caused a rejection is actually fixed, a rejected event just stays
+  rejected forever. For adverse-event data specifically, "we can see the
+  serious event we rejected but can never get it back into the system" is a
+  real operational hole, not a nice-to-have. **Decision:**
+  `pharos-cli dlq replay <idempotency-key>` resubmits the record's stored
+  raw payload through the exact same Central Ingestion validation path a
+  fresh submission takes — not a trust-it-now backdoor. Replay reuses the
+  *same* idempotency key (it's a resubmission, not a new event), so it goes
+  through the identical claim/lease path any retry already uses — no new
+  outbox mechanism needed. On success, the original DLQ record is marked
+  `REPLAYED`, never deleted — the original rejection stays part of the
+  audit trail, matching the "never silently mutate a reported result"
+  principle §2.4 already established for late-arriving data.
+
+- **Slice 11 — Data retention & lifecycle.** `event_outbox`, the canonical
+  tables, and the DLQ all grow forever today, with no tiering or archival
+  plan — a real gap made a little ironic by this project's own 21 CFR Part
+  11 framing, which implies long *retention* of clinical safety data, not
+  deletion. Needs a real proposal (genuinely open): the interesting
+  engineering problem isn't deletion, it's tiering — hot storage (the
+  existing Cassandra cluster) for recent/active data, a cold/archival tier
+  (periodic export to compressed storage — local disk satisfies the
+  zero-cloud-spend constraint) for data past an age threshold, with the
+  query layer able to fall back to archival lookup for old records rather
+  than just losing access to them.
+
+- **Slice 12 — Edge collector durability hardening.** A site's entire local
+  durability guarantee today is one un-replicated SQLite file (this is what
+  makes Slice 8's failure mode possible in the first place) — a disk
+  failure before forwarding completes loses whatever hadn't been sent yet.
+  Needs a proposal weighing real options against the operational reality of
+  a resource-constrained trial site (periodic WAL backup to a second local
+  path or removable media; a lightweight local replica process; or
+  explicitly documenting and accepting the residual data-loss exposure
+  window) rather than defaulting to the most complex option unexamined.
+
+- **Slice 13 — Consumer crash/restart fault-injection (watermark
+  continuity).** Claude's own hands-on test work per §6, parallel to the
+  node-failure scenarios already planned. Kill `pharos-consumer` mid-stream
+  and restart it; prove the watermark cannot regress below what was already
+  reported before the crash, even while some partitions are still catching
+  up on replay — the same monotonic-guard principle from §2.4 (already
+  tested against partition reawakening), now tested against process death
+  specifically.
+
+- **Slice 14 — Multi-region Cassandra + Kafka (simulated).** Explicit
+  constraint: no real geographically-distributed hardware exists for this
+  project. The response is to simulate the topology and its failure modes
+  as rigorously as one machine allows, not to skip the problem — proving
+  the *configuration and application logic* are multi-region-correct, while
+  being honest that real WAN latency/partition characteristics are
+  approximated, not reproduced.
+  - **Cassandra:** convert from `SimpleStrategy` (Slice 7) to
+    `NetworkTopologyStrategy` across two simulated datacenters (`dc-us`,
+    `dc-eu`), 3 nodes each, `GossipingPropertyFileSnitch` configured with
+    distinct `dc`/`rack` per container, replication
+    `{'dc-us': 3, 'dc-eu': 3}`. `LOCAL_QUORUM` is already the app's
+    consistency level from Slice 7 specifically because it's the correct
+    choice once real datacenters exist — this slice is what that decision
+    was made for.
+  - **Kafka:** `broker.rack` set per broker across the two simulated
+    regions so partition replicas are rack/region-aware, not all landing in
+    one simulated region — and, further, a second independent Kafka
+    cluster in the second region with MirrorMaker 2 (free, open-source, no
+    cloud spend) replicating both topics, to exercise real cross-region DR
+    rather than just in-cluster rack placement.
+  - **Simulated WAN conditions:** Linux traffic-control (`tc netem`) on the
+    relevant Docker network interfaces to inject realistic cross-region
+    latency (~80-150ms) and, for a fault-injection test, a full simulated
+    partition between the two regions — proving the existing
+    partition-tolerance guarantees (§2.1, §2.2) actually hold across a
+    region split, not just a single-node failure. This is standard,
+    recognized practice for testing multi-region behavior without real
+    geographic infrastructure, not a shortcut.
+  - **Deliverable:** the full existing test suite passes unchanged against
+    the 2-region topology, plus a new fault-injection scenario (a
+    `tc`-induced regional partition) proving no data loss or duplication
+    across it.
+
+This is genuinely months, not weeks, of work sequenced across many
+sessions — nobody should expect this list to close quickly, and no single
+slice above should be treated as "finished" until it's reviewed and
+verified against real infrastructure the same way every earlier slice was.
+
+- **Slice 15 — Auth & TLS** *(was Slice 8)*. Nothing in this system
+  authenticates or encrypts anything today — any process that can reach the
+  HTTP ports can submit or read adverse event data, which is disqualifying
+  for anything claiming production-readiness with clinical data. Needs a
+  proposal in ARCHITECTURE_PROPOSALS.md before implementation (genuinely
+  open: per-site API keys vs. mTLS for edge→ingestion; TLS termination
+  approach for Cassandra/Kafka inter-node and client traffic, now across
+  two simulated regions per Slice 14) — this is exactly the kind of
+  decision that shouldn't get made unattended overnight, so treat it as
   requiring review before building, not skippable.
 
-- **Slice 9 — Load testing.** Needs Slice 7 (multi-node) to produce numbers
-  worth trusting. `k6` or `vegeta` scripts simulating realistic multi-site
+- **Slice 16 — Load testing** *(was Slice 9)*. Needs Slice 7 (multi-node)
+  and benefits from Slice 14 (multi-region) to produce numbers worth
+  trusting. `k6` or `vegeta` scripts simulating realistic multi-site
   submission volume; establish baseline throughput/latency numbers under
-  normal operation and under one site producing a burst; identify the actual
-  bottleneck rather than assuming one.
+  normal operation and under one site producing a burst; identify the
+  actual bottleneck rather than assuming one.
 
-- **Slice 10 — Deployment automation.** Kubernetes manifests or an
-  equivalent IaC approach for every service, health/readiness probes wired
-  to the metrics from Slice 6, basic CI image build.
+- **Slice 17 — Deployment automation** *(was Slice 10)*. Kubernetes
+  manifests or an equivalent IaC approach for every service, health/
+  readiness probes wired to the metrics from Slice 6, basic CI image build.
 
-- **Slice 11 — Backup & disaster recovery.** Cassandra snapshot/restore
-  procedure for the multi-node cluster from Slice 7, an actual tested
-  restore drill (not just a documented procedure that's never been run), and
-  a stated RPO/RTO.
+- **Slice 18 — Backup & disaster recovery** *(was Slice 11)*. Cassandra
+  snapshot/restore procedure for the multi-node cluster from Slice 7, an
+  actual tested restore drill (not just a documented procedure that's never
+  been run), a stated RPO/RTO, and — now that Slice 14 exists — a tested
+  cross-region failover, not just a single-region restore.
 
-- **Slice 12 — Multi-instance scaling.** Run 2+ `pharos-ingestion` instances
-  behind a load balancer (this is what the rate limiter's already-pluggable
-  interface from §2.3 exists for — swap in the Redis-backed implementation
-  here, don't build a new one), and 2+ `pharos-consumer` instances, verifying
-  Kafka consumer-group rebalancing actually works correctly with this
-  project's watermark tracking.
+- **Slice 19 — Multi-instance scaling** *(was Slice 12)*. Run 2+
+  `pharos-ingestion` instances behind a load balancer (this is what the
+  rate limiter's already-pluggable interface from §2.3 exists for — swap in
+  the Redis-backed implementation here, don't build a new one), and 2+
+  `pharos-consumer` instances, verifying Kafka consumer-group rebalancing
+  actually works correctly with this project's watermark tracking.
 
-- **Slice 13 — Compliance / access-audit logging.** Who queried what,
-  building on the existing `LateArrivalAudit` pattern from §2.4 rather than
-  inventing a second audit mechanism.
+- **Slice 20 — Compliance / access-audit logging** *(was Slice 13)*. Who
+  queried what, building on the existing `LateArrivalAudit` pattern from
+  §2.4 rather than inventing a second audit mechanism — and, once Slice 10
+  (DLQ replay) exists, who replayed what belongs in the same audit trail.
 
-This is genuinely weeks of work sequenced across many sessions — nobody
-should expect Phase 2 to close in a day the way Phase 1's core challenges
-did, and no single slice above should be treated as "finished" until it's
-been reviewed and verified against real infrastructure the same way every
-Phase 1 slice was.
+### Slice 21 — Web dashboard (portfolio accessibility — not production hardening) *(was Slice 14)*
 
-### Slice 14 — Web dashboard (portfolio accessibility — not production hardening)
-
-Scoped 2026-08-31, sequenced separately from Slices 6-13 above. Everything
-in this project is currently operated via `curl` + `pharos-cli` + Grafana —
-deliberately, since the four core distributed-systems challenges are the
-actual point, and a web frontend proves nothing about partition tolerance
-or exactly-once semantics that the CLI + fault-injection suite doesn't
-already prove better. This slice exists for a narrower reason: a
-non-technical viewer (a recruiter, an interviewer without a terminal handy)
-can't run commands, and a browser page they can just look at closes that
-gap. **This is not a Phase 2 production-hardening item — don't let it get
-counted as progress on Slices 8-13, and don't let it block or get blocked
-by them.**
+Scoped 2026-08-31, sequenced separately from every numbered slice above.
+Everything in this project is currently operated via `curl` + `pharos-cli`
++ Grafana — deliberately, since the four core distributed-systems
+challenges are the actual point, and a web frontend proves nothing about
+partition tolerance or exactly-once semantics that the CLI + fault-injection
+suite doesn't already prove better. This slice exists for a narrower
+reason: a non-technical viewer (a recruiter, an interviewer without a
+terminal handy) can't run commands, and a browser page they can just look
+at closes that gap. **This is not a production-hardening item — don't let
+it get counted as progress on Slices 8-20, and don't let it block or get
+blocked by them.**
 
 **Decision: server-rendered Go, not a JS frontend.** A new `pharos-dashboard`
 binary using stdlib `html/template` (or a minimal Go templating helper —
-not a new one unless there's a real reason), reusing `pkg/query.Service` —
-the exact same interface `pharos-cli` already uses, so this is a new
+not a new one unless there's a real reason), reusing `internal/query.Service`
+— the exact same interface `pharos-cli` already uses, so this is a new
 presentation layer over already-built, already-tested query logic, not new
 business logic. Explicitly rejected a React/Next.js frontend: this project's
 whole stated pitch is "Go, Kafka, Cassandra — nothing else," and pulling in
@@ -258,9 +393,10 @@ needing client-side interactivity this can't deliver).
 
 **Scope:**
 - Recent-events feed across all sites (reuse `events_by_study`/`events_by_site`
-  query patterns already in `pkg/query.Service`, latest N).
-- DLQ view: rejected events with their structured validation reasons,
-  reusing `pkg/query.Service`'s existing DLQ methods.
+  query patterns already in `internal/query.Service`, latest N).
+- DLQ view: rejected events with their structured validation reasons, and
+  (once Slice 10 exists) a replay action, reusing `internal/query.Service`'s
+  existing DLQ methods rather than a second read path.
 - Query by site/study, mirroring `pharos-cli query`'s existing patterns —
   don't reinvent the query logic, just render it.
 - A simple form to submit a test adverse event, POSTing directly to Central
@@ -270,14 +406,14 @@ needing client-side interactivity this can't deliver).
   rather than re-building charts this project already has.
 
 **Explicitly out of scope:** authentication (this project has none anywhere
-yet — Slice 8 owns that decision when it happens; the dashboard doesn't
+yet — Slice 15 owns that decision when it happens; the dashboard doesn't
 change the project's risk posture, since it's a UI over data that's already
 reachable unauthenticated). Real-time push/websockets — a page refresh or a
 short polling interval is enough for a demo.
 
 **Who builds it:** feature work, so Gemini per the established split in §6 —
 Claude scopes/reviews as usual. Sequence whenever convenient; not a
-dependency of Slices 8-13 or vice versa.
+dependency of Slices 8-20 or vice versa.
 
 ---
 
