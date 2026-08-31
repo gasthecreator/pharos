@@ -415,6 +415,100 @@ short polling interval is enough for a demo.
 Claude scopes/reviews as usual. Sequence whenever convenient; not a
 dependency of Slices 8-20 or vice versa.
 
+### Slice 22 — Property-based & deterministic simulation testing
+
+Scoped 2026-08-31. Every fault-injection test in this project (existing and
+planned — Slice 13's crash/restart, Slice 14's region partition) is a
+hand-picked scenario. That's necessary but not sufficient: a handful of
+scenarios a human thought to write down is a much smaller slice of the
+actual state space than what a real deployment will eventually hit. This
+slice generalizes fault injection into automated exploration, in two
+stages of increasing ambition — deliberately staged so the cheap, high-value
+part ships even if the ambitious part turns out to be too much.
+
+**Stage A — property-based testing.** Using `pgregory.net/rapid` (or
+equivalent) against the claim/lease outbox (§2.2) and the watermark tracker
+(§2.4): generate random sequences of operations (concurrent claims,
+retries, a crash simulated mid-publish, events arriving late or
+out-of-order) and assert the core invariants hold after *every* generated
+sequence, not just the specific interleavings existing tests happen to
+construct by hand. Invariants worth checking this way: exactly one publish
+per idempotency key ever reaches Kafka; the watermark never decreases;
+`LateArrivalAudit` never has a duplicate entry for the same
+(window, idempotency_key) pair. Cheap relative to Stage B — reuses the
+existing in-memory test doubles, no new abstractions needed.
+
+**Stage B — deterministic simulation, FoundationDB-style.** The more
+ambitious piece: introduce `Clock` and `Network` abstractions the core
+pipeline runs against (the codebase is already reasonably decoupled for
+this — `HTTPClient`, `QueueStore`, and `Producer` are already interfaces,
+not concrete types), so the *entire* edge→forward→ingest→publish→consume→
+canonical-write path can run against simulated, seed-controlled time and
+message delivery instead of real HTTP/Kafka/Cassandra. A single integer
+seed deterministically reproduces one exact interleaving of message delays,
+reordering, crash timing, and inter-site clock skew — which means running
+100,000 random seeds is a CI job measured in seconds, not hours, and any
+failing seed is trivially reproducible (rerun that exact seed) rather than
+a flaky one-off. This is deliberately not a rewrite of the pipeline — the
+simulation swaps out the I/O boundaries, not the logic being tested.
+
+**Why this, not just more hand-written fault-injection tests:** a handful
+of scenarios proves the specific things a human thought to check. A
+simulation run across thousands of seeds finds the interleaving nobody
+thought to write down — which is exactly the category every real bug
+caught during this project's review process (the concurrency race, the
+monotonicity violation, the audit duplication) fell into before it was
+found.
+
+**Sequencing:** doesn't block or get blocked by Slices 8-21. Best built
+once Slice 8/9's wire-format changes land, so the simulation's invariant
+checks target the final wire contract rather than a moving target.
+
+**Who builds it:** test/verification infrastructure, so Claude's own work
+per §6 — Stage A is well-scoped enough that Gemini could reasonably take
+it instead, if bandwidth suggests splitting the two stages across builders.
+
+### Slice 23 — Chaos Control Panel (extends Slice 21's dashboard)
+
+Scoped 2026-08-31. Today, "this system survives a network partition" is a
+claim a reader has to take on faith from `WORKLOG.md`. This slice makes it
+something they can watch happen: real chaos actions, triggered from
+`pharos-dashboard` (Slice 21), acting on the actual live multi-node
+cluster, next to a live panel proving the system is still correct while
+it's being hurt.
+
+**Scope:**
+- Chaos actions, each wired to a capability that already exists or is
+  about to (nothing here invents a new failure mode, it just exposes ones
+  this project already knows how to cause): partition a site (the same
+  transport-blocking pattern `internal/faultinjection` already uses against
+  a real edge instance instead of a test harness), kill/restart a Cassandra
+  node, inject a duplicate delivery, skew a site's clock, and — once Slice
+  14 exists — partition an entire simulated region.
+- A live "Correctness Ledger" panel: events submitted, events delivered
+  exactly-once, duplicates correctly suppressed, late arrivals correctly
+  audited, current watermark and how long it's held its monotonicity
+  streak — all read from the existing `/metrics` endpoints (Slice 6), not
+  a new data source invented for this panel.
+
+**Explicit safety guard, not an assumption:** chaos actions mutate real
+running infrastructure. This only ever makes sense on a local/demo
+instance, and since this project has no authentication yet (Slice 15),
+the dashboard must not silently trust its deployment context to keep
+random visitors from killing a Cassandra node — chaos actions stay
+disabled unless the operator explicitly passes `--enable-chaos` at
+startup, off by default, not something that ships live just because
+`pharos-dashboard` happens to be reachable.
+
+**Sequencing:** needs Slice 21 (dashboard) to exist as its host. Each
+chaos action becomes available as its underlying capability lands — the
+site-partition action could ship immediately (the capability already
+exists in `internal/faultinjection`), while the region-partition action
+naturally waits for Slice 14.
+
+**Who builds it:** feature work, so Gemini per the established split in
+§6 — Claude scopes/reviews as usual.
+
 ---
 
 ## 2. Core engineering challenges (design decisions)

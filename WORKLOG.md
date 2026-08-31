@@ -40,6 +40,57 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-31] Claude Code: scoped Slice 22 (simulation testing) and Slice 23 (Chaos Control Panel)
+
+**Author:** Claude Code
+
+**What:** Appended two new slices to `PLAN.md`'s Phase 2 breakdown, after
+Slice 21. Slice 22: property-based testing of the claim/lease and
+watermark invariants (`pgregory.net/rapid`), staged toward a full
+deterministic simulation harness in FoundationDB's style — `Clock`/`Network`
+abstractions letting the whole pipeline run against simulated,
+seed-controlled time and message delivery, so a CI job can explore tens of
+thousands of interleavings a second instead of the handful of hand-picked
+scenarios fault-injection tests can afford. Slice 23: a "Chaos Control
+Panel" extending the Slice 21 dashboard — real chaos actions (partition a
+site, kill a Cassandra node, inject a duplicate, skew a clock) triggered
+against the live running cluster, next to a live "Correctness Ledger"
+panel proving the system stays correct while it's being deliberately hurt.
+
+**Why:** Gideon asked for genuinely novel ideas beyond incremental
+production-hardening — something that would make the project stand out,
+not just close gaps. Two ideas, aimed at two different audiences: Slice 22
+is the one that earns credibility with engineers who know what FoundationDB
+did and why it mattered (a handful of hand-written fault-injection
+scenarios proves less than most people assume — this project's own history
+of real bugs found in review were all interleavings nobody thought to
+write down by hand). Slice 23 is the one that's actually shareable — most
+"we tested for partition tolerance" claims live in a doc a reader has to
+trust; this one lets them press a button and watch it happen.
+
+**How:** Sequenced deliberately: Slice 22 doesn't block anything and is
+best built once Slice 8/9's wire-format changes land so its invariant
+checks target the final contract. Slice 23 needs Slice 21 to exist as a
+host, and its individual chaos actions unlock incrementally as their
+underlying capability lands elsewhere (site-partition chaos could ship
+immediately, since `internal/faultinjection` already has the transport-
+blocking pattern; region-partition chaos naturally waits for Slice 14).
+Gave Slice 23 an explicit safety requirement — chaos actions must be
+opt-in via a startup flag, not silently trusted to be safe just because
+the project has no auth yet — rather than leaving that as an unstated
+assumption.
+
+**Files/modules touched:** `PLAN.md` only — scoping, no code yet.
+
+**Tests added/updated:** None (scoping only).
+
+**Follow-ups / left open:** Neither slice has a build session started yet.
+Slice 22 Stage A (property-based tests) is well-scoped enough to hand to
+Gemini as a standalone task if that's preferred over Claude doing all of
+Slice 22 directly.
+
+---
+
 ## [2026-08-31] Claude Code: re-scoped PLAN.md — 7 new core-pipeline slices inserted ahead of production hardening
 
 **Author:** Claude Code
