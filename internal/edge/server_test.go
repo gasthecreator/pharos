@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/gasthecreator/pharos/internal/model"
@@ -35,11 +36,15 @@ func TestServer_CaptureValidEvent(t *testing.T) {
 	if resp.Status != "QUEUED" {
 		t.Errorf("expected status QUEUED, got %s", resp.Status)
 	}
-	if resp.IdempotencyKey != "SITE-US-01:1" {
-		t.Errorf("expected idempotency key SITE-US-01:1, got %s", resp.IdempotencyKey)
+	// local_seq is (instance_epoch << 32) | counter (§2.2, Slice 8), not
+	// necessarily 1 — a fresh database file still mints a real epoch. What
+	// must hold: nonzero, and the key matches site_id:local_seq exactly.
+	if resp.LocalSeq == 0 {
+		t.Errorf("expected a nonzero local seq, got 0")
 	}
-	if resp.LocalSeq != 1 {
-		t.Errorf("expected local seq 1, got %d", resp.LocalSeq)
+	expectedKey := siteID + ":" + strconv.FormatUint(resp.LocalSeq, 10)
+	if resp.IdempotencyKey != expectedKey {
+		t.Errorf("expected idempotency key %s, got %s", expectedKey, resp.IdempotencyKey)
 	}
 }
 
@@ -70,8 +75,9 @@ func TestServer_CaptureMalformedFHIREvent(t *testing.T) {
 
 	var resp CaptureResponse
 	_ = json.NewDecoder(rec.Body).Decode(&resp)
-	if resp.IdempotencyKey != "SITE-NG-02:1" {
-		t.Errorf("expected idempotency key SITE-NG-02:1, got %s", resp.IdempotencyKey)
+	expectedKey := siteID + ":" + strconv.FormatUint(resp.LocalSeq, 10)
+	if resp.IdempotencyKey != expectedKey {
+		t.Errorf("expected idempotency key %s, got %s", expectedKey, resp.IdempotencyKey)
 	}
 
 	// Verify that the record is indeed in the SQLite store and retrievable
@@ -116,7 +122,7 @@ func TestServer_StatsEndpoint(t *testing.T) {
 
 	// Enqueue 2 events directly
 	_, _ = store.Enqueue(t.Context(), siteID, newTestEvent(siteID))
-	_, _ = store.Enqueue(t.Context(), siteID, newTestEvent(siteID))
+	rec2, _ := store.Enqueue(t.Context(), siteID, newTestEvent(siteID))
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
 	rec := httptest.NewRecorder()
@@ -135,7 +141,7 @@ func TestServer_StatsEndpoint(t *testing.T) {
 	if stats.PendingCount != 2 {
 		t.Errorf("expected 2 pending events in stats, got %d", stats.PendingCount)
 	}
-	if stats.MaxSequence != 2 {
-		t.Errorf("expected max sequence 2 in stats, got %d", stats.MaxSequence)
+	if stats.MaxSequence != rec2.LocalSeq {
+		t.Errorf("expected max sequence %d (2nd event's, §2.2 Slice 8) in stats, got %d", rec2.LocalSeq, stats.MaxSequence)
 	}
 }
