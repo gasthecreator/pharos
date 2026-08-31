@@ -230,6 +230,55 @@ did, and no single slice above should be treated as "finished" until it's
 been reviewed and verified against real infrastructure the same way every
 Phase 1 slice was.
 
+### Slice 14 — Web dashboard (portfolio accessibility — not production hardening)
+
+Scoped 2026-08-31, sequenced separately from Slices 6-13 above. Everything
+in this project is currently operated via `curl` + `pharos-cli` + Grafana —
+deliberately, since the four core distributed-systems challenges are the
+actual point, and a web frontend proves nothing about partition tolerance
+or exactly-once semantics that the CLI + fault-injection suite doesn't
+already prove better. This slice exists for a narrower reason: a
+non-technical viewer (a recruiter, an interviewer without a terminal handy)
+can't run commands, and a browser page they can just look at closes that
+gap. **This is not a Phase 2 production-hardening item — don't let it get
+counted as progress on Slices 8-13, and don't let it block or get blocked
+by them.**
+
+**Decision: server-rendered Go, not a JS frontend.** A new `pharos-dashboard`
+binary using stdlib `html/template` (or a minimal Go templating helper —
+not a new one unless there's a real reason), reusing `pkg/query.Service` —
+the exact same interface `pharos-cli` already uses, so this is a new
+presentation layer over already-built, already-tested query logic, not new
+business logic. Explicitly rejected a React/Next.js frontend: this project's
+whole stated pitch is "Go, Kafka, Cassandra — nothing else," and pulling in
+an npm/Node toolchain for a demo-only accessibility layer would dilute that
+story and add a second build/dependency system for something that isn't the
+point of the project. Revisit only if a real reason surfaces (e.g. genuinely
+needing client-side interactivity this can't deliver).
+
+**Scope:**
+- Recent-events feed across all sites (reuse `events_by_study`/`events_by_site`
+  query patterns already in `pkg/query.Service`, latest N).
+- DLQ view: rejected events with their structured validation reasons,
+  reusing `pkg/query.Service`'s existing DLQ methods.
+- Query by site/study, mirroring `pharos-cli query`'s existing patterns —
+  don't reinvent the query logic, just render it.
+- A simple form to submit a test adverse event, POSTing directly to Central
+  Ingestion's existing `/api/v1/events` — this is the only write path, and
+  it exercises the real pipeline live rather than faking it.
+- Link out to the existing Grafana dashboard (Slice 6) for system health
+  rather than re-building charts this project already has.
+
+**Explicitly out of scope:** authentication (this project has none anywhere
+yet — Slice 8 owns that decision when it happens; the dashboard doesn't
+change the project's risk posture, since it's a UI over data that's already
+reachable unauthenticated). Real-time push/websockets — a page refresh or a
+short polling interval is enough for a demo.
+
+**Who builds it:** feature work, so Gemini per the established split in §6 —
+Claude scopes/reviews as usual. Sequence whenever convenient; not a
+dependency of Slices 8-13 or vice versa.
+
 ---
 
 ## 2. Core engineering challenges (design decisions)
