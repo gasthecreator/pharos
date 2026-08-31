@@ -40,6 +40,42 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-31] Claude Code: scoped Slice 14 — web dashboard
+
+**Author:** Claude Code
+
+**What:** Added a "Slice 14 — Web dashboard" section to `PLAN.md`, sequenced
+separately from the Phase 2 production-hardening slices (6-13). Scopes a new
+`pharos-dashboard` binary: server-rendered Go (stdlib `html/template`) over
+the existing `pkg/query.Service`, showing a recent-events feed, DLQ view,
+site/study query, a test-event submission form, and a link out to the
+existing Grafana dashboard.
+
+**Why:** Gideon asked whether there was any way to interact with the system
+besides the CLI, and whether that was the right call. Answered that pure
+backend + CLI + Grafana is the right choice for the actual point of this
+project (distributed-systems correctness, not frontend polish), but flagged
+that a lightweight dashboard would help a non-technical viewer (recruiter,
+interviewer without a terminal) see it working without running commands.
+Gideon asked for it to be scoped.
+
+**How:** Deliberately rejected a JS frontend (React/Next.js) in favor of
+server-rendered Go reusing `pkg/query.Service` — the project's whole pitch
+is "Go, Kafka, Cassandra, nothing else," and a second toolchain for a
+demo-only accessibility layer would dilute that story for no real gain.
+Labeled the slice explicitly as *not* Phase 2 progress so it doesn't get
+conflated with the production-hardening list Gideon actually asked for.
+
+**Files/modules touched:** `PLAN.md` only — scoping, no code yet.
+
+**Tests added/updated:** None (scoping only).
+
+**Follow-ups / left open:** Build is feature work for Gemini per the
+established §6 split, not yet kicked off — Gideon hasn't asked to start it
+yet, only to have it scoped.
+
+---
+
 ## [2026-08-31] Claude Code review + finish: Phase 2 Slice 7 — multi-node Cassandra + Kafka
 
 **Author:** Claude Code (reviewing and finishing Gemini's unattended overnight
