@@ -128,9 +128,12 @@ cmd/pharos-consumer     Kafka consumer: watermarking, canonical Cassandra writes
 cmd/pharos-cli          Query & DLQ inspection CLI
 internal/               Implementation packages, one per concern above plus faultinjection
 migrations/             Cassandra schema (bootstrapped automatically at startup too)
+docs/api/               OpenAPI specs for the edge and Central Ingestion HTTP APIs
 PLAN.md                 Living architecture doc — source of truth for every design decision
 ARCHITECTURE_PROPOSALS.md   Proposal/review trail for every non-trivial design change
 WORKLOG.md              Dated log of every implementation session, by whoever did it
+CONTRIBUTING.md         Branch/PR/proposal-review workflow
+SECURITY.md             Security policy and known, deliberate gaps
 ```
 
 ## License

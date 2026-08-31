@@ -71,11 +71,12 @@ func (wt *WatermarkTracker) ProcessEvent(partition int, idempotencyKey string, e
 	// 5. Check if event belongs to an already closed window (transition COMPLETE -> REVISED)
 	for _, w := range wt.windows {
 		if !eventTime.Before(w.Start) && eventTime.Before(w.End) {
-			if w.Status == WindowStatusComplete {
+			switch w.Status {
+			case WindowStatusComplete:
 				w.Status = WindowStatusRevised
 				w.RevisedAt = now
 				wt.appendLateAuditIfNotExistsLocked(w.ID, idempotencyKey, partition, eventTime, now, currentWatermark)
-			} else if w.Status == WindowStatusRevised {
+			case WindowStatusRevised:
 				wt.appendLateAuditIfNotExistsLocked(w.ID, idempotencyKey, partition, eventTime, now, currentWatermark)
 			}
 		}

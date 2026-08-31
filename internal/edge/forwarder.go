@@ -142,8 +142,8 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	respBytes, _ := io.ReadAll(resp.Body)
 
 	// 4. Handle response status codes
-	switch {
-	case resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusMultiStatus || resp.StatusCode == http.StatusUnprocessableEntity:
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusCreated, http.StatusMultiStatus, http.StatusUnprocessableEntity:
 		metrics.ForwarderOutcomesTotal.WithLabelValues("success").Inc()
 		var batchResp ingestion.BatchResponse
 		_ = json.Unmarshal(respBytes, &batchResp)
@@ -184,16 +184,17 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 				failedRecords = append(failedRecords, failedRecord{id: r.ID, reason: reason, retryAfter: retryAfter})
 			} else {
 				// Fallback if not found in results map
-				if resp.StatusCode == http.StatusUnprocessableEntity {
+				switch resp.StatusCode {
+				case http.StatusUnprocessableEntity:
 					reason := batchResp.Error
 					if reason == "" {
 						reason = "batch rejected by central ingestion (HTTP 422)"
 					}
 					rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
-				} else if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+				case http.StatusOK, http.StatusCreated:
 					// Full batch acceptance (HTTP 200/201)
 					ackIDs = append(ackIDs, r.ID)
-				} else {
+				default:
 					// Conservative fallback for unmapped records in partial/multi-status responses:
 					// Never silently acknowledge unmapped records; mark as failed for retry with backoff (§2.1).
 					reason := "event result missing from central ingestion response"
@@ -223,7 +224,7 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 		return len(records), nil
 
-	case resp.StatusCode == http.StatusTooManyRequests:
+	case http.StatusTooManyRequests:
 		// Rate limited by Central Ingestion token bucket (§2.3)
 		metrics.ForwarderOutcomesTotal.WithLabelValues("rate_limited").Inc()
 		retryAfter := f.parseRetryAfter(resp.Header.Get("Retry-After"))

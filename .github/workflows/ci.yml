@@ -29,6 +29,11 @@ jobs:
             exit 1
           fi
 
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.13.2
+
       - name: go build
         run: go build ./...
 

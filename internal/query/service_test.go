@@ -39,8 +39,12 @@ func TestMemoryService_CanonicalAndDLQQueries(t *testing.T) {
 		Subject:        "PATIENT-101",
 		Payload:        `{"resourceType":"AdverseEvent"}`,
 	}
-	svc.CanonicalStore().SaveEvent(ctx, rec1)
-	svc.CanonicalStore().SaveEvent(ctx, rec2)
+	if err := svc.CanonicalStore().SaveEvent(ctx, rec1); err != nil {
+		t.Fatalf("failed to seed rec1: %v", err)
+	}
+	if err := svc.CanonicalStore().SaveEvent(ctx, rec2); err != nil {
+		t.Fatalf("failed to seed rec2: %v", err)
+	}
 
 	// 2. Seed DLQ record
 	dlq1 := &DLQRecord{

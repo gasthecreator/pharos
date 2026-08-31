@@ -1,0 +1,215 @@
+openapi: 3.0.3
+info:
+  title: Pharos Edge Collector API
+  version: "1.0"
+  description: >
+    Runs once per trial site (see PLAN.md §2.1). This is the only endpoint
+    site EDC systems or staff actually talk to — every submission is durably
+    persisted to a local SQLite WAL queue before this responds, and forwarded
+    to Central Ingestion asynchronously in the background. A 201 response
+    means "captured locally," not "processed centrally" — those are
+    deliberately different guarantees.
+servers:
+  - url: http://localhost:8080
+    description: Default local edge collector instance (--port 8080)
+
+paths:
+  /api/v1/adverse-events:
+    post:
+      summary: Submit an adverse event report for durable local capture
+      description: >
+        Does not validate the payload against the FHIR schema — by design
+        (PLAN.md §2.3), the edge buffers even malformed-looking data rather
+        than lose it locally. Validation happens centrally. `/api/v1/events`
+        is an accepted alias for this same endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdverseEvent"
+      responses:
+        "201":
+          description: Captured and durably enqueued locally
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaptureResponse"
+        "400":
+          description: Empty body or malformed JSON
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Failed to persist to the local queue
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/v1/stats:
+    get:
+      summary: Local queue operational stats
+      responses:
+        "200":
+          description: Current queue state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueueStats"
+
+  /healthz:
+    get:
+      summary: Liveness check
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: UP
+
+  /metrics:
+    get:
+      summary: Prometheus metrics (edge queue depth, forwarder attempt/outcome counters)
+      responses:
+        "200":
+          description: Prometheus text exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  schemas:
+    CaptureResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: QUEUED
+        idempotency_key:
+          type: string
+          description: "`<site_id>:<local_seq>`, assigned at capture time — the exactly-once boundary (§2.2)"
+          example: SITE-DEMO-NG:1
+        local_seq:
+          type: integer
+          format: uint64
+        site_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    QueueStats:
+      type: object
+      properties:
+        site_id:
+          type: string
+        pending_count:
+          type: integer
+        in_flight_count:
+          type: integer
+        acknowledged_count:
+          type: integer
+        failed_count:
+          type: integer
+        rejected_count:
+          type: integer
+        max_sequence:
+          type: integer
+          format: uint64
+        oldest_pending_time:
+          type: string
+          format: date-time
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+
+    AdverseEvent:
+      type: object
+      description: >
+        A deliberately scoped subset of the FHIR R4 AdverseEvent resource —
+        see PLAN.md §2.3 for the full field list and reasoning. Central
+        Ingestion is what actually validates this; the edge accepts it
+        as-is.
+      required: [resourceType, actuality, event, subject, date, recordedDate, severity, study, location]
+      properties:
+        resourceType:
+          type: string
+          enum: [AdverseEvent]
+        identifier:
+          type: array
+          description: Populated by Central Ingestion with the idempotency key on ingest — omit when submitting.
+          items:
+            type: object
+            properties:
+              system:
+                type: string
+              value:
+                type: string
+        actuality:
+          type: string
+          example: actual
+        event:
+          $ref: "#/components/schemas/CodeableConcept"
+        subject:
+          $ref: "#/components/schemas/Reference"
+        date:
+          type: string
+          format: date-time
+          description: Event time — when the adverse reaction actually occurred, in the site's local time normalized to UTC.
+        recordedDate:
+          type: string
+          format: date-time
+          description: Ingestion time — when this was captured.
+        seriousness:
+          $ref: "#/components/schemas/CodeableConcept"
+        severity:
+          $ref: "#/components/schemas/CodeableConcept"
+        outcome:
+          $ref: "#/components/schemas/CodeableConcept"
+        study:
+          type: array
+          items:
+            $ref: "#/components/schemas/Reference"
+        location:
+          $ref: "#/components/schemas/Reference"
+        suspectEntity:
+          type: array
+          items:
+            type: object
+
+    CodeableConcept:
+      type: object
+      properties:
+        coding:
+          type: array
+          items:
+            type: object
+            properties:
+              system:
+                type: string
+              code:
+                type: string
+              display:
+                type: string
+        text:
+          type: string
+
+    Reference:
+      type: object
+      properties:
+        reference:
+          type: string
+          example: Patient/DEMO-001
+        display:
+          type: string
