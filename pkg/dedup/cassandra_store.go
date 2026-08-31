@@ -20,16 +20,16 @@ type CassandraConfig struct {
 	ReplicationFactor int
 }
 
-// DefaultCassandraConfig provides connection defaults for local Docker single-node Cassandra.
+// DefaultCassandraConfig provides connection defaults for the Pharos 3-node Cassandra cluster.
 func DefaultCassandraConfig() CassandraConfig {
 	return CassandraConfig{
 		Hosts:             []string{"127.0.0.1"},
 		Port:              9042,
 		Keyspace:          "pharos",
-		Consistency:       gocql.One,         // RF=1 single node dev default; LOCAL_QUORUM in cluster
+		Consistency:       gocql.LocalQuorum, // RF=3, LOCAL_QUORUM reads/writes (Slice 7, §2.2)
 		SerialConsistency: gocql.LocalSerial, // Confines Paxos LWT rounds to local DC
 		ConnectTimeout:    10 * time.Second,
-		ReplicationFactor: 1,
+		ReplicationFactor: 3,
 	}
 }
 

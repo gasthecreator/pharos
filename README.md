@@ -113,7 +113,7 @@ Every decision, review finding, and fix is in `WORKLOG.md` and `ARCHITECTURE_PRO
 
 ## What's here vs. what's next
 
-This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. Everything above has only ever run as a single Docker container per service (Cassandra at replication factor 1, one Kafka broker); there's no authentication or TLS anywhere; nothing has been load-tested at real throughput; there's no deployment automation, backup/DR plan, or multi-instance scaling ever exercised. Observability is real as of Phase 2 Slice 6 (Prometheus + Grafana, see below) — closing the rest of the gap is ongoing work, not a gap in what's already been built; see `PLAN.md`'s roadmap section for the specifics.
+This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. There's no authentication or TLS anywhere; nothing has been load-tested at real throughput; there's no deployment automation, backup/DR plan, or multi-instance scaling ever exercised. Observability (Prometheus + Grafana, Slice 6) and a genuine multi-node cluster — 3-node Cassandra at replication factor 3, 3-broker Kafka, `LOCAL_QUORUM` reads/writes (Slice 7) — are both real, not aspirational; closing the rest of the gap is ongoing work, not a gap in what's already been built; see `PLAN.md`'s roadmap section for the specifics.
 
 ### Observability
 

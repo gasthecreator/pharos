@@ -26,7 +26,7 @@ func main() {
 	cassandraHosts := flag.String("cassandra-hosts", "127.0.0.1", "Comma-separated Cassandra host addresses")
 	cassandraPort := flag.Int("cassandra-port", 9042, "Cassandra port")
 	cassandraKeyspace := flag.String("cassandra-keyspace", "pharos", "Cassandra keyspace")
-	kafkaBrokers := flag.String("kafka-brokers", "127.0.0.1:9092", "Comma-separated Kafka broker addresses")
+	kafkaBrokers := flag.String("kafka-brokers", "127.0.0.1:9092,127.0.0.1:9094,127.0.0.1:9095", "Comma-separated Kafka broker addresses")
 	leaseTimeout := flag.Duration("lease-timeout", 30*time.Second, "Outbox publishing claim lease timeout")
 	sweeperInterval := flag.Duration("sweeper-interval", 10*time.Second, "Background outbox sweeper interval")
 	useMemoryStore := flag.Bool("use-memory-store", false, "Use in-memory outbox store and mock producer (for testing without Docker)")

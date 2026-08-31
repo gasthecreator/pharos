@@ -20,13 +20,13 @@ type CassandraServiceConfig struct {
 	ConnectTimeout time.Duration
 }
 
-// DefaultCassandraServiceConfig returns standard connection settings for local Cassandra.
+// DefaultCassandraServiceConfig returns standard connection settings for the Pharos Cassandra cluster.
 func DefaultCassandraServiceConfig() CassandraServiceConfig {
 	return CassandraServiceConfig{
 		Hosts:          []string{"127.0.0.1"},
 		Port:           9042,
 		Keyspace:       "pharos",
-		Consistency:    gocql.One,
+		Consistency:    gocql.LocalQuorum, // RF=3, LOCAL_QUORUM reads/writes (Slice 7)
 		ConnectTimeout: 10 * time.Second,
 	}
 }
@@ -47,7 +47,7 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 		Keyspace:          cfg.Keyspace,
 		Consistency:       cfg.Consistency,
 		ConnectTimeout:    cfg.ConnectTimeout,
-		ReplicationFactor: 1,
+		ReplicationFactor: 3,
 	}
 
 	cStore, err := consumer.NewCassandraCanonicalStore(cStoreCfg)
@@ -141,7 +141,7 @@ func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey strin
 	var kafkaPartition *int
 	var kafkaOffset *int64
 
-	iter := s.session.Query(query, idempotencyKey).WithContext(ctx).Consistency(gocql.One).Iter()
+	iter := s.session.Query(query, idempotencyKey).WithContext(ctx).Iter()
 	if !iter.Scan(
 		&rec.IdempotencyKey,
 		&rec.SiteID,
@@ -199,7 +199,7 @@ func (s *CassandraService) ListDLQEventsBySite(ctx context.Context, siteID strin
 	          FROM pharos.dead_letter_events_by_site
 	          WHERE site_id = ? LIMIT ?`
 
-	iter := s.session.Query(query, siteID, limit).WithContext(ctx).Consistency(gocql.One).Iter()
+	iter := s.session.Query(query, siteID, limit).WithContext(ctx).Iter()
 	return scanDLQRecords(iter)
 }
 
@@ -220,7 +220,7 @@ func (s *CassandraService) ListAllDLQEvents(ctx context.Context, limit int) ([]*
 	          FROM pharos.dead_letter_events
 	          LIMIT ?`
 
-	iter := s.session.Query(query, limit).WithContext(ctx).Consistency(gocql.One).Iter()
+	iter := s.session.Query(query, limit).WithContext(ctx).Iter()
 	return scanDLQRecords(iter)
 }
 

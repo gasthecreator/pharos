@@ -34,7 +34,7 @@ type EngineConfig struct {
 // DefaultEngineConfig returns production defaults for the canonical consumer group.
 func DefaultEngineConfig(brokers []string) EngineConfig {
 	if len(brokers) == 0 {
-		brokers = []string{"127.0.0.1:9092"}
+		brokers = []string{"127.0.0.1:9092", "127.0.0.1:9094", "127.0.0.1:9095"}
 	}
 	return EngineConfig{
 		Brokers:           brokers,

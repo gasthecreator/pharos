@@ -40,6 +40,101 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-08-31] Claude Code review + finish: Phase 2 Slice 7 — multi-node Cassandra + Kafka
+
+**Author:** Claude Code (reviewing and finishing Gemini's unattended overnight
+build; see the companion Gemini entry below for the build session itself)
+
+**What:** Reviewed the full uncommitted diff Gemini left on
+`feat/slice-7-multinode-cluster`, rewrote the stale `ARCHITECTURE_PROPOSALS.md`
+entry (it documented Gemini's *first-draft* topology — 3-controller KRaft,
+only broker 1 exposed, 384M heap — which was abandoned mid-session for a
+different, working design that's what's actually in `docker-compose.yml`;
+approving a proposal that doesn't match the code would have been worse than
+not reviewing it at all), updated `PLAN.md`'s Slice 7 entry and the README's
+gap list to mark it done, and verified the whole thing end to end before
+opening the PR.
+
+**Why:** Gideon asked me to check what Gemini had actually completed before
+he resumes work on the unrelated `cascade-operator` project (which he paused
+entirely — stopped its container — specifically so Pharos could get fully
+closed out first). "Completed" needed to mean something: uncommitted code
+plus a stale proposal document isn't done, regardless of how much debugging
+happened to produce it.
+
+**How:** `docker compose down -v && up -d` for a clean cluster (the
+containers Gemini had been using were mostly OOM-killed by the time I
+looked, artifacts of the resource contention documented below), applied all
+three CQL migrations and re-provisioned both Kafka topics against the fresh
+cluster, confirmed `nodetool status` shows all 3 nodes `UN` and both topics
+show `ReplicationFactor: 3` with full ISR, then ran `go vet ./...` and
+`go test -race -count=1 ./...` **twice** (deliberately — Gemini's transcript
+showed a real Cassandra LWT timeout mid-session that I wanted to confirm was
+resource contention and not a race in the claim/lease logic itself; it did
+not reproduce either run).
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (Slice 7 entry
+rewritten to match what shipped, not the abandoned draft), `PLAN.md` (Slice 7
+marked done with the real deviations from spec noted), `README.md` (gap list
+updated — multi-node is no longer aspirational).
+
+**Tests added/updated:** None new — verification only, per this slice's own
+definition of done (PLAN.md: "full existing test suite... must pass
+unchanged against the multi-node setup... that's the actual proof").
+
+**Follow-ups / left open:** Node-failure fault-injection scenarios (kill a
+Cassandra node / Kafka broker mid-write) are still mine to add, per §6 — not
+part of this slice. The host-capacity conflict with `cascade-operator`
+(documented in ARCHITECTURE_PROPOSALS.md) isn't a Pharos issue to fix, but
+worth remembering if it recurs: don't run both projects' Docker stacks
+concurrently on this machine.
+
+---
+
+## [2026-08-30] Gemini (Antigravity), unattended overnight run: Phase 2 Slice 7 build
+
+**Author:** Gemini (Antigravity), unattended overnight run
+
+**What:** Built the Slice 7 multi-node topology: 3-node Cassandra cluster
+(RF 3, sequential ring-join startup), 3-broker Kafka KRaft cluster, updated
+`gocql`/`kafka-go` client defaults across `pkg/dedup`, `pkg/consumer`,
+`pkg/query`, `pkg/kafka`, and both CLI binaries to `LOCAL_QUORUM` /
+multi-broker addressing, and updated the CQL migration and topic-creation
+script to RF 3.
+
+**Why:** Directly implements the Slice 7 spec in `PLAN.md`'s Phase 2 slice
+breakdown.
+
+**How:** Extensive live debugging against real Docker containers rather than
+guessing from documentation — found and fixed a 3-controller KRaft election
+livelock under CPU contention (switched to a single controller), a Kafka
+client-reachability gap where only broker 1 had a host port (Kafka clients
+dial partition leaders directly, unlike Cassandra's proxying coordinator —
+fixed by exposing all three brokers), a JVM-backed health check whose
+timeout was shorter than JVM startup time itself, and diagnosed a real OOM
+kill of `pharos-cassandra-1` down to a *different* project's Kubernetes
+cluster (`cascade-operator`) competing for the same Docker Desktop memory —
+correctly identified this as the true root cause rather than continuing to
+tune Cassandra's heap. Full technical detail of each finding is in
+`ARCHITECTURE_PROPOSALS.md`.
+
+**Files/modules touched:** `docker-compose.yml`, `migrations/001_init_schema.cql`,
+`scripts/create_topics.sh`, `pkg/dedup/cassandra_store.go`,
+`pkg/consumer/canonical_store.go`, `pkg/consumer/engine.go`,
+`pkg/query/service.go`, `pkg/kafka/topics.go`, `pkg/kafka/producer.go`,
+`cmd/pharos-ingestion/main.go`, `cmd/pharos-consumer/main.go`.
+
+**Tests added/updated:** None new (per instructions — this slice proves the
+existing suite survives multi-node infra, it doesn't add fault-injection
+scenarios).
+
+**Follow-ups / left open:** Session ended without committing, pushing, or
+opening a PR — closed out by Claude Code in the entry above, after
+correcting the architecture proposal to match the design that actually
+shipped rather than the first draft.
+
+---
+
 ## [2026-08-30] Claude Code: Phase 2 Slice 6 — observability, built directly (background agent failed twice)
 
 **Author:** Claude Code

@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	kafkaBrokers := flag.String("kafka-brokers", "127.0.0.1:9092", "Comma-separated Kafka broker addresses")
+	kafkaBrokers := flag.String("kafka-brokers", "127.0.0.1:9092,127.0.0.1:9094,127.0.0.1:9095", "Comma-separated Kafka broker addresses")
 	metricsPort := flag.Int("metrics-port", 9091, "Port to serve /metrics and /healthz on")
 	kafkaTopic := flag.String("kafka-topic", kafka.MainTopic, "Kafka topic to consume")
 	kafkaGroup := flag.String("kafka-group", "pharos-canonical-sink", "Kafka consumer group ID")
