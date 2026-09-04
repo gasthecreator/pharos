@@ -15,17 +15,29 @@ const (
 	MedDRASystem             = "http://hl7.org/fhir/sid/meddra"
 )
 
+// Wire-format schema versions (§2.3, Slice 9). SchemaVersionV1 is the profile
+// this project has used since Slice 1; it's named explicitly, not left as an
+// implicit "the only version," specifically so a future SchemaVersionV2 is a
+// pure addition to schemaValidators rather than a redesign of this constant
+// block. CurrentSchemaVersion is what the edge collector stamps on events it
+// captures — see internal/edge/sqlite_store.go's Enqueue.
+const (
+	SchemaVersionV1      = 1
+	CurrentSchemaVersion = SchemaVersionV1
+)
+
 var (
-	ErrInvalidResourceType = errors.New("resourceType must be 'AdverseEvent'")
-	ErrInvalidActuality    = errors.New("actuality must be 'actual'")
-	ErrMissingSubject      = errors.New("subject reference is required (e.g., 'Patient/<id>')")
-	ErrMissingEvent        = errors.New("event coding or text is required")
-	ErrMissingDate         = errors.New("date (observation event time) is required")
-	ErrMissingRecordedDate = errors.New("recordedDate (site capture time) is required")
-	ErrMissingStudy        = errors.New("study reference is required (e.g., 'ResearchStudy/<id>')")
-	ErrMissingLocation     = errors.New("location reference is required (e.g., 'Location/<site_id>')")
-	ErrMissingSeverity     = errors.New("severity coding is required ('mild', 'moderate', or 'severe')")
-	ErrMissingIdempotency  = errors.New("identifier with system 'urn:pharos:idempotency-key' is required")
+	ErrInvalidResourceType      = errors.New("resourceType must be 'AdverseEvent'")
+	ErrInvalidActuality         = errors.New("actuality must be 'actual'")
+	ErrMissingSubject           = errors.New("subject reference is required (e.g., 'Patient/<id>')")
+	ErrMissingEvent             = errors.New("event coding or text is required")
+	ErrMissingDate              = errors.New("date (observation event time) is required")
+	ErrMissingRecordedDate      = errors.New("recordedDate (site capture time) is required")
+	ErrMissingStudy             = errors.New("study reference is required (e.g., 'ResearchStudy/<id>')")
+	ErrMissingLocation          = errors.New("location reference is required (e.g., 'Location/<site_id>')")
+	ErrMissingSeverity          = errors.New("severity coding is required ('mild', 'moderate', or 'severe')")
+	ErrMissingIdempotency       = errors.New("identifier with system 'urn:pharos:idempotency-key' is required")
+	ErrUnsupportedSchemaVersion = errors.New("unsupported schemaVersion")
 )
 
 // Reference represents a standard FHIR Reference element.
@@ -61,8 +73,13 @@ type SuspectEntity struct {
 
 // AdverseEvent represents the scoped FHIR R4 AdverseEvent resource profile (§2.3).
 type AdverseEvent struct {
-	ResourceType  string            `json:"resourceType"`
-	ID            string            `json:"id,omitempty"`
+	ResourceType string `json:"resourceType"`
+	ID           string `json:"id,omitempty"`
+	// SchemaVersion is the wire-format version this event was captured under
+	// (§2.3, Slice 9). Absent/zero is treated as SchemaVersionV1 for
+	// backward compatibility with every event captured before this field
+	// existed — nothing gets retroactively invalidated.
+	SchemaVersion int               `json:"schemaVersion,omitempty"`
 	Identifier    []Identifier      `json:"identifier"`
 	Actuality     string            `json:"actuality"`
 	Category      []CodeableConcept `json:"category,omitempty"`
@@ -79,8 +96,32 @@ type AdverseEvent struct {
 	SuspectEntity []SuspectEntity   `json:"suspectEntity,omitempty"`
 }
 
-// Validate checks that the AdverseEvent satisfies the scoped FHIR R4 profile constraints.
+// schemaValidators dispatches Validate() by wire-format version (§2.3, Slice
+// 9). Adding a future SchemaVersionV2 means adding an entry here and a new
+// validateV2 function — validateV1 and every existing test stays untouched.
+var schemaValidators = map[int]func(*AdverseEvent) error{
+	SchemaVersionV1: validateV1,
+}
+
+// Validate checks that the AdverseEvent satisfies its declared wire-format
+// version's profile constraints, dispatching by SchemaVersion (§2.3, Slice 9).
+// An absent/zero SchemaVersion is treated as SchemaVersionV1.
 func (ae *AdverseEvent) Validate() error {
+	version := ae.SchemaVersion
+	if version == 0 {
+		version = SchemaVersionV1
+	}
+
+	validator, ok := schemaValidators[version]
+	if !ok {
+		return fmt.Errorf("%w: %d", ErrUnsupportedSchemaVersion, version)
+	}
+	return validator(ae)
+}
+
+// validateV1 is the FHIR R4 AdverseEvent profile this project has used since
+// Slice 1 (§2.3).
+func validateV1(ae *AdverseEvent) error {
 	if ae.ResourceType != ResourceTypeAdverseEvent {
 		return fmt.Errorf("%w: got %q", ErrInvalidResourceType, ae.ResourceType)
 	}

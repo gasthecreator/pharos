@@ -40,6 +40,55 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-04] Claude Code: Slice 9 — wire-format schema versioning
+
+**Author:** Claude Code
+
+**What:** Added `schemaVersion int` to `model.AdverseEvent`, restructured
+`Validate()` into a version dispatch (`map[int]func(*AdverseEvent) error`,
+one entry today: `SchemaVersionV1`), and had the edge collector stamp
+`CurrentSchemaVersion` at capture time. Wrote and self-approved the
+proposal in `ARCHITECTURE_PROPOSALS.md` first.
+
+**Why:** Forward-looking hardening per `PLAN.md`'s Slice 9 — the wire
+schema hasn't changed since Slice 1, but a system meant to run for years
+with independently-updated edge binaries across many sites needs a
+version story before the first real schema change, not after.
+
+**How:** Absent/zero `schemaVersion` defaults to `SchemaVersionV1` so
+nothing already captured (every event from Slices 1-8) is retroactively
+invalidated. An unrecognized version returns a typed
+`ErrUnsupportedSchemaVersion` that flows through the *existing*
+validation-rejection path into the DLQ unchanged — deliberately not a new
+code path, just a new reason an existing one can trigger. Built the
+dispatch as a map from day one, with a single entry, specifically so a
+real future `SchemaVersionV2` is a pure addition (new constant, new
+validator function, new map entry) rather than a second, more invasive
+refactor of `Validate()` itself. The edge stamps the version (not left to
+whatever Central Ingestion's current default is), since the whole point is
+reflecting what the *submitting* binary understood at capture time, not
+what's currently deployed centrally.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry),
+`PLAN.md` (Slice 9 marked done), `internal/model/adverse_event.go`,
+`internal/model/adverse_event_test.go`, `internal/edge/sqlite_store.go`,
+`internal/edge/sqlite_store_test.go`, `internal/ingestion/handler_test.go`.
+
+**Tests added/updated:** `TestAdverseEvent_SchemaVersionDispatch` (4
+subtests: absent version, explicit v1, unrecognized version, unrecognized
+version checked before any other field), `TestSQLiteStore_EnqueueStampsSchemaVersion`
+(2 subtests: stamps when unset, never overwrites a caller-set value),
+`TestHandler_UnsupportedSchemaVersionRejectedCleanly`. Full suite passed
+twice against the real multi-node cluster.
+
+**Follow-ups / left open:** None. Deliberately did not add a dedicated
+`schema_version` Cassandra/DLQ column — the raw wire payload already
+preserves it durably everywhere it's stored, so a second column would
+duplicate data for no operational gain (see the proposal's "Explicitly out
+of scope" section).
+
+---
+
 ## [2026-09-04] Claude Code: Slice 8 implementation verified and closed out
 
 **Author:** Claude Code

@@ -2,6 +2,7 @@ package model
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -144,6 +145,54 @@ func TestAdverseEvent_Validate(t *testing.T) {
 		ae.Identifier = nil
 		if err := ae.Validate(); err == nil {
 			t.Fatal("expected error for missing idempotency key")
+		}
+	})
+}
+
+// TestAdverseEvent_SchemaVersionDispatch locks in §2.3/Slice 9: an
+// absent/zero SchemaVersion must validate exactly as it did before this
+// field existed (nothing retroactively invalidated), an explicit
+// SchemaVersionV1 must behave identically to the implicit case, and any
+// version this binary doesn't recognize must be rejected with a specific,
+// typed error rather than silently misparsed or accepted.
+func TestAdverseEvent_SchemaVersionDispatch(t *testing.T) {
+	t.Run("absent schemaVersion (backward compatibility)", func(t *testing.T) {
+		ae := validAdverseEvent()
+		ae.SchemaVersion = 0
+		if err := ae.Validate(); err != nil {
+			t.Fatalf("expected an absent schemaVersion to validate as v1, got: %v", err)
+		}
+	})
+
+	t.Run("explicit SchemaVersionV1", func(t *testing.T) {
+		ae := validAdverseEvent()
+		ae.SchemaVersion = SchemaVersionV1
+		if err := ae.Validate(); err != nil {
+			t.Fatalf("expected explicit v1 to validate, got: %v", err)
+		}
+	})
+
+	t.Run("unrecognized schemaVersion is rejected specifically", func(t *testing.T) {
+		ae := validAdverseEvent()
+		ae.SchemaVersion = 99
+		err := ae.Validate()
+		if err == nil {
+			t.Fatal("expected an error for an unrecognized schemaVersion")
+		}
+		if !errors.Is(err, ErrUnsupportedSchemaVersion) {
+			t.Fatalf("expected ErrUnsupportedSchemaVersion, got: %v", err)
+		}
+	})
+
+	t.Run("unrecognized version does not fall through to a different check first", func(t *testing.T) {
+		// An event that's ALSO missing other required fields should still
+		// report the version problem, not a coincidentally-triggered
+		// FHIR-shape error — version dispatch happens before profile
+		// validation runs at all.
+		ae := &AdverseEvent{SchemaVersion: 42}
+		err := ae.Validate()
+		if !errors.Is(err, ErrUnsupportedSchemaVersion) {
+			t.Fatalf("expected ErrUnsupportedSchemaVersion even for an otherwise-empty event, got: %v", err)
 		}
 	})
 }

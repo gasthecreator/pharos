@@ -15,6 +15,72 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-04] Slice 9: Wire-Format Schema Versioning
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-04).
+
+**What in PLAN.md this touches:** §2.3 (FHIR validation), Phase 2 Slice 9.
+
+**What I'm proposing:** an explicit `schemaVersion int` field on
+`model.AdverseEvent` (`json:"schemaVersion,omitempty"`), stamped by the
+edge collector at capture time (mirroring exactly how it already stamps
+the idempotency key) rather than left to whatever a submitting client
+happens to send. `Validate()` becomes a dispatch: look up a validator
+function by version in a `map[int]func(*AdverseEvent) error`, defaulting
+an absent/zero field to `SchemaVersionV1` for full backward compatibility
+with every event ever captured before this ships (nothing gets
+retroactively invalidated), and returning a specific, typed
+`ErrUnsupportedSchemaVersion` for anything not in the map. That error
+flows through the *existing* validation-rejection path into the DLQ
+unchanged — an unrecognized version was already going to be a rejection
+via `ev.Validate()`'s error return; this doesn't add a new code path, it
+adds a new reason a rejection can happen.
+
+**Why a dispatch map now, when there's only one version:** the point of
+this slice is to not need a second, more invasive change the day a real
+v2 shows up. Adding `SchemaVersionV2` and its validator later is then a
+pure addition to the map — v1's validator, tests, and behavior stay
+completely untouched. Building the dispatch shape today, even with one
+entry, is the actual hardening; a bare `if version != 1 { reject }` would
+still work today but would force a larger refactor later instead of an
+addition.
+
+**Why the edge stamps it, not left implicit:** the whole reason this
+matters is edge binaries at different sites getting updated at different
+times over years. If the field were only set by whichever validator
+happens to run centrally, every site's events would silently claim
+whatever the *current* Central Ingestion binary's default is, which
+defeats the purpose — the version has to reflect what the *submitting*
+binary actually understood at capture time.
+
+**Explicitly out of scope:** a second Cassandra/DLQ column for
+`schema_version`. The raw wire payload is already preserved byte-for-byte
+in both the canonical tables and the DLQ (`payload` column, confirmed in
+`internal/dedup/store.go`), so the version is always recoverable from
+there for anyone inspecting a record — a dedicated column would duplicate
+data already durably stored elsewhere for no operational gain, which is
+the kind of complexity that doesn't buy anything and shouldn't be added
+just because it's available to add.
+
+**Alternatives considered:** a bare version check without a dispatch
+table (`if ev.SchemaVersion > 1 { reject }`) — rejected per the reasoning
+above, since it would need to become a dispatch table the moment a real
+v2 exists anyway, at which point the "simple" version was never actually
+simpler, just deferred.
+
+**Impact if approved:**
+- `internal/model/adverse_event.go`: new field, `Validate()` restructured
+  into a version dispatch, `ErrUnsupportedSchemaVersion` added.
+- `internal/edge/sqlite_store.go`: `Enqueue` stamps
+  `model.CurrentSchemaVersion` alongside the existing idempotency-key
+  stamp, only if not already set (matching the existing
+  location-reference-defaulting pattern in the same function).
+- No changes to Cassandra schema, the DLQ mechanism, or any downstream
+  consumer — an unsupported-version rejection is just a new *reason* for
+  a code path that already exists.
+
+---
+
 #### [2026-08-31] Slice 8: Idempotency Key Resilience Across Edge Instance Loss
 
 **Status:** Resolved: Approved (Claude Code, 2026-08-31). Authored directly

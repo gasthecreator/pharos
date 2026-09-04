@@ -2,6 +2,7 @@ package edge
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -103,6 +104,49 @@ func TestSQLiteStore_EnqueueAndFetch(t *testing.T) {
 	if records[0].IdempotencyKey != expectedKey {
 		t.Errorf("fetched record key mismatch: %s", records[0].IdempotencyKey)
 	}
+}
+
+// TestSQLiteStore_EnqueueStampsSchemaVersion locks in §2.3/Slice 9: the edge
+// stamps its own binary's schema version onto every event it captures, and
+// never overwrites a version the caller already set explicitly.
+func TestSQLiteStore_EnqueueStampsSchemaVersion(t *testing.T) {
+	ctx := context.Background()
+	store, _ := setupTestStore(t)
+	siteID := "SITE-VERSION-01"
+
+	t.Run("stamps CurrentSchemaVersion when caller didn't set one", func(t *testing.T) {
+		ev := newTestEvent(siteID)
+		if ev.SchemaVersion != 0 {
+			t.Fatalf("test setup invalid: newTestEvent already sets a version")
+		}
+		rec, err := store.Enqueue(ctx, siteID, ev)
+		if err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+		var persisted model.AdverseEvent
+		if err := json.Unmarshal(rec.Payload, &persisted); err != nil {
+			t.Fatalf("failed to unmarshal persisted payload: %v", err)
+		}
+		if persisted.SchemaVersion != model.CurrentSchemaVersion {
+			t.Errorf("expected persisted schemaVersion %d, got %d", model.CurrentSchemaVersion, persisted.SchemaVersion)
+		}
+	})
+
+	t.Run("does not overwrite a caller-set version", func(t *testing.T) {
+		ev := newTestEvent(siteID)
+		ev.SchemaVersion = 7 // hypothetical future version the caller already knows about
+		rec, err := store.Enqueue(ctx, siteID, ev)
+		if err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
+		var persisted model.AdverseEvent
+		if err := json.Unmarshal(rec.Payload, &persisted); err != nil {
+			t.Fatalf("failed to unmarshal persisted payload: %v", err)
+		}
+		if persisted.SchemaVersion != 7 {
+			t.Errorf("expected caller-set schemaVersion 7 to be preserved, got %d", persisted.SchemaVersion)
+		}
+	})
 }
 
 func TestSQLiteStore_DurabilityAcrossRestart(t *testing.T) {
