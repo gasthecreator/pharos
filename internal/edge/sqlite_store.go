@@ -13,15 +13,58 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// projectEpochUnix anchors the instance-epoch component of local_seq (§2.2,
+// ARCHITECTURE_PROPOSALS.md "Slice 8: Idempotency Key Resilience Across Edge
+// Instance Loss") to 2026-01-01T00:00:00Z rather than the Unix epoch. Encoding
+// minutes since *this* epoch in 31 bits gives ~4,083 years of headroom before
+// wrapping; encoding raw Unix seconds in the same 31 bits would wrap in
+// January 2038 (2^31 seconds after 1970) and overflow into the sign bit of
+// Cassandra's signed 64-bit bigint columns that store local_seq downstream.
+const projectEpochUnix = 1767225600 // 2026-01-01T00:00:00Z
+
+// instanceEpochBits is the number of bits reserved for the instance-epoch
+// component of a composite local_seq value; the remaining 32 bits are the
+// per-instance monotonic counter. 31 + 32 = 63 bits, always leaving bit 63
+// (the sign bit, as stored in Cassandra's signed bigint) at zero.
+const instanceEpochMask = uint64(1)<<31 - 1
+
+// currentInstanceEpochMinutes returns minutes since projectEpochUnix, clamped
+// to [0, instanceEpochMask] so a misconfigured system clock (before the
+// project epoch, or implausibly far in the future) can never produce a value
+// that touches bit 63 once shifted into place.
+func currentInstanceEpochMinutes() uint64 {
+	deltaSeconds := time.Now().UTC().Unix() - projectEpochUnix
+	if deltaSeconds < 0 {
+		return 0
+	}
+	return uint64(deltaSeconds/60) & instanceEpochMask
+}
+
 // SQLiteStore implements QueueStore using embedded SQLite with WAL mode (§2.1).
 type SQLiteStore struct {
-	db     *sql.DB
-	dbPath string
-	mu     sync.Mutex // serializes write transactions to prevent database lock contention
+	db               *sql.DB
+	dbPath           string
+	mu               sync.Mutex // serializes write transactions to prevent database lock contention
+	epochMinutesFunc func() uint64
 }
 
 // NewSQLiteStore opens or creates an embedded SQLite store with WAL mode enabled.
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
+	return newSQLiteStore(dbPath, currentInstanceEpochMinutes)
+}
+
+// NewSQLiteStoreWithEpochSource is NewSQLiteStore with an injectable source for
+// the instance-epoch component of local_seq (§2.2, Slice 8), instead of the
+// real wall clock. Exists for tests that need deterministic control over
+// instance_epoch — e.g. simulating two edge instances for the same site_id
+// created far enough apart to land in different epochs, without an actual
+// wall-clock sleep past a minute boundary. Production code should use
+// NewSQLiteStore.
+func NewSQLiteStoreWithEpochSource(dbPath string, epochMinutesFunc func() uint64) (*SQLiteStore, error) {
+	return newSQLiteStore(dbPath, epochMinutesFunc)
+}
+
+func newSQLiteStore(dbPath string, epochMinutesFunc func() uint64) (*SQLiteStore, error) {
 	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)", dbPath)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -32,8 +75,9 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	db.SetMaxOpenConns(1)
 
 	store := &SQLiteStore{
-		db:     db,
-		dbPath: dbPath,
+		db:               db,
+		dbPath:           dbPath,
+		epochMinutesFunc: epochMinutesFunc,
 	}
 
 	if err := store.initSchema(); err != nil {
@@ -55,7 +99,8 @@ func (s *SQLiteStore) initSchema() error {
 
 	CREATE TABLE IF NOT EXISTS site_sequence (
 		site_id TEXT PRIMARY KEY,
-		last_seq INTEGER NOT NULL DEFAULT 0
+		last_seq INTEGER NOT NULL DEFAULT 0,
+		instance_epoch INTEGER NOT NULL DEFAULT 0
 	);
 
 	CREATE TABLE IF NOT EXISTS queued_events (
@@ -75,8 +120,56 @@ func (s *SQLiteStore) initSchema() error {
 	CREATE INDEX IF NOT EXISTS idx_queued_events_status_seq ON queued_events(status, local_seq);
 	CREATE INDEX IF NOT EXISTS idx_queued_events_site_seq ON queued_events(site_id, local_seq);
 	`
-	_, err := s.db.Exec(query)
-	return err
+	if _, err := s.db.Exec(query); err != nil {
+		return err
+	}
+
+	// Migration for database files that predate the instance_epoch column
+	// (§2.2, Slice 8): CREATE TABLE IF NOT EXISTS above is a no-op against an
+	// already-existing site_sequence table, so a pre-existing file needs an
+	// explicit ALTER TABLE. Existing rows default instance_epoch to 0, which
+	// makes their composite local_seq numerically identical to their current
+	// plain value — no renumbering, no discontinuity for already-running sites.
+	hasColumn, err := s.hasColumn("site_sequence", "instance_epoch")
+	if err != nil {
+		return fmt.Errorf("failed to inspect site_sequence schema: %w", err)
+	}
+	if !hasColumn {
+		if _, err := s.db.Exec(`ALTER TABLE site_sequence ADD COLUMN instance_epoch INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add instance_epoch column: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// hasColumn reports whether the named column already exists on the named
+// table, so schema migrations can be applied idempotently across restarts
+// without erroring on an already-migrated database file.
+func (s *SQLiteStore) hasColumn(table, column string) (bool, error) {
+	rows, err := s.db.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			colType    string
+			notNull    int
+			defaultVal sql.NullString
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Enqueue atomically allocates the next sequence number for the site, stamps the event
@@ -102,20 +195,34 @@ func (s *SQLiteStore) Enqueue(ctx context.Context, siteID string, event *model.A
 		_ = tx.Rollback()
 	}()
 
-	// 1. Allocate next sequence number monotonically
+	// 1. Allocate next sequence number monotonically. instance_epoch is only
+	// ever written on the INSERT branch below — the ON CONFLICT UPDATE clause
+	// doesn't mention it, so it's left untouched on every call after the
+	// first. That first-INSERT moment is exactly "this local database file
+	// has never tracked this site_id before," which is the correct signal
+	// for minting a fresh epoch: it's true both for a genuinely new site and
+	// for a disk-replaced site's fresh file re-encountering its own site_id
+	// for the first time (§2.2, Slice 8) — no separate detection needed.
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO site_sequence (site_id, last_seq) VALUES (?, 1)
+		INSERT INTO site_sequence (site_id, last_seq, instance_epoch) VALUES (?, 1, ?)
 		ON CONFLICT(site_id) DO UPDATE SET last_seq = last_seq + 1;
-	`, siteID)
+	`, siteID, s.epochMinutesFunc())
 	if err != nil {
 		return nil, fmt.Errorf("failed to increment sequence: %w", err)
 	}
 
-	var nextSeq uint64
-	err = tx.QueryRowContext(ctx, `SELECT last_seq FROM site_sequence WHERE site_id = ?`, siteID).Scan(&nextSeq)
+	var counter, instanceEpoch uint64
+	err = tx.QueryRowContext(ctx, `SELECT last_seq, instance_epoch FROM site_sequence WHERE site_id = ?`, siteID).Scan(&counter, &instanceEpoch)
 	if err != nil {
 		return nil, fmt.Errorf("failed to retrieve allocated sequence: %w", err)
 	}
+
+	// The composite value stamped on the outgoing idempotency key and stored
+	// as queued_events.local_seq. Still strictly monotonic within this
+	// instance's lifetime (instance_epoch is fixed once set; counter keeps
+	// incrementing 1-by-1 exactly as before), while being numerically
+	// disjoint from any prior instance's range for the same site_id.
+	nextSeq := (instanceEpoch << 32) | counter
 
 	// 2. Form client-side idempotency key (§2.2)
 	idempotencyKey, err := model.NewIdempotencyKey(siteID, nextSeq)

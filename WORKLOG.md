@@ -38,6 +38,55 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ---
 
+## Log
+
+## [2026-09-04] Claude Code: Slice 8 implementation verified and closed out
+
+**Author:** Claude Code
+
+**What:** Verified the Slice 8 implementation (checkpointed 2026-08-31 on
+`feat/slice-8-idempotency-key-resilience`, pending real infra at the time)
+against the actual multi-node Cassandra/Kafka cluster, ran the new
+`TestEdgeInstanceLoss_DiskReplacementDoesNotDropNewEvents` regression test
+and the full suite twice, and marked Slice 8 done in `PLAN.md`. Also
+caught and fixed a real WORKLOG.md header-corruption bug — the exact
+recurring pattern this file has documented twice before (a prepending
+edit swallowing the immediately-preceding `## Log` section header) — this
+time self-inflicted during the Slice 8 proposal entry.
+
+**Why:** Gideon paused verification on 2026-08-31 specifically to avoid
+running Pharos's Docker stack concurrently with an unrelated project on
+the same 8GB machine — a real resource-contention cost, not a
+hypothetical one, demonstrated earlier that same session. Picked back up
+once that project's work was done.
+
+**How:** Started Docker Desktop (it had been fully quit, not just the
+containers stopped), brought up the full 8-container stack, applied all
+3 CQL migrations and re-provisioned both Kafka topics against the fresh
+cluster, then ran the targeted new test first in isolation before the
+full suite — both passed clean, twice in a row for the full suite. Before
+touching any of that, ran a header-integrity check across the entire
+file (`grep` for every `## [` entry plus an awk check that every entry's
+`**Author:**` line sits within 3 lines of its own header) to confirm the
+corruption I found was isolated to the one spot, not a wider problem
+introduced across this session's several WORKLOG.md edits.
+
+**Files/modules touched:** `PLAN.md` (Slice 8 marked done), `WORKLOG.md`
+(this entry, plus the header-corruption fix — see the entry immediately
+below, which is what got its section header clipped).
+
+**Tests added/updated:** None new here — verification of what was
+already written and checkpointed on 2026-08-31.
+
+**Follow-ups / left open:** None for Slice 8 itself. Worth remembering
+for future WORKLOG.md edits in this session or later ones: this file has
+now had its `## Log` header clipped by a prepending edit three times
+total across this project's history — always check header integrity
+after editing this file, not just before, since the corruption is in the
+edit that was just made, not one you're about to make.
+
+---
+
 ## [2026-08-31] Claude Code: Slice 8 architecture proposal — idempotency key resilience
 
 **Author:** Claude Code

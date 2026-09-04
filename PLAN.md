@@ -247,6 +247,28 @@ with no change to their own content or intent.
   wipe/replace an edge's SQLite file mid-stream, confirm subsequent
   genuinely-new submissions land as `new_claim`, never `duplicate_hit`.
 
+  **Done 2026-09-04.** Implemented entirely inside
+  `internal/edge/sqlite_store.go` as designed — zero changes anywhere else.
+  Added `NewSQLiteStoreWithEpochSource` alongside the existing
+  `NewSQLiteStore`, matching the same dependency-injection pattern
+  `Forwarder` already uses for its `HTTPClient`, so tests can control
+  `instance_epoch` deterministically instead of sleeping past a real
+  wall-clock minute boundary to force two different epochs. Updated every
+  existing `internal/edge` unit test that had hardcoded small sequence
+  numbers (`1`, `2`, `1..N`) to assert the actual invariant instead
+  (nonzero, monotonic, contiguous, matches the key's own local_seq) — a
+  fresh database file now always mints a real, non-trivial epoch, not just
+  a legacy-migrated one. New fault-injection test
+  (`TestEdgeInstanceLoss_DiskReplacementDoesNotDropNewEvents`) simulates
+  exactly the bug scenario: two edge "instances" for the same site_id,
+  different local database files, different injected epochs standing in
+  for real elapsed time — both submit real events through the same real
+  Central Ingestion/Cassandra/Kafka, and neither's idempotency keys
+  collide with the other's. `go vet`, `go build`, `gofmt`, and
+  `golangci-lint` (0 issues) all clean; full test suite passed twice in a
+  row against the real multi-node cluster, including the new test and
+  every existing fault-injection scenario.
+
 - **Slice 9 — Wire-format schema versioning.** Forward-looking hardening,
   not a fix for an existing bug: the AdverseEvent wire schema hasn't changed
   since Slice 1, but a system meant to run for years with independently

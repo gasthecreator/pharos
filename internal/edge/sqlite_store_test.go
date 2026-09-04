@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -76,11 +77,16 @@ func TestSQLiteStore_EnqueueAndFetch(t *testing.T) {
 	if record.SiteID != siteID {
 		t.Errorf("expected siteID %s, got %s", siteID, record.SiteID)
 	}
-	if record.LocalSeq != 1 {
-		t.Errorf("expected local_seq 1, got %d", record.LocalSeq)
+	// local_seq is no longer guaranteed to be a small number starting at 1 —
+	// it's (instance_epoch << 32) | counter (§2.2, Slice 8), so a fresh
+	// database file's first allocation is a large, epoch-derived value. What
+	// must hold is: nonzero, and the idempotency key round-trips to it.
+	if record.LocalSeq == 0 {
+		t.Errorf("expected a nonzero local_seq, got 0")
 	}
-	if record.IdempotencyKey != "SITE-NG-01:1" {
-		t.Errorf("expected idempotency_key SITE-NG-01:1, got %s", record.IdempotencyKey)
+	expectedKey := siteID + ":" + strconv.FormatUint(record.LocalSeq, 10)
+	if record.IdempotencyKey != expectedKey {
+		t.Errorf("expected idempotency_key %s, got %s", expectedKey, record.IdempotencyKey)
 	}
 	if record.Status != StatusPending {
 		t.Errorf("expected status PENDING, got %s", record.Status)
@@ -94,7 +100,7 @@ func TestSQLiteStore_EnqueueAndFetch(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("expected 1 record, got %d", len(records))
 	}
-	if records[0].IdempotencyKey != "SITE-NG-01:1" {
+	if records[0].IdempotencyKey != expectedKey {
 		t.Errorf("fetched record key mismatch: %s", records[0].IdempotencyKey)
 	}
 }
@@ -111,15 +117,21 @@ func TestSQLiteStore_DurabilityAcrossRestart(t *testing.T) {
 		t.Fatalf("failed to open store1: %v", err)
 	}
 
+	var issuedSeqs []uint64
 	for i := 1; i <= 5; i++ {
 		ev := newTestEvent(siteID)
 		rec, err := store1.Enqueue(ctx, siteID, ev)
 		if err != nil {
 			t.Fatalf("failed to enqueue event %d: %v", i, err)
 		}
-		if rec.LocalSeq != uint64(i) {
-			t.Fatalf("expected seq %d, got %d", i, rec.LocalSeq)
+		// local_seq is (instance_epoch << 32) | counter (§2.2, Slice 8) — not
+		// a small number starting at 1 — but within one instance's lifetime
+		// it must still increase by exactly 1 per call, since instance_epoch
+		// is fixed once minted.
+		if i > 1 && rec.LocalSeq != issuedSeqs[i-2]+1 {
+			t.Fatalf("expected seq %d to be %d+1, got %d", i, issuedSeqs[i-2], rec.LocalSeq)
 		}
+		issuedSeqs = append(issuedSeqs, rec.LocalSeq)
 	}
 
 	// Verify WAL file exists while open
@@ -150,20 +162,22 @@ func TestSQLiteStore_DurabilityAcrossRestart(t *testing.T) {
 	}
 
 	for i, r := range records {
-		expectedSeq := uint64(i + 1)
-		if r.LocalSeq != expectedSeq {
-			t.Errorf("record %d has seq %d, expected %d", i, r.LocalSeq, expectedSeq)
+		if r.LocalSeq != issuedSeqs[i] {
+			t.Errorf("record %d has seq %d, expected %d (same instance, same epoch)", i, r.LocalSeq, issuedSeqs[i])
 		}
 	}
 
-	// Enqueue a 6th event; sequence must resume at 6
+	// Enqueue a 6th event; sequence must resume immediately after the 5th —
+	// same instance_epoch (this is the same database file, not a fresh one),
+	// counter continuing from where it left off.
 	ev6 := newTestEvent(siteID)
 	rec6, err := store2.Enqueue(ctx, siteID, ev6)
 	if err != nil {
 		t.Fatalf("failed to enqueue after restart: %v", err)
 	}
-	if rec6.LocalSeq != 6 {
-		t.Errorf("expected sequence to resume at 6, got %d", rec6.LocalSeq)
+	expected6 := issuedSeqs[4] + 1
+	if rec6.LocalSeq != expected6 {
+		t.Errorf("expected sequence to resume at %d, got %d", expected6, rec6.LocalSeq)
 	}
 }
 
@@ -215,10 +229,19 @@ func TestSQLiteStore_ConcurrentEnqueueMonotonicSequences(t *testing.T) {
 		seenSeqs[res.seq] = true
 	}
 
-	// Check that sequences are strictly 1 through numGoroutines with zero gaps
-	for seq := uint64(1); seq <= numGoroutines; seq++ {
-		if !seenSeqs[seq] {
-			t.Fatalf("GAP in sequence numbers: missing sequence %d", seq)
+	// Sequences are no longer guaranteed to start at 1 — local_seq is
+	// (instance_epoch << 32) | counter (§2.2, Slice 8) — but within one
+	// instance's lifetime they must still form a contiguous run with zero
+	// gaps, relative to whatever the first-allocated value was.
+	minSeq := ^uint64(0)
+	for seq := range seenSeqs {
+		if seq < minSeq {
+			minSeq = seq
+		}
+	}
+	for i := uint64(0); i < numGoroutines; i++ {
+		if !seenSeqs[minSeq+i] {
+			t.Fatalf("GAP in sequence numbers: missing sequence %d (base %d)", minSeq+i, minSeq)
 		}
 	}
 }
@@ -286,8 +309,11 @@ func TestSQLiteStore_StateTransitionsAndBackoff(t *testing.T) {
 	if stats.FailedCount != 1 {
 		t.Errorf("expected 1 failed, got %d", stats.FailedCount)
 	}
-	if stats.MaxSequence != 2 {
-		t.Errorf("expected max sequence 2, got %d", stats.MaxSequence)
+	// rec2 was enqueued second, so it holds the higher local_seq within this
+	// instance (§2.2, Slice 8: not necessarily "2" — instance_epoch makes it
+	// a large, epoch-derived value — but it must be the max).
+	if stats.MaxSequence != rec2.LocalSeq {
+		t.Errorf("expected max sequence %d (rec2's), got %d", rec2.LocalSeq, stats.MaxSequence)
 	}
 }
 
@@ -331,12 +357,14 @@ func TestSQLiteStore_FIFOOrder(t *testing.T) {
 	siteID := "SITE-JP-01"
 
 	const total = 20
+	var issuedSeqs []uint64
 	for i := 0; i < total; i++ {
 		ev := newTestEvent(siteID)
-		_, err := store.Enqueue(ctx, siteID, ev)
+		rec, err := store.Enqueue(ctx, siteID, ev)
 		if err != nil {
 			t.Fatalf("enqueue %d failed: %v", i, err)
 		}
+		issuedSeqs = append(issuedSeqs, rec.LocalSeq)
 	}
 
 	// Fetch in batches of 5
@@ -367,9 +395,8 @@ func TestSQLiteStore_FIFOOrder(t *testing.T) {
 	}
 
 	for i := 0; i < total; i++ {
-		expected := uint64(i + 1)
-		if retrievedSeqs[i] != expected {
-			t.Errorf("FIFO order violation at index %d: expected %d, got %d", i, expected, retrievedSeqs[i])
+		if retrievedSeqs[i] != issuedSeqs[i] {
+			t.Errorf("FIFO order violation at index %d: expected %d, got %d", i, issuedSeqs[i], retrievedSeqs[i])
 		}
 	}
 }
