@@ -233,6 +233,15 @@ func (s *SQLiteStore) Enqueue(ctx context.Context, siteID string, event *model.A
 	// 3. Stamp idempotency key on event
 	event.SetIdempotencyKey(idempotencyKey)
 
+	// Stamp the wire-format version this binary captures under (§2.3, Slice
+	// 9), only if the caller hasn't already set one — this must reflect what
+	// *this* edge binary understood at capture time, not be silently
+	// overwritten by whatever Central Ingestion's current default happens to
+	// be, since different sites may run different edge binary versions.
+	if event.SchemaVersion == 0 {
+		event.SchemaVersion = model.CurrentSchemaVersion
+	}
+
 	// Ensure location matches siteID if not already set
 	if event.Location.Reference == "" {
 		event.Location = model.Reference{Reference: fmt.Sprintf("Location/%s", siteID)}

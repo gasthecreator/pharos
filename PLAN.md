@@ -279,6 +279,18 @@ with no change to their own content or intent.
   rejection — never a crash or a silent misparse. Sequenced right after
   Slice 8 since both are wire-format changes worth reviewing together.
 
+  **Done 2026-09-04.** `AdverseEvent.Validate()` dispatches by
+  `SchemaVersion` through a `map[int]func(*AdverseEvent) error`, currently
+  holding one entry (`SchemaVersionV1`); absent/zero defaults to v1 for
+  full backward compatibility, anything else returns typed
+  `ErrUnsupportedSchemaVersion` and flows through the existing DLQ
+  rejection path unchanged. The edge stamps `CurrentSchemaVersion` at
+  capture time (mirroring the idempotency-key stamp), never overriding a
+  caller-set value. Full reasoning in
+  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet`,
+  `go build`, `gofmt`, `golangci-lint` (0 issues) all clean; full suite
+  passed twice against the real multi-node cluster.
+
 - **Slice 10 — DLQ replay & reprocessing.** The DLQ is fully inspectable
   (`pharos-cli dlq list/get`) but has no path back into the pipeline — once
   whatever caused a rejection is actually fixed, a rejected event just stays

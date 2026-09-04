@@ -138,6 +138,41 @@ func TestHandler_ValidationRejectionStructuredErrors(t *testing.T) {
 	}
 }
 
+// TestHandler_UnsupportedSchemaVersionRejectedCleanly locks in §2.3/Slice 9:
+// an event declaring a schemaVersion this binary doesn't recognize must be
+// rejected through the exact same structured-error path as any other FHIR
+// validation failure — a specific, inspectable reason, never a crash or a
+// silent misparse.
+func TestHandler_UnsupportedSchemaVersionRejectedCleanly(t *testing.T) {
+	limiter := ratelimit.NewTokenBucketLimiter(10, 1)
+	h := NewHandler(limiter)
+	siteID := "SITE-VERSION-REJECT"
+
+	futureVersion := validEvent(siteID, 1)
+	futureVersion.SchemaVersion = 99
+
+	reqBody, _ := json.Marshal(BatchRequest{SiteID: siteID, Events: toRaw(futureVersion)})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/events", bytes.NewReader(reqBody))
+	rec := httptest.NewRecorder()
+
+	h.HandleEvents(rec, req)
+
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected HTTP 422 for an unsupported schemaVersion, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	var resp BatchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if resp.Rejected != 1 {
+		t.Fatalf("expected 1 rejected event, got %d", resp.Rejected)
+	}
+	if !strings.Contains(resp.Results[0].Error, "schemaVersion") {
+		t.Errorf("expected the rejection reason to mention schemaVersion, got: %s", resp.Results[0].Error)
+	}
+}
+
 func TestHandler_PartialValidationBatch(t *testing.T) {
 	limiter := ratelimit.NewTokenBucketLimiter(10, 1)
 	h := NewHandler(limiter)
