@@ -18,6 +18,19 @@ type CassandraConfig struct {
 	SerialConsistency gocql.SerialConsistency
 	ConnectTimeout    time.Duration
 	ReplicationFactor int
+	// LocalDC is this service's simulated home datacenter (§2.4, Slice 14:
+	// Multi-Region Cassandra + Kafka). Used both to build the keyspace's
+	// NetworkTopologyStrategy replication map and to configure gocql's
+	// DC-aware host selection policy -- without the latter, LOCAL_QUORUM's
+	// meaning depends on whichever DC the coordinator node happens to be in,
+	// which is undefined across a genuinely multi-DC cluster.
+	LocalDC string
+	// RemoteDCs maps each additional datacenter to its own replication
+	// factor, e.g. {"dc-eu": 2}. Empty for a single-DC deployment, in which
+	// case the keyspace still uses NetworkTopologyStrategy (forward-compatible
+	// with adding a DC later without an ALTER KEYSPACE), just with only
+	// LocalDC in the replication map.
+	RemoteDCs map[string]int
 }
 
 // DefaultCassandraConfig provides connection defaults for the Pharos 3-node Cassandra cluster.
@@ -30,6 +43,8 @@ func DefaultCassandraConfig() CassandraConfig {
 		SerialConsistency: gocql.LocalSerial, // Confines Paxos LWT rounds to local DC
 		ConnectTimeout:    10 * time.Second,
 		ReplicationFactor: 3,
+		LocalDC:           "dc-us",
+		RemoteDCs:         map[string]int{"dc-eu": 2},
 	}
 }
 
@@ -38,6 +53,20 @@ type CassandraOutboxStore struct {
 	session *gocql.Session
 	cfg     CassandraConfig
 	closed  bool
+}
+
+// networkTopologyReplicationMap renders the CQL replication map literal for
+// NetworkTopologyStrategy, e.g. {'dc-us': 3, 'dc-eu': 3} (§2.4, Slice 14:
+// Multi-Region Cassandra + Kafka). NetworkTopologyStrategy is used even for a
+// single-DC deployment (RemoteDCs empty) rather than SimpleStrategy, so
+// adding a second DC later never requires an ALTER KEYSPACE on an already
+// -provisioned keyspace.
+func networkTopologyReplicationMap(localDC string, localRF int, remoteDCs map[string]int) string {
+	parts := []string{fmt.Sprintf("'%s': %d", localDC, localRF)}
+	for dc, rf := range remoteDCs {
+		parts = append(parts, fmt.Sprintf("'%s': %d", dc, rf))
+	}
+	return "{'class': 'NetworkTopologyStrategy', " + strings.Join(parts, ", ") + "}"
 }
 
 // NewCassandraOutboxStore creates and bootstraps a new CassandraOutboxStore.
@@ -50,6 +79,13 @@ func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error)
 	cluster.Consistency = cfg.Consistency
 	cluster.SerialConsistency = cfg.SerialConsistency
 	cluster.DisableInitialHostLookup = true // Critical for Docker-on-Mac to route to 127.0.0.1:9042 directly
+	if cfg.LocalDC != "" {
+		// DC-aware host selection (§2.4, Slice 14): without this, LOCAL_QUORUM's
+		// meaning depends on whichever DC gocql's default round-robin policy
+		// happens to pick as coordinator -- invisible with one DC, silently
+		// wrong once a second one exists.
+		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
+	}
 
 	// 1. Attempt direct connection to the target keyspace
 	cluster.Keyspace = cfg.Keyspace
@@ -64,8 +100,8 @@ func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error)
 
 		keyspaceStmt := fmt.Sprintf(`
 			CREATE KEYSPACE IF NOT EXISTS %s
-			WITH replication = {'class': 'SimpleStrategy', 'replication_factor': %d};
-		`, cfg.Keyspace, cfg.ReplicationFactor)
+			WITH replication = %s;
+		`, cfg.Keyspace, networkTopologyReplicationMap(cfg.LocalDC, cfg.ReplicationFactor, cfg.RemoteDCs))
 
 		if err := initSession.Query(keyspaceStmt).Exec(); err != nil {
 			initSession.Close()

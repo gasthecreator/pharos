@@ -1,8 +1,17 @@
 -- Pharos Cassandra Schema Initialization (§2.2, §2.3)
 -- Defines the keyspace and tables for the transactional outbox, dead-letter pipeline, and sweeper index.
 
+-- NetworkTopologyStrategy across two simulated datacenters (§2.4, Slice 14:
+-- Multi-Region Cassandra + Kafka) -- matches the replication map the Go
+-- bootstrap code (internal/dedup, internal/consumer) builds at runtime, so
+-- CI applying this file first (before any Go code runs) doesn't leave the
+-- keyspace on the old SimpleStrategy that a later "IF NOT EXISTS" would then
+-- silently leave in place. dc-eu is RF=2 (not 3) matching its 2-node
+-- topology in docker-compose.yml -- see that file's Cassandra section
+-- comment for why dc-eu specifically was trimmed from the originally-planned
+-- 3 nodes to fit this project's 8GB host.
 CREATE KEYSPACE IF NOT EXISTS pharos
-WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+WITH replication = {'class': 'NetworkTopologyStrategy', 'dc-us': 3, 'dc-eu': 2};
 
 -- 1. Dedup & Transactional Outbox
 -- Primary key idempotency_key (<site_id>:<local_seq>) guarantees strict uniqueness via LWT.

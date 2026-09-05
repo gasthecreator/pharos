@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ type CassandraStoreConfig struct {
 	Consistency       gocql.Consistency
 	ConnectTimeout    time.Duration
 	ReplicationFactor int
+	// LocalDC and RemoteDCs mirror dedup.CassandraConfig's fields (§2.4,
+	// Slice 14: Multi-Region Cassandra + Kafka) -- see that type's docs.
+	LocalDC   string
+	RemoteDCs map[string]int
 }
 
 // DefaultCassandraStoreConfig returns defaults for the Pharos 3-node Cassandra cluster.
@@ -40,7 +45,23 @@ func DefaultCassandraStoreConfig() CassandraStoreConfig {
 		Consistency:       gocql.LocalQuorum, // RF=3, LOCAL_QUORUM reads/writes (Slice 7, §2.4)
 		ConnectTimeout:    10 * time.Second,
 		ReplicationFactor: 3,
+		LocalDC:           "dc-us",
+		RemoteDCs:         map[string]int{"dc-eu": 2},
 	}
+}
+
+// networkTopologyReplicationMap renders the CQL replication map literal for
+// NetworkTopologyStrategy (§2.4, Slice 14). Duplicated from
+// internal/dedup/cassandra_store.go rather than shared -- this project has
+// no existing common Cassandra-bootstrap package, and each store's keyspace
+// bootstrap is already independently duplicated (SimpleStrategy before this
+// change, identically, in both files).
+func networkTopologyReplicationMap(localDC string, localRF int, remoteDCs map[string]int) string {
+	parts := []string{fmt.Sprintf("'%s': %d", localDC, localRF)}
+	for dc, rf := range remoteDCs {
+		parts = append(parts, fmt.Sprintf("'%s': %d", dc, rf))
+	}
+	return "{'class': 'NetworkTopologyStrategy', " + strings.Join(parts, ", ") + "}"
 }
 
 // CassandraCanonicalStore implements CanonicalStore against Apache Cassandra using parallel idempotent upserts.
@@ -60,6 +81,11 @@ func NewCassandraCanonicalStore(cfg CassandraStoreConfig) (*CassandraCanonicalSt
 	cluster.Timeout = cfg.ConnectTimeout
 	cluster.Consistency = cfg.Consistency
 	cluster.DisableInitialHostLookup = true // Required for Docker-on-Mac localhost port mapping
+	if cfg.LocalDC != "" {
+		// DC-aware host selection (§2.4, Slice 14) -- see dedup.CassandraConfig's
+		// LocalDC docs for why this matters once a second DC genuinely exists.
+		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
+	}
 
 	cluster.Keyspace = cfg.Keyspace
 	session, err := cluster.CreateSession()
@@ -73,8 +99,8 @@ func NewCassandraCanonicalStore(cfg CassandraStoreConfig) (*CassandraCanonicalSt
 
 		keyspaceStmt := fmt.Sprintf(`
 			CREATE KEYSPACE IF NOT EXISTS %s
-			WITH replication = {'class': 'SimpleStrategy', 'replication_factor': %d};
-		`, cfg.Keyspace, cfg.ReplicationFactor)
+			WITH replication = %s;
+		`, cfg.Keyspace, networkTopologyReplicationMap(cfg.LocalDC, cfg.ReplicationFactor, cfg.RemoteDCs))
 
 		if err := initSession.Query(keyspaceStmt).Exec(); err != nil {
 			initSession.Close()

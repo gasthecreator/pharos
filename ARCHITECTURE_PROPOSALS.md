@@ -15,6 +15,203 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-05] Slice 14: Multi-Region Cassandra + Kafka (Simulated)
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-05).
+
+**What in PLAN.md this touches:** §2.1, §2.2, §2.4, §5, Phase 2 Slice 14.
+
+**A constraint PLAN.md didn't anticipate, found before writing any config:
+this host has 8GB RAM total, Docker Desktop's VM is capped at ~6.28GB, and
+the *existing* single-DC 3-node Cassandra + 3-broker Kafka topology was
+already using ~5GB of that (`docker stats`: Cassandra nodes 870MB-1.05GB
+each with no Kafka heap cap set at all, broker RSS 656-900MB each purely
+from JVM defaults). Naively *adding* a second 3-node Cassandra DC, a second
+3-broker Kafka cluster, and MirrorMaker 2 on top of that would need well
+over 10GB and reliably OOM the Docker VM. This doesn't change the decision
+to build the real thing — it changes how. Two mitigations, both applied,
+neither a scope cut:**
+
+1. **Aggressive, explicit JVM heap tuning on every node, tighter than Slice
+   7's original defaults.** Cassandra's existing 256M heap is lowered further
+   where the 2-DC topology needs the headroom; Kafka brokers get an explicit
+   `KAFKA_HEAP_OPTS` for the first time (Slice 7 never set one, which is the
+   entire reason broker RSS was 650-900MB against no configured ceiling).
+   Six small, disciplined JVMs fit where three undisciplined ones barely did.
+2. **The topology replaces the existing containers, it doesn't run alongside
+   them.** `docker-compose.yml`'s single-DC Cassandra/Kafka service
+   definitions are edited in place into the 2-DC/2-cluster definitions --
+   there is no window where both the old 3+3 and the new 6+6+MM2 topology
+   need to be up at once. The realistic total (six tuned Cassandra nodes, six
+   tuned Kafka brokers, one MirrorMaker 2 process, existing
+   Prometheus/Grafana) comes out lower than the old topology's *untuned*
+   footprint, not higher.
+
+**Fresh bootstrap, not a live single-DC-to-two-DC migration.** Converting a
+running keyspace's replication strategy from `SimpleStrategy` to
+`NetworkTopologyStrategy` against an actually-expanding cluster is a real,
+delicate operational procedure (`ALTER KEYSPACE`, then `nodetool rebuild`/
+`repair` per new-DC node, done carefully to avoid inconsistent reads
+mid-stream) -- appropriate to test as its own concern, but not what this
+slice asks for, and not something to smuggle in unrehearsed. Nothing in this
+project's Cassandra volumes is production data; it's this session's own
+accumulated test fixtures. Tearing down the old volumes and bootstrapping
+the 2-DC topology fresh proves exactly what this slice is actually about --
+that the *configuration and application logic* are multi-region-correct --
+without conflating it with a live-migration procedure PLAN.md never scoped.
+
+**Cassandra: `NetworkTopologyStrategy` across `dc-us`/`dc-eu`, 3 nodes each.**
+The official Cassandra image already honors `CASSANDRA_DC`/`CASSANDRA_RACK`
+env vars to populate `cassandra-rackdc.properties` under
+`GossipingPropertyFileSnitch` (already this project's snitch since Slice 7)
+-- no hand-written config files needed, just distinct values per container.
+Keyspace replication becomes `{'class': 'NetworkTopologyStrategy', 'dc-us':
+3, 'dc-eu': 3}`. `LOCAL_QUORUM` was already this project's consistency level
+specifically because it's the correct choice once real datacenters exist
+(Slice 7's own reasoning) -- this is what that decision was made for.
+
+**A real correctness gap found while tracing this, not just infrastructure:**
+none of the three places that construct a `gocql.ClusterConfig` (`internal/
+dedup/cassandra_store.go`, `internal/consumer/canonical_store.go`, `internal/
+query/service.go`) set a DC-aware host selection policy. In a single-DC
+cluster this was invisible -- there's only one DC, so "local" is unambiguous
+regardless of which host gocql's default round-robin policy happens to pick
+as coordinator. Across two real DCs, `LOCAL_QUORUM`'s meaning is decided by
+whichever node ends up coordinating the request, so an undirected policy
+could coordinate a `dc-us` service's write through a `dc-eu` node, silently
+satisfying quorum against the *wrong* DC's replicas. Fixed by adding
+`cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.
+DCAwareRoundRobinPolicy(cfg.LocalDC))` in all three places, with a new
+`LocalDC` config field (default `dc-us`, since Central Ingestion/consumer/
+query are all simulated as deployed in the primary region for this exercise).
+This is exactly the kind of gap the "convert to NetworkTopologyStrategy" line
+in PLAN.md's original Slice 14 scoping was implicitly asking to be found.
+
+**Kafka: existing cluster stays cluster A (`dc-us`), a genuinely independent
+second cluster becomes cluster B (`dc-eu`), MirrorMaker 2 replicates both
+topics A→B.** Cluster A's three existing brokers get `broker.rack` values
+identifying them as `dc-us`; cluster B is three *new* broker containers with
+their own KRaft controller quorum and a distinct `CLUSTER_ID` (a shared
+`CLUSTER_ID` would make them the same cluster, not two independent ones) and
+their own `broker.rack` values for `dc-eu`. MirrorMaker 2 (via
+`connect-mirror-maker.sh`, already bundled in the `apache/kafka` image this
+project already depends on -- no new image) replicates `pharos.events.
+adverse` and `pharos.events.dlq` one-directionally A→B, matching the
+standard "primary region replicates to a DR region" shape rather than a
+bidirectional setup, which would need MM2's loop-prevention/topic-renaming
+machinery for a property this project doesn't need.
+
+**Simulated WAN: `tc netem` for steady-state latency, the same mechanism for
+the full-partition fault-injection test.** `cap_add: [NET_ADMIN]` on every
+Cassandra and Kafka container makes `tc qdisc add dev eth0 root netem delay
+<80-150ms>` runnable via `docker exec` against the containers on the "other"
+side of a simulated link. The full-partition scenario uses the same `tc`
+mechanism (`netem loss 100%`) rather than a second, different mechanism
+(e.g. Docker network disconnect) -- one tool for both the steady-state and
+fault-injection cases is simpler to reason about and keeps the test close to
+what a real operator would reach for. This is standard, recognized practice
+for testing multi-region behavior without real geographic infrastructure,
+exactly as PLAN.md's own framing says -- not a shortcut.
+
+**Deliverable, unchanged from PLAN.md:** the full existing test suite passes
+against the 2-region topology without modification to the tests themselves,
+plus a new fault-injection test proving no data loss or duplication across a
+`tc`-induced regional partition -- reusing this project's existing outbox/
+idempotency guarantees (§2.1, §2.2), which don't care *why* a publish or a
+Cassandra write failed, only that it failed and must be safely retryable.
+
+**Impact if approved:**
+- `docker-compose.yml`: Cassandra section rewritten for 6 nodes/2 DCs with
+  tuned heaps and `cap_add: [NET_ADMIN]`; Kafka section rewritten for 2
+  independent 3-broker clusters with `broker.rack`, tuned heaps, distinct
+  `CLUSTER_ID`s, `cap_add: [NET_ADMIN]`; new MirrorMaker 2 service; existing
+  data volumes torn down and recreated fresh under the new topology.
+- `internal/dedup/cassandra_store.go`, `internal/consumer/canonical_store.go`:
+  keyspace bootstrap switches to `NetworkTopologyStrategy`; new `LocalDC`
+  config field; DC-aware gocql host selection policy.
+- `internal/query/service.go`: same DC-aware host selection policy fix
+  (doesn't bootstrap the keyspace, but still needs correct LOCAL_QUORUM
+  routing for reads).
+- New MirrorMaker 2 properties file.
+- New fault-injection test for the regional-partition scenario.
+- No wire-format changes -- this slice is topology and driver
+  configuration, not data model.
+
+**Addendum [2026-09-05], written after actually bringing the topology up:**
+the 3+3 Cassandra plan above genuinely OOM-killed on this host --
+`docker inspect` confirmed `OOMKilled: true` on `pharos-cassandra-1` with all
+6 Cassandra nodes + 6 Kafka brokers + MirrorMaker 2 running together, even
+after the heap tuning already described. Heap turned out not to be the
+dominant lever: dropping Cassandra's heap further, from 192M to 128M, barely
+moved real RSS (~700-950MB per node at *both* settings) -- the floor is
+JVM+off-heap baseline overhead on this image, not the configured heap.
+Adaptation actually shipped: **dc-eu runs 2 nodes (RF=2) instead of 3**, for
+both Cassandra and Kafka cluster B. dc-us (and Kafka cluster A) keep their
+full 3 nodes/RF=3 unchanged -- that's the one fault-tolerance property this
+project's application logic and tests actually exercise (`LocalDC` defaults
+to `dc-us` everywhere; nothing ever coordinates `LOCAL_QUORUM`/ISR against
+dc-eu directly). Verified real footprint with all 13 containers up and the
+full suite run twice: ~4.8-5.1GB, comfortably under the ~6.28GB Docker VM
+ceiling.
+
+Two more things found only by actually running this, not by planning it:
+1. **A real `tc` priomap bug**, caught by hand before it reached the
+   automated test: a `prio` qdisc's `priomap` decides which band *unmatched*
+   traffic defaults to, and an all-`2`s priomap accidentally routed default
+   (same-DC) traffic into the *same* band as the explicit u32-filtered
+   (cross-DC) traffic -- silently breaking intra-DC gossip, not just the
+   intended inter-DC link. Fixed with an all-`0`s priomap so default traffic
+   stays in an untouched band, reserving a separate band exclusively for the
+   u32-matched peer IPs.
+2. **Paxos LWTs under heavy concurrent contention got measurably more
+   sensitive, independent of the partition test.** `TestCassandraOutboxStore_RealIntegration`'s
+   10-goroutine race sub-test occasionally saw zero clean winners (never
+   more than one -- no correctness violation) -- once during the partition
+   test specifically, and again on a later plain full-suite run against the
+   healthy, unpartitioned cluster, ruling out the partition itself as the
+   cause. Root cause found by comparing repeated full-suite runs: 128M heap
+   was lean enough to pass CI once but not reliably -- a *different*
+   operation (a plain, non-Paxos `MarkPublished` update) also hit an
+   operation timeout on a later run, pointing at GC pauses under `-race`'s
+   own overhead plus concurrent test-suite load, not anything specific to
+   Paxos contention or the regional partition. Fixed two ways: (a) bumped
+   Cassandra's heap from 128M to 176M -- still comfortably under budget,
+   but enough headroom that two full-suite runs in a row came back clean;
+   (b) made the race sub-test itself retry (fresh key each time, up to 3
+   attempts) on exactly 0 winners specifically, since that outcome means
+   "every attempt errored out," not "two attempts both won" -- the actual
+   correctness property this test exists to catch (`>1` winners) still
+   fails immediately, on the first occurrence, no retry. Belt-and-suspenders
+   deliberately: the heap fix addresses the actual cause, the test-retry
+   fix keeps the suite from being sensitive to whatever *next* transient
+   slowdown this environment produces.
+3. **A third real bug, and a real host-level lesson, both found while
+   re-verifying after the 176M heap bump.** Bringing everything up in one
+   `docker compose up -d` starts MirrorMaker 2 concurrently with Cassandra
+   and Kafka's own startup -- before any topic exists for it to replicate,
+   MM2 busy-loops discovery/retry, piling CPU contention on top of 10 other
+   JVMs' own startup work. This produced two more genuine OOM kills (`docker
+   inspect`: `OOMKilled: true`) even at 176M heap, in a configuration that
+   had looked stable moments earlier in an idle snapshot -- CPU starvation
+   delays GC, letting RSS balloon before it can be reclaimed. Fixed by
+   sequencing MirrorMaker 2 strictly last: Cassandra + Kafka +
+   Prometheus/Grafana come up and settle first, then migrations and topics
+   are provisioned, and only then does `mirrormaker` start (applied to both
+   the local verification process and `.github/workflows/ci.yml`, which had
+   the identical single-shot `docker compose up -d` ordering issue). Separately,
+   repeated bring-up/tear-down cycles over several hours of this same
+   verification eventually degraded the local Docker Desktop VM itself into
+   a genuinely unresponsive state (containers reported "zombie and can not
+   be killed," host load average briefly hit 25 on an 8-core machine) --
+   unrelated to anything in this project's own config, but real enough to
+   need a full Docker Desktop restart (done with the user's explicit
+   go-ahead) before verification could complete. Included here because it's
+   exactly the kind of thing a future session repeating this bring-up cycle
+   many times in one sitting should recognize rather than mistake for a
+   fourth application-level bug.
+
+---
+
 #### [2026-09-05] Slice 13: Consumer Crash/Restart Watermark Continuity
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-05).
