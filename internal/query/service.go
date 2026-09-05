@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/archive"
 	"github.com/gasthecreator/pharos/internal/consumer"
+	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gocql/gocql"
 )
 
@@ -18,6 +20,12 @@ type CassandraServiceConfig struct {
 	Keyspace       string
 	Consistency    gocql.Consistency
 	ConnectTimeout time.Duration
+	// ArchiveDir is the cold-tier directory Slice 11's archival job writes
+	// to. Queries fall back here when the hot tier doesn't have what was
+	// asked for (or, for range/site-scoped queries, always also check here,
+	// since "some of this might have aged into cold storage" is the normal
+	// case for those query shapes, not an edge case).
+	ArchiveDir string
 }
 
 // DefaultCassandraServiceConfig returns standard connection settings for the Pharos Cassandra cluster.
@@ -28,12 +36,15 @@ func DefaultCassandraServiceConfig() CassandraServiceConfig {
 		Keyspace:       "pharos",
 		Consistency:    gocql.LocalQuorum, // RF=3, LOCAL_QUORUM reads/writes (Slice 7)
 		ConnectTimeout: 10 * time.Second,
+		ArchiveDir:     archive.DefaultConfig().Dir,
 	}
 }
 
-// CassandraService implements Service against live Apache Cassandra tables.
+// CassandraService implements Service against live Apache Cassandra tables,
+// falling back to the Slice 11 archive tier for data that's aged out of them.
 type CassandraService struct {
 	canonicalStore *consumer.CassandraCanonicalStore
+	archiveReader  *archive.Reader
 	session        *gocql.Session
 	mu             sync.RWMutex
 	closed         bool
@@ -70,8 +81,14 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 		return nil, fmt.Errorf("failed to open Cassandra session for DLQ inspection: %w", err)
 	}
 
+	archiveDir := cfg.ArchiveDir
+	if archiveDir == "" {
+		archiveDir = archive.DefaultConfig().Dir
+	}
+
 	svc := &CassandraService{
 		canonicalStore: cStore,
+		archiveReader:  archive.NewReader(archive.Config{Dir: archiveDir}),
 		session:        session,
 	}
 
@@ -108,23 +125,101 @@ func (s *CassandraService) EnsureSchemas() error {
 	return nil
 }
 
-// GetEvent performs a point lookup by idempotency_key against pharos.canonical_events (§2.4, §5).
+// GetEvent performs a point lookup by idempotency_key against
+// pharos.canonical_events (§2.4, §5), falling back to the Slice 11 archive
+// tier only on a hot-tier miss -- the overwhelmingly common case (recent
+// data) never pays the cost of touching the cold tier at all.
 func (s *CassandraService) GetEvent(ctx context.Context, idempotencyKey string) (*consumer.CanonicalRecord, error) {
-	return s.canonicalStore.GetEvent(ctx, idempotencyKey)
+	rec, err := s.canonicalStore.GetEvent(ctx, idempotencyKey)
+	if err == nil {
+		return rec, nil
+	}
+	if s.archiveReader != nil {
+		if archived, archErr := s.archiveReader.GetEvent(idempotencyKey); archErr == nil && archived != nil {
+			return archived, nil
+		}
+	}
+	return nil, err
 }
 
-// GetEventsByStudy answers "all events for trial X in date range Y" via pharos.events_by_study (§2.4, §5).
+// GetEventsByStudy answers "all events for trial X in date range Y" via
+// pharos.events_by_study (§2.4, §5), always also consulting the Slice 11
+// archive tier for the requested range and merging results -- "some of
+// what's being asked for might have aged into cold storage" is the normal
+// case for a date-range query, not an edge case worth special-casing.
 func (s *CassandraService) GetEventsByStudy(ctx context.Context, studyID string, startTime, endTime time.Time) ([]*consumer.CanonicalRecord, error) {
-	return s.canonicalStore.GetEventsByStudy(ctx, studyID, startTime, endTime)
+	hot, err := s.canonicalStore.GetEventsByStudy(ctx, studyID, startTime, endTime)
+	if err != nil {
+		return nil, err
+	}
+	if s.archiveReader == nil {
+		return hot, nil
+	}
+	cold, err := s.archiveReader.GetEventsByStudy(studyID, startTime, endTime)
+	if err != nil {
+		return nil, fmt.Errorf("archive fallback failed for study %s: %w", studyID, err)
+	}
+	return mergeCanonicalRecords(hot, cold), nil
 }
 
-// GetEventsBySite answers "all events from site Z" via pharos.events_by_site (§2.4, §5).
+// GetEventsBySite answers "all events from site Z" via pharos.events_by_site
+// (§2.4, §5), mirroring GetEventsByStudy's always-merge behavior.
 func (s *CassandraService) GetEventsBySite(ctx context.Context, siteID string, minLocalSeq int64) ([]*consumer.CanonicalRecord, error) {
-	return s.canonicalStore.GetEventsBySite(ctx, siteID, minLocalSeq)
+	hot, err := s.canonicalStore.GetEventsBySite(ctx, siteID, minLocalSeq)
+	if err != nil {
+		return nil, err
+	}
+	if s.archiveReader == nil {
+		return hot, nil
+	}
+	cold, err := s.archiveReader.GetEventsBySite(siteID, minLocalSeq)
+	if err != nil {
+		return nil, fmt.Errorf("archive fallback failed for site %s: %w", siteID, err)
+	}
+	return mergeCanonicalRecords(hot, cold), nil
 }
 
-// GetDLQEvent performs a point lookup on a rejected event by idempotency_key (§2.3).
+// mergeCanonicalRecords combines hot- and cold-tier results, deduplicating by
+// idempotency_key. A key can legitimately exist in both tiers briefly -- the
+// archival job exports before it deletes, so a row can be in both places for
+// the short window between those two steps (or indefinitely, if the delete
+// step failed and hasn't been retried yet; see internal/archive/job.go).
+// Content is identical either way, so which copy wins doesn't matter -- the
+// hot-tier copy is kept for no reason beyond "it was seen first."
+func mergeCanonicalRecords(hot, cold []*consumer.CanonicalRecord) []*consumer.CanonicalRecord {
+	if len(cold) == 0 {
+		return hot
+	}
+	seen := make(map[string]bool, len(hot))
+	merged := make([]*consumer.CanonicalRecord, 0, len(hot)+len(cold))
+	for _, r := range hot {
+		seen[r.IdempotencyKey] = true
+		merged = append(merged, r)
+	}
+	for _, r := range cold {
+		if !seen[r.IdempotencyKey] {
+			merged = append(merged, r)
+		}
+	}
+	return merged
+}
+
+// GetDLQEvent performs a point lookup on a rejected event by idempotency_key
+// (§2.3), falling back to the Slice 11 archive tier only on a hot-tier miss.
 func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey string) (*DLQRecord, error) {
+	rec, err := s.getDLQEventHot(ctx, idempotencyKey)
+	if err == nil {
+		return rec, nil
+	}
+	if s.archiveReader != nil {
+		if archived, archErr := s.archiveReader.GetDLQEvent(idempotencyKey); archErr == nil && archived != nil {
+			return dlqRecordFromArchive(archived), nil
+		}
+	}
+	return nil, err
+}
+
+func (s *CassandraService) getDLQEventHot(ctx context.Context, idempotencyKey string) (*DLQRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -185,9 +280,27 @@ func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey strin
 	return &rec, nil
 }
 
-// ListDLQEventsBySite retrieves rejected events for a specific clinical trial site (§2.3)
-// querying pharos.dead_letter_events_by_site directly by partition key site_id.
+// ListDLQEventsBySite retrieves rejected events for a specific clinical trial
+// site (§2.3) querying pharos.dead_letter_events_by_site directly by
+// partition key site_id, always also merging in the Slice 11 archive tier --
+// this query shape has no time bound, so "some of this site's rejections
+// might have aged into cold storage" is the normal case, not an edge case.
 func (s *CassandraService) ListDLQEventsBySite(ctx context.Context, siteID string, limit int) ([]*DLQRecord, error) {
+	hot, err := s.listDLQEventsBySiteHot(ctx, siteID, limit)
+	if err != nil {
+		return nil, err
+	}
+	if s.archiveReader == nil {
+		return hot, nil
+	}
+	cold, err := s.archiveReader.GetDLQEventsBySite(siteID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("archive fallback failed for site %s: %w", siteID, err)
+	}
+	return mergeDLQRecords(hot, cold, limit), nil
+}
+
+func (s *CassandraService) listDLQEventsBySiteHot(ctx context.Context, siteID string, limit int) ([]*DLQRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.closed {
@@ -207,7 +320,58 @@ func (s *CassandraService) ListDLQEventsBySite(ctx context.Context, siteID strin
 	return scanDLQRecords(iter)
 }
 
-// ListAllDLQEvents retrieves recently rejected events across all trial sites (§2.3).
+// dlqRecordFromArchive converts an archived dedup.DLQRecord (raw []byte
+// payload, the storage-level shape) into this package's query.DLQRecord
+// (string payload, the display-level shape) -- the same conversion
+// CassandraService already does implicitly when scanning Cassandra rows,
+// just made explicit here since the archive tier hands back the storage type
+// directly rather than a Cassandra row.
+func dlqRecordFromArchive(r *dedup.DLQRecord) *DLQRecord {
+	return &DLQRecord{
+		IdempotencyKey:   r.IdempotencyKey,
+		SiteID:           r.SiteID,
+		Payload:          string(r.Payload),
+		RejectionReason:  r.RejectionReason,
+		ValidationErrors: r.ValidationErrors,
+		RejectedAt:       r.RejectedAt,
+		Status:           string(r.Status),
+		ClaimedAt:        r.ClaimedAt,
+		PublishedAt:      r.PublishedAt,
+		KafkaTopic:       r.KafkaTopic,
+		KafkaPartition:   r.KafkaPartition,
+		KafkaOffset:      r.KafkaOffset,
+		ReplayedAt:       r.ReplayedAt,
+	}
+}
+
+// mergeDLQRecords combines hot- and cold-tier DLQ results, deduplicating by
+// idempotency_key (see mergeCanonicalRecords for why a key can legitimately
+// appear in both tiers), and honors the same limit the hot-tier query used.
+func mergeDLQRecords(hot []*DLQRecord, cold []*dedup.DLQRecord, limit int) []*DLQRecord {
+	seen := make(map[string]bool, len(hot))
+	merged := make([]*DLQRecord, 0, len(hot)+len(cold))
+	for _, r := range hot {
+		seen[r.IdempotencyKey] = true
+		merged = append(merged, r)
+	}
+	for _, r := range cold {
+		if limit > 0 && len(merged) >= limit {
+			break
+		}
+		if !seen[r.IdempotencyKey] {
+			merged = append(merged, dlqRecordFromArchive(r))
+		}
+	}
+	return merged
+}
+
+// ListAllDLQEvents retrieves recently rejected events across all trial sites
+// (§2.3). Deliberately hot-tier only, unlike the other DLQ query methods:
+// merging in the archive here would mean scanning every known site's cold
+// storage for what's meant to be a quick "what's rejected right now" check,
+// a much heavier cost for a query shape that's about recent activity by
+// nature -- anyone who needs archived DLQ history for a specific site
+// already has ListDLQEventsBySite, which does merge.
 func (s *CassandraService) ListAllDLQEvents(ctx context.Context, limit int) ([]*DLQRecord, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

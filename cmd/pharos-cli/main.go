@@ -12,7 +12,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/archive"
 	"github.com/gasthecreator/pharos/internal/consumer"
+	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/query"
 )
 
@@ -34,6 +36,10 @@ DLQ Inspection Commands:
 DLQ Replay Commands (§2.3, Slice 10 -- requires Central Ingestion, not --memory):
   dlq replay <idempotency_key>                              Resubmit one rejected event's stored payload
   dlq replay --all --site <site_id>                         Resubmit every PUBLISHED rejected event for a site
+
+Archive Commands (§2.4, Slice 11 -- requires Cassandra, not --memory):
+  archive run [--older-than 90d] [--archive-dir <path>] [--dry-run]
+                                                             Move records older than the threshold to cold storage
 
 Flags:
   --hosts        Comma-separated Cassandra hosts (default: 127.0.0.1)
@@ -181,6 +187,12 @@ func main() {
 		handleQuery(ctx, svc, remainingArgs[1:], jsonOutput)
 	case "dlq":
 		handleDLQ(ctx, svc, remainingArgs[1:], jsonOutput, centralURLFlag)
+	case "archive":
+		if useMemory {
+			fmt.Fprintf(os.Stderr, "archive is not meaningful with --memory: there's no real Cassandra data to archive\n")
+			os.Exit(1)
+		}
+		handleArchive(ctx, remainingArgs[1:], hostsFlag, portFlag, keyspaceFlag)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
@@ -473,6 +485,74 @@ func replayDLQRecord(centralURL, idempotencyKey string) (*dlqReplayResponse, int
 		return nil, resp.StatusCode, fmt.Errorf("failed to decode replay response: %w", err)
 	}
 	return &result, resp.StatusCode, nil
+}
+
+// handleArchive runs the Slice 11 data-retention job: connects directly to
+// the Cassandra canonical and outbox stores (not query.Service -- archival
+// is a Cassandra-specific operational concern the in-memory demo store has
+// no meaningful equivalent for) and moves rows older than the threshold to
+// the local cold-tier archive.
+func handleArchive(ctx context.Context, args []string, hosts string, port int, keyspace string) {
+	if len(args) == 0 || args[0] != "run" {
+		fmt.Fprintf(os.Stderr, "Usage: pharos-cli archive run [--older-than 90d] [--archive-dir <path>] [--dry-run]\n")
+		os.Exit(1)
+	}
+
+	archiveFlags := flag.NewFlagSet("archive run", flag.ExitOnError)
+	olderThan := archiveFlags.String("older-than", "2160h", "Age threshold (Go duration, e.g. 2160h for 90 days)")
+	archiveDir := archiveFlags.String("archive-dir", archive.DefaultConfig().Dir, "Local directory to write archive files to")
+	dryRun := archiveFlags.Bool("dry-run", false, "Report what would be archived without writing or deleting anything")
+	archiveFlags.Parse(args[1:])
+
+	age, err := time.ParseDuration(*olderThan)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid --older-than value %q: %v\n", *olderThan, err)
+		os.Exit(1)
+	}
+	cutoff := time.Now().UTC().Add(-age)
+
+	cStoreCfg := consumer.DefaultCassandraStoreConfig()
+	cStoreCfg.Hosts = strings.Split(hosts, ",")
+	cStoreCfg.Port = port
+	cStoreCfg.Keyspace = keyspace
+	canonicalStore, err := consumer.NewCassandraCanonicalStore(cStoreCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to connect canonical store: %v\n", err)
+		os.Exit(1)
+	}
+	defer canonicalStore.Close()
+
+	dedupCfg := dedup.DefaultCassandraConfig()
+	dedupCfg.Hosts = strings.Split(hosts, ",")
+	dedupCfg.Port = port
+	dedupCfg.Keyspace = keyspace
+	outboxStore, err := dedup.NewCassandraOutboxStore(dedupCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to connect outbox store: %v\n", err)
+		os.Exit(1)
+	}
+	defer outboxStore.Close()
+
+	archiveCfg := archive.Config{Dir: *archiveDir}
+
+	fmt.Printf("Archiving records older than %s (cutoff: %s)%s...\n", *olderThan, cutoff.Format(time.RFC3339), map[bool]string{true: " [DRY RUN]", false: ""}[*dryRun])
+
+	canonArchived, canonFailed, err := archive.RunCanonical(ctx, canonicalStore, archiveCfg, cutoff, *dryRun)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "canonical archival failed: %v\n", err)
+		os.Exit(1)
+	}
+	dlqArchived, dlqFailed, err := archive.RunDLQ(ctx, outboxStore, archiveCfg, cutoff, *dryRun)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "DLQ archival failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\nCanonical: %d archived, %d failed\nDLQ:       %d archived, %d failed\n",
+		canonArchived, canonFailed, dlqArchived, dlqFailed)
+	if canonFailed > 0 || dlqFailed > 0 {
+		os.Exit(1)
+	}
 }
 
 func printCanonicalRecordsTable(title string, records []*consumer.CanonicalRecord) {

@@ -18,6 +18,9 @@ coverage.html
 *.db-shm
 data/
 
+# Slice 11 cold-tier archive output (local, per-deployment, not project content)
+/archive/
+
 # IDE & Editor files
 .idea/
 .vscode/

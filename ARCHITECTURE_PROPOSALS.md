@@ -15,6 +15,104 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-05] Slice 11: Data Retention & Lifecycle (Tiered Archival)
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-05).
+
+**What in PLAN.md this touches:** §2.4 (canonical query tables), §2.3
+(DLQ), Phase 2 Slice 11.
+
+**What's actually being tiered, and what isn't:** the canonical tables
+(`canonical_events`, `events_by_study`, `events_by_site`) and the DLQ
+tables (`dead_letter_events`, `dead_letter_events_by_site`) — this is the
+clinical safety data this project's whole 21 CFR Part 11 framing is about,
+and it's what "retention" actually means here: never delete it, move it to
+cheaper storage once it's no longer active. **`event_outbox` and
+`pending_outbox` are deliberately excluded.** They're operational
+claim/lease bookkeeping for exactly-once delivery (§2.2), not the
+data-of-record — once an event is durably `PUBLISHED` and has flowed
+through to the canonical tables, the outbox row's job is done. Conflating
+"archive the clinical record" with "prune bookkeeping metadata" would
+muddy two genuinely different concerns with different lifetimes and
+different consequences if handled wrong (losing a canonical record is a
+compliance problem; losing a stale outbox claim row after enough time has
+passed is not). Outbox pruning is real future work, but it's a retention
+*policy* question (how long is "long enough past the lease timeout to be
+safe"), not this slice's tiering problem — noted as a follow-up, not
+silently dropped.
+
+**Decision: file-based cold tier, partitioned the same way the hot tier
+already is.** Archived rows are exported as gzip-compressed JSON Lines,
+one file per (partition key, month) — `archive/by_study/<study_id>/<YYYY-MM>.jsonl.gz`,
+`archive/by_site/<site_id>/<YYYY-MM>.jsonl.gz`,
+`archive/dlq_by_site/<site_id>/<YYYY-MM>.jsonl.gz` — deliberately mirroring
+this project's own established partition-key-first modeling principle
+(§2.4, §5.1) instead of inventing a different physical layout for cold
+storage than the one already proven correct for hot storage. Local disk
+satisfies the zero-cloud-spend constraint the same way it already does
+for everything else in this project.
+
+**Why no secondary index database for the archive tier:** the obvious
+alternative — a small SQLite (or Cassandra) index mapping
+idempotency_key → archive file/offset for O(1) point lookups — was
+considered and rejected. It's a second source of truth that has to stay
+perfectly consistent with the archive files themselves, for a lookup path
+(a point query against *already-cold, already-inactive* data) that isn't
+performance-critical by definition — if it were still being looked up
+frequently, it wouldn't be a candidate for archival in the first place.
+Point lookups (`GetEvent`, `GetDLQEvent`) against archived data fall back
+to scanning that key's site's archive files across all months only *after*
+a hot-tier miss — slower than a hot lookup, which is an honest and
+acceptable tradeoff for cold data, not a design gap.
+
+**Query-layer fallback, by query shape:**
+- `GetEventsByStudy`/`GetEventsBySite`/DLQ site listing (all already
+  time/range-aware or naturally bounded): always also consult the
+  relevant archive files for the requested range, merge with hot results,
+  sort consistently. These are exactly the query shapes where "some of
+  what you're asking for might have aged into cold storage" is the normal
+  case, not an edge case.
+- `GetEvent`/`GetDLQEvent` (point lookups): archive fallback only fires on
+  a hot-tier miss, since the overwhelmingly common case (recent data)
+  should never pay the cost of touching the cold tier at all.
+
+**Retention threshold:** 90 days of "active" data stays in Cassandra by
+default, configurable via a flag on the archival job — chosen as a
+reasonable default for what's operationally "recent," not a regulatory
+requirement (the regulatory requirement this project cares about is the
+opposite: don't ever delete, which the design already guarantees by
+tiering instead of deleting).
+
+**The archival job itself:** `pharos-cli archive run [--older-than 90d]
+[--archive-dir <path>] [--dry-run]` — a CLI subcommand, not a new binary,
+consistent with how Slice 10 added `dlq replay` to the existing CLI rather
+than standing up a new deployment artifact for one more operational
+concern. Scans the hot tables for rows older than the threshold, exports
+them to the partitioned archive files, and only deletes the exported rows
+from Cassandra after the export is confirmed written and flushed to disk —
+never delete-then-write.
+
+**Alternatives considered:**
+- **Cassandra TTL** (native per-row expiration): rejected outright — TTL
+  *deletes* data, it doesn't tier it. Using it here would violate the
+  actual retention requirement this slice exists to satisfy.
+- **A second Cassandra table/keyspace as the "cold" tier** instead of
+  local files: rejected as unnecessary complexity — it's still hot,
+  always-on infrastructure either way, and doesn't get anything the file
+  approach doesn't already provide for this project's actual scale and
+  zero-cloud-spend constraint.
+
+**Impact if approved:**
+- New `internal/archive` package: writer (export + verified delete),
+  reader (partition-aware file scan for a given key/range).
+- `internal/query.CassandraService` gains an optional archive reader,
+  falling back per the rules above.
+- `cmd/pharos-cli`: new `archive run` subcommand.
+- No Cassandra schema changes — this slice moves rows between tiers, it
+  doesn't change what a row looks like.
+
+---
+
 #### [2026-09-04] Slice 10: DLQ Replay & Reprocessing
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-04).

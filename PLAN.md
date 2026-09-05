@@ -341,6 +341,33 @@ with no change to their own content or intent.
   query layer able to fall back to archival lookup for old records rather
   than just losing access to them.
 
+  **Done 2026-09-05.** `internal/archive` package: gzip-JSONL cold tier
+  partitioned by study_id/site_id + month, mirroring this project's own
+  partition-key-first modeling instead of inventing a new physical layout.
+  `known_studies`/`known_sites` tracking tables (upserted alongside existing
+  writes) let the archival job discover what to scan without a secondary
+  index or `ALLOW FILTERING`, reusing `events_by_study`'s and
+  `dead_letter_events_by_site`'s already-efficient time-based clustering
+  for the actual scan. `pharos-cli archive run [--older-than 90d]
+  [--dry-run]` exports then deletes (never delete-then-write, confirmed via
+  `f.Sync()` before any Cassandra delete runs). `query.CassandraService`
+  falls back to the archive on a hot-tier miss (point lookups) or always
+  merges it in (range/site-scoped queries, since "some of this aged into
+  cold storage" is the normal case for those shapes, not an edge case).
+  `event_outbox`/`pending_outbox` deliberately excluded — operational
+  claim/lease bookkeeping, not the data-of-record; noted as a real,
+  separate follow-up, not silently dropped. Full reasoning in
+  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet`,
+  `go build`, `gofmt`, `golangci-lint` (0 issues) all clean; full suite
+  passed twice against the real multi-node cluster, including a flagship
+  integration test proving the whole lifecycle (seed old data → confirm
+  hot-tier queryable → archive for real → confirm deleted from Cassandra →
+  confirm still queryable via fallback). Verified live via the actual
+  `pharos-cli` binary too, not just Go tests: archived 172 real records
+  accumulated from this session's own testing, confirmed one directly gone
+  from Cassandra via `cqlsh`, and confirmed `pharos-cli query event` still
+  returns it correctly through the archive fallback.
+
 - **Slice 12 — Edge collector durability hardening.** A site's entire local
   durability guarantee today is one un-replicated SQLite file (this is what
   makes Slice 8's failure mode possible in the first place) — a disk

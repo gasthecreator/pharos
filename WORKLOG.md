@@ -40,6 +40,90 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 11 — data retention & lifecycle (tiered archival)
+
+**Author:** Claude Code
+
+**What:** New `internal/archive` package (gzip-JSONL cold tier partitioned
+by study_id/site_id + month), `known_studies`/`known_sites` Cassandra
+tracking tables, `pharos-cli archive run`, and archive fallback wired into
+every `query.CassandraService` method except `ListAllDLQEvents` (deliberately
+hot-tier only — see below).
+
+**Why:** Per `PLAN.md`'s Slice 11 — canonical and DLQ tables grew forever
+with no tiering plan, which was a real gap given this project's own 21 CFR
+Part 11 framing implies long retention of clinical safety data, not
+deletion.
+
+**How:** The interesting design problem was how the archival job finds
+"old" rows without a secondary index or `ALLOW FILTERING`, both already
+established anti-patterns in this project. Solved by reusing exactly the
+clustering this project already had: `events_by_study` is clustered by
+`event_time DESC` and `dead_letter_events_by_site` by `rejected_at DESC`,
+so both already support an efficient range query by age — the only real
+gap was "which studies/sites exist to scan," closed with two small
+tracking tables upserted alongside existing writes, mirroring
+`pending_outbox`'s own established time-bucketed-index pattern rather than
+inventing a new one. Archive files are laid out by the *same* partition
+keys as the hot tables (deliberately, not a new physical scheme for cold
+storage), append-only via concatenated gzip streams (valid per RFC 1952;
+Go's `gzip.Reader` defaults to `Multistream(true)`) so no file ever needs
+decompressing and recompressing just to add one record. Export is
+`fsync`'d before any Cassandra delete runs — never delete-then-write, and
+a failure between the two steps just leaves a row in both tiers rather
+than losing it.
+
+Deliberately excluded `event_outbox`/`pending_outbox` from archival:
+they're operational claim/lease bookkeeping (§2.2), not the data-of-record
+— conflating "archive the clinical record" with "prune bookkeeping
+metadata" would muddy two concerns with genuinely different consequences
+if handled wrong. Also deliberately kept `ListAllDLQEvents` hot-tier only
+(unlike every other DLQ/canonical query method) — merging the archive
+there would mean scanning every known site's cold storage for what's
+meant to be a quick "what's rejected right now" check.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry),
+`PLAN.md` (Slice 11 marked done), new `internal/archive` package
+(`archive.go`, `reader.go`, `job.go` + 2 test files),
+`internal/consumer/canonical_store.go` (`known_studies` tracking,
+`ListKnownStudies`, `DeleteArchivedEvent`), `internal/dedup/cassandra_store.go`
+(`known_sites` tracking, `ListKnownSites`, `ListDLQBySiteOlderThan`,
+`DeleteArchivedDLQRecord`), `internal/query/service.go` (archive fallback +
+merge logic), `cmd/pharos-cli/main.go` (`archive run` subcommand),
+`migrations/005_archive_tracking.cql`, `.gitignore` (`/archive/`).
+
+**Tests added/updated:** 10 unit tests in `internal/archive` (no infra
+needed — append/read round-trip proving the gzip-concatenation approach
+genuinely works, month-range math, partition-key sanitization, the
+`Reader`'s five query shapes against pure file fixtures).
+`TestArchivalLifecycle_RealCassandra` in `internal/query` is the flagship
+test: seeds a canonical + DLQ record with an old timestamp, proves both
+hot-tier queryable, runs the real archival job, proves both genuinely
+deleted from Cassandra (not just copied), proves both still queryable
+through the same `CassandraService` via the archive fallback, with the
+original DLQ rejection reason intact. Caught and fixed a real bug in this
+test itself while writing it: tried to backdate `dead_letter_events_by_site.rejected_at`
+via `UPDATE`, which doesn't work since it's a clustering (primary key)
+column Cassandra won't let you change in place — fixed by using a
+future-dated cutoff for the DLQ half of the test instead of fabricating
+history, and by not inventing a test-only `Session()` accessor that didn't
+exist. Also caught a real bug in the test's initial config (omitted
+`Consistency`, defaulting to `gocql.Any`, which Cassandra rejects for
+reads) before it ever ran clean.
+
+Full suite passed twice against the real multi-node cluster. Verified live
+via the actual `pharos-cli` binary too: archived 172 real records
+accumulated from this session's own testing, confirmed one directly gone
+from Cassandra via `cqlsh`, confirmed `pharos-cli query event` still
+returns it correctly through the archive fallback.
+
+**Follow-ups / left open:** `event_outbox`/`pending_outbox` pruning is
+real future work (a retention *policy* question — how long past the lease
+timeout is safe — not this slice's tiering problem), deliberately not
+addressed here.
+
+---
+
 ## [2026-09-04] Claude Code: Slice 10 — DLQ replay & reprocessing
 
 **Author:** Claude Code

@@ -147,6 +147,10 @@ func (s *CassandraOutboxStore) EnsureSchema() error {
 			kafka_offset bigint,
 			PRIMARY KEY ((site_id), rejected_at, idempotency_key)
 		) WITH CLUSTERING ORDER BY (rejected_at DESC, idempotency_key ASC);`,
+		`CREATE TABLE IF NOT EXISTS known_sites (
+			site_id text,
+			PRIMARY KEY (site_id)
+		);`,
 	}
 
 	for _, q := range queries {
@@ -382,6 +386,14 @@ func (s *CassandraOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord
 			) VALUES (?, ?, ?, ?, ?, ?, 'PUBLISHING', ?);`,
 			rec.SiteID, now, rec.IdempotencyKey, string(rec.Payload),
 			rec.RejectionReason, rec.ValidationErrors, now,
+		).WithContext(ctx).Exec()
+
+		// Archive-tracking (§2.3, Slice 11): lets the archival job discover
+		// which sites to scan via dead_letter_events_by_site's already-
+		// efficient rejected_at range query, mirroring known_studies on the
+		// canonical side.
+		_ = s.session.Query(
+			`INSERT INTO known_sites (site_id) VALUES (?);`, rec.SiteID,
 		).WithContext(ctx).Exec()
 
 		return ClaimResult{
@@ -638,6 +650,103 @@ func (s *CassandraOutboxStore) GetDLQRecord(ctx context.Context, idempotencyKey 
 }
 
 // Close terminates the Cassandra session.
+// ListDLQBySiteOlderThan returns PUBLISHED DLQ records for siteID rejected
+// before cutoff (§2.3, Slice 11) -- an efficient range query against
+// dead_letter_events_by_site's existing rejected_at clustering key, driving
+// the archival job's scan the same way GetEventsByStudy already drives the
+// canonical side. Only PUBLISHED records are archival candidates: a
+// still-PUBLISHING record's rejection isn't durably finished yet, and a
+// REPLAYED record already has a live outbox claim elsewhere -- archiving a
+// stale copy of either would be misleading.
+func (s *CassandraOutboxStore) ListDLQBySiteOlderThan(ctx context.Context, siteID string, cutoff time.Time) ([]*DLQRecord, error) {
+	query := `
+		SELECT idempotency_key, rejected_at, payload, rejection_reason, validation_errors,
+		       status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset, replayed_at
+		FROM dead_letter_events_by_site
+		WHERE site_id = ? AND rejected_at < ?;
+	`
+	iter := s.session.Query(query, siteID, cutoff).WithContext(ctx).Iter()
+
+	var records []*DLQRecord
+	var idKey, payload, reason, valErrors, status, topic string
+	var rejectedAt time.Time
+	var claimedAt, publishedAt, replayedAt *time.Time
+	var partition *int
+	var offset *int64
+
+	for iter.Scan(&idKey, &rejectedAt, &payload, &reason, &valErrors, &status, &claimedAt, &publishedAt, &topic, &partition, &offset, &replayedAt) {
+		if OutboxStatus(status) != StatusPublished {
+			continue
+		}
+		rec := &DLQRecord{
+			IdempotencyKey:   idKey,
+			SiteID:           siteID,
+			RejectedAt:       rejectedAt,
+			Payload:          []byte(payload),
+			RejectionReason:  reason,
+			ValidationErrors: valErrors,
+			Status:           OutboxStatus(status),
+			KafkaTopic:       topic,
+		}
+		if claimedAt != nil {
+			rec.ClaimedAt = *claimedAt
+		}
+		if publishedAt != nil {
+			rec.PublishedAt = *publishedAt
+		}
+		if partition != nil {
+			rec.KafkaPartition = *partition
+		}
+		if offset != nil {
+			rec.KafkaOffset = *offset
+		}
+		if replayedAt != nil {
+			rec.ReplayedAt = *replayedAt
+		}
+		records = append(records, rec)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list DLQ records for %s older than %s: %w", siteID, cutoff, err)
+	}
+	return records, nil
+}
+
+// ListKnownSites returns every site_id ever seen in a DLQ rejection (§2.3,
+// Slice 11) -- mirrors CassandraCanonicalStore.ListKnownStudies for the same
+// reason: an efficient way for the archival job to discover which
+// dead_letter_events_by_site partitions to scan.
+func (s *CassandraOutboxStore) ListKnownSites(ctx context.Context) ([]string, error) {
+	iter := s.session.Query(`SELECT site_id FROM known_sites;`).WithContext(ctx).Iter()
+	var sites []string
+	var siteID string
+	for iter.Scan(&siteID) {
+		sites = append(sites, siteID)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list known sites: %w", err)
+	}
+	return sites, nil
+}
+
+// DeleteArchivedDLQRecord removes one record from both dead_letter_events and
+// dead_letter_events_by_site (§2.3, Slice 11) -- called only after that
+// record has been durably exported to the cold tier and the export confirmed
+// flushed to disk, never delete-then-write.
+func (s *CassandraOutboxStore) DeleteArchivedDLQRecord(ctx context.Context, rec *DLQRecord) error {
+	if err := s.session.Query(
+		`DELETE FROM dead_letter_events WHERE idempotency_key = ?;`, rec.IdempotencyKey,
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("delete dead_letter_events failed: %w", err)
+	}
+	if err := s.session.Query(
+		`DELETE FROM dead_letter_events_by_site WHERE site_id = ? AND rejected_at = ? AND idempotency_key = ?;`,
+		rec.SiteID, rec.RejectedAt, rec.IdempotencyKey,
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("delete dead_letter_events_by_site failed: %w", err)
+	}
+	return nil
+}
+
 func (s *CassandraOutboxStore) Close() error {
 	if s.session != nil && !s.closed {
 		s.closed = true

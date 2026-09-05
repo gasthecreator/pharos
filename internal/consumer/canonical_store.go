@@ -152,6 +152,10 @@ func (s *CassandraCanonicalStore) EnsureSchema() error {
 			is_late boolean,
 			PRIMARY KEY ((site_id), local_seq, idempotency_key)
 		) WITH CLUSTERING ORDER BY (local_seq DESC, idempotency_key ASC);`,
+		`CREATE TABLE IF NOT EXISTS pharos.known_studies (
+			study_id text,
+			PRIMARY KEY (study_id)
+		);`,
 	}
 
 	for _, q := range queries {
@@ -162,7 +166,9 @@ func (s *CassandraCanonicalStore) EnsureSchema() error {
 	return nil
 }
 
-// SaveEvent writes the record to all three canonical tables concurrently using parallel idempotent upserts (§2.4).
+// SaveEvent writes the record to all three canonical tables, plus the
+// known_studies archive-tracking table (§2.4, Slice 11), concurrently using
+// parallel idempotent upserts (§2.4).
 func (s *CassandraCanonicalStore) SaveEvent(ctx context.Context, r *CanonicalRecord) error {
 	s.mu.RLock()
 	if s.closed {
@@ -199,7 +205,7 @@ func (s *CassandraCanonicalStore) SaveEvent(ctx context.Context, r *CanonicalRec
 	`
 
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, 4)
 
 	// 1. Table: canonical_events
 	wg.Add(1)
@@ -242,6 +248,19 @@ func (s *CassandraCanonicalStore) SaveEvent(ctx context.Context, r *CanonicalRec
 		).WithContext(ctx).Exec()
 		if err != nil {
 			errCh <- fmt.Errorf("insert events_by_site failed: %w", err)
+		}
+	}()
+
+	// 4. Table: known_studies (archive-tracking, §2.4 Slice 11) -- lets the
+	// archival job discover which studies to scan without ALLOW FILTERING
+	// or a secondary index, both already avoided elsewhere in this project.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := session.Query(`INSERT INTO pharos.known_studies (study_id) VALUES (?);`, r.StudyID).
+			WithContext(ctx).Exec()
+		if err != nil {
+			errCh <- fmt.Errorf("insert known_studies failed: %w", err)
 		}
 	}()
 
@@ -351,6 +370,74 @@ func (s *CassandraCanonicalStore) GetEventsBySite(ctx context.Context, siteID st
 		return nil, err
 	}
 	return results, nil
+}
+
+// ListKnownStudies returns every study_id ever seen, from the archive-
+// tracking table (§2.4, Slice 11) -- lets the archival job discover which
+// studies to scan via GetEventsByStudy's already-efficient event_time range
+// query, without a secondary index or ALLOW FILTERING across canonical_events.
+func (s *CassandraCanonicalStore) ListKnownStudies(ctx context.Context) ([]string, error) {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	iter := session.Query(`SELECT study_id FROM pharos.known_studies;`).WithContext(ctx).Iter()
+	var studies []string
+	var studyID string
+	for iter.Scan(&studyID) {
+		studies = append(studies, studyID)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list known studies: %w", err)
+	}
+	return studies, nil
+}
+
+// DeleteArchivedEvent removes one record from all three canonical tables
+// (§2.4, Slice 11) -- called only after that record has been durably
+// exported to the cold tier and the export confirmed flushed to disk, never
+// delete-then-write. All three tables mirror the same logical event, so all
+// three deletes use exactly the key columns SaveEvent originally wrote.
+func (s *CassandraCanonicalStore) DeleteArchivedEvent(ctx context.Context, r *CanonicalRecord) error {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, 3)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := session.Query(`DELETE FROM pharos.canonical_events WHERE idempotency_key = ?;`, r.IdempotencyKey).WithContext(ctx).Exec(); err != nil {
+			errCh <- fmt.Errorf("delete canonical_events failed: %w", err)
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := session.Query(`DELETE FROM pharos.events_by_study WHERE study_id = ? AND event_time = ? AND idempotency_key = ?;`,
+			r.StudyID, r.EventTime, r.IdempotencyKey).WithContext(ctx).Exec(); err != nil {
+			errCh <- fmt.Errorf("delete events_by_study failed: %w", err)
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := session.Query(`DELETE FROM pharos.events_by_site WHERE site_id = ? AND local_seq = ? AND idempotency_key = ?;`,
+			r.SiteID, r.LocalSeq, r.IdempotencyKey).WithContext(ctx).Exec(); err != nil {
+			errCh <- fmt.Errorf("delete events_by_site failed: %w", err)
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying Cassandra session.
