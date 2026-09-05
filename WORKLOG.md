@@ -40,6 +40,84 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 13 — consumer crash/restart watermark continuity
+
+**Author:** Claude Code
+
+**What:** A `consumer_watermark_checkpoints` Cassandra table (one row per
+consumer group) persisting `WatermarkTracker`'s state every 10s and on
+graceful shutdown; `cmd/pharos-consumer` restores it before the engine
+consumes anything, so a real process crash no longer resets the observable
+watermark to zero.
+
+**Why:** PLAN.md's Slice 13 was phrased as "prove the watermark cannot
+regress... now tested against process death" — worded as if the guarantee
+already existed and this slice was purely a testing exercise. Tracing
+`WatermarkTracker` before writing that test found it didn't: `previousEmitted`
+and the per-partition maps were plain in-process fields, reconstructed empty
+by `consumer.NewWatermarkTracker` on every `cmd/pharos-consumer` start. A real
+crash throws all of that away, and the strict monotonic guard's own
+zero-value escape hatch (`wt.previousEmitted.IsZero() || candidate.After(...)`)
+would then let whatever the first replayed message produces through
+unguarded — regressing the externally visible `pharos_consumer_watermark_seconds`
+gauge if that message's event_time is earlier than the pre-crash high point,
+which is entirely plausible since Kafka resumes from the last *committed*
+offset, not "wherever the in-memory watermark had gotten to."
+
+**How:** Full design in ARCHITECTURE_PROPOSALS.md's Slice 13 entry. Chose a
+dedicated Cassandra checkpoint table over deriving the watermark from the
+canonical query tables (no efficient per-Kafka-partition query exists there —
+same shape of rejection Slice 11 gave its own archive index) and over
+persisting on every message (unnecessary hot-path cost for state that only
+matters at the rare moment of a crash — same bounded-window reasoning as
+Slice 12's backup interval, just tighter at 10s since this state is
+load-bearing correctness, not just a disaster-recovery snapshot).
+`WatermarkTracker` gained `Snapshot()`/`Restore()`; `CanonicalStore` gained
+`SaveWatermarkCheckpoint`/`LoadWatermarkCheckpoint` on both the Cassandra and
+in-memory implementations.
+
+Writing the flagship fault-injection test surfaced a second, genuinely
+separate bug: Cassandra's `timestamp` column is millisecond-precision, so a
+nanosecond-precision Go `time.Time` round-tripped through the checkpoint came
+back very slightly *earlier* than it went in — tripping the exact guard this
+slice exists to fix, but for a spurious reason (storage precision) rather
+than a real one. Fixed at the correct boundary: `Snapshot()` truncates all
+three timestamp fields to millisecond precision itself, so its return value
+already equals whatever a round trip through Cassandra will produce, whether
+or not persistence actually happens.
+
+Also found, while writing the same test: a brand-new Kafka consumer group
+on the shared `kafka.MainTopic` has to wade through this entire session's
+accumulated backlog (thousands of messages from every other test run this
+session, since `NewKafkaReader`'s `StartOffset: FirstOffset` is the correct
+production default for a genuinely new group) before ever reaching a test's
+own freshly-published messages — not a bug, but a real test-design trap.
+Fixed by giving the fault-injection test its own dedicated, single-partition,
+per-test topic instead of sharing `MainTopic`.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry), `PLAN.md`
+(Slice 13 marked done), `internal/consumer/watermark.go`
+(`WatermarkCheckpoint` type, `Snapshot`/`Restore`, millisecond truncation),
+`internal/consumer/canonical_store.go` (`consumer_watermark_checkpoints`
+table, `SaveWatermarkCheckpoint`/`LoadWatermarkCheckpoint` on both
+`CassandraCanonicalStore` and `MemoryCanonicalStore`),
+`internal/consumer/watermark_test.go` (5 new tests), `cmd/pharos-consumer/main.go`
+(load-and-restore at startup, periodic checkpoint goroutine, save-on-shutdown),
+new `internal/faultinjection/consumer_restart_watermark_test.go`.
+
+**Verification:** `go build ./...`, `go vet ./...` clean. Full suite
+(`go test -race -count=1 ./...`) run twice against the live 3-node Cassandra
+/ 3-broker Kafka cluster, both passes clean, including the new fault-injection
+test against real infrastructure. Live binary verification: real `pharos-edge`
+→ `pharos-ingestion` → `pharos-consumer` pipeline, a real event submitted and
+processed, checkpoint confirmed present via `cqlsh`, consumer `kill -9`'d
+(genuine crash, no graceful shutdown), restarted with the same `--kafka-group`
+— log confirmed restoration from the exact persisted checkpoint, and the next
+status tick reported the identical (not regressed) watermark while correctly
+flagging the newly-processed event as late against the restored floor.
+
+---
+
 ## [2026-09-05] Claude Code: Slice 12 — edge collector durability hardening
 
 **Author:** Claude Code

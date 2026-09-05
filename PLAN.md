@@ -410,6 +410,45 @@ with no change to their own content or intent.
   tested against partition reawakening), now tested against process death
   specifically.
 
+  **Done 2026-09-05.** Investigating before writing the test found the
+  guarantee didn't actually exist yet across a real restart:
+  `WatermarkTracker`'s `previousEmitted`/per-partition state was plain
+  in-process memory, reset to zero on every `cmd/pharos-consumer` start, so
+  the strict monotonic guard's own zero-value escape hatch would let a
+  restart's first replayed message (Kafka resumes from the last *committed*
+  offset, not "wherever the in-memory watermark had gotten to") silently
+  regress the externally observed `pharos_consumer_watermark_seconds` gauge.
+  Fixed rather than merely tested around, per ARCHITECTURE_PROPOSALS.md's
+  Slice 13 entry: a `consumer_watermark_checkpoints` Cassandra table (one row
+  per consumer group, `map<int, timestamp>` columns matching the tracker's
+  own shape) persists `previousEmitted` + per-partition high-watermark/
+  activity every 10s and on graceful shutdown; `cmd/pharos-consumer`
+  restores it via `WatermarkTracker.Restore` before the engine consumes
+  anything. Also found and fixed a real precision bug while writing the
+  fault-injection test: Cassandra's `timestamp` column is millisecond-only,
+  so a nanosecond-precision Go time round-tripped through it came back
+  slightly *earlier*, tripping the guard as a false regression — fixed by
+  truncating to millisecond precision inside `Snapshot()` itself, so its
+  return value already equals whatever persistence will produce. Verified
+  with unit tests (`internal/consumer/watermark_test.go`, including a
+  dedicated millisecond-truncation regression test) and the flagship
+  fault-injection test `internal/faultinjection/consumer_restart_watermark_test.go`:
+  real Kafka + real Cassandra, a dedicated single-partition test topic
+  (avoids wading through this session's entire accumulated topic backlog
+  under a fresh consumer group), one real event processed and checkpointed,
+  the engine discarded with no graceful save (a true crash, not a clean
+  shutdown), a second real event published with an *earlier* event_time than
+  the first (exactly what post-restart replay can hand you), a brand-new
+  engine restored from the Cassandra-persisted checkpoint and proven to
+  never report a watermark below the pre-crash floor. Also verified against
+  the actual built `pharos-consumer` binary: a fresh consumer group
+  processing this session's real Kafka backlog, `kill -9`'d mid-stream (no
+  graceful shutdown), restarted with the same `--kafka-group` — log
+  confirmed `Watermark tracker restored from checkpoint (...previous_emitted:
+  2026-09-05T02:03:28Z)`, and the next status tick reported the identical
+  watermark, not a regression, while correctly flagging the newly-processed
+  event as late against the restored floor.
+
 - **Slice 14 — Multi-region Cassandra + Kafka (simulated).** Explicit
   constraint: no real geographically-distributed hardware exists for this
   project. The response is to simulate the topology and its failure modes

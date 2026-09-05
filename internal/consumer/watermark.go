@@ -228,22 +228,30 @@ func (wt *WatermarkTracker) GetLateArrivalAudits() []LateArrivalAudit {
 }
 
 // Snapshot returns a deep copy of the tracker's persistable state, suitable
-// for saving as a WatermarkCheckpoint (§2.4, Slice 13). Safe to call
-// concurrently with ProcessEvent.
+// for saving as a WatermarkCheckpoint (§2.4, Slice 13). All timestamps are
+// truncated to millisecond precision -- Cassandra's timestamp column type is
+// itself only millisecond-precision, so persisting a Go time.Time with finer
+// resolution and reading it back would otherwise silently produce a value
+// microseconds/nanoseconds *earlier* than the original, which is exactly
+// the kind of spurious "regression" the strict monotonic guard exists to
+// catch and would incorrectly flag. Truncating here, at the point state is
+// about to be persisted, makes Snapshot()'s return value exactly what a
+// round trip through the checkpoint store will produce, whether or not
+// persistence actually happens. Safe to call concurrently with ProcessEvent.
 func (wt *WatermarkTracker) Snapshot() WatermarkCheckpoint {
 	wt.mu.RLock()
 	defer wt.mu.RUnlock()
 
 	high := make(map[int]time.Time, len(wt.partitionHighWatermark))
 	for p, t := range wt.partitionHighWatermark {
-		high[p] = t
+		high[p] = t.Truncate(time.Millisecond)
 	}
 	activity := make(map[int]time.Time, len(wt.partitionLastActivity))
 	for p, t := range wt.partitionLastActivity {
-		activity[p] = t
+		activity[p] = t.Truncate(time.Millisecond)
 	}
 	return WatermarkCheckpoint{
-		PreviousEmitted:        wt.previousEmitted,
+		PreviousEmitted:        wt.previousEmitted.Truncate(time.Millisecond),
 		PartitionHighWatermark: high,
 		PartitionLastActivity:  activity,
 	}

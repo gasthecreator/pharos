@@ -224,3 +224,38 @@ func TestWatermarkTracker_SnapshotIsIndependentCopy(t *testing.T) {
 		t.Fatalf("expected snapshot's partition high watermark to remain %v after further mutation, got %v", originalHigh, snap.PartitionHighWatermark[0])
 	}
 }
+
+// TestWatermarkTracker_SnapshotTruncatesToMillisecondPrecision guards against
+// a real bug found while writing the Slice 13 fault-injection test: Cassandra's
+// timestamp column is millisecond-precision, so a Go time.Time with finer
+// resolution silently loses precision on a round trip through the checkpoint
+// store, making the restored floor look *earlier* than the true in-memory
+// value -- exactly the shape of "regression" the strict monotonic guard
+// exists to catch, but a spurious one caused by storage precision, not logic.
+// Snapshot must truncate to millisecond precision itself, so its return value
+// already equals whatever a round trip through Cassandra would produce.
+func TestWatermarkTracker_SnapshotTruncatesToMillisecondPrecision(t *testing.T) {
+	baseTime := time.Date(2026, 9, 5, 12, 0, 0, 123456789, time.UTC) // sub-millisecond component: 456789ns
+	tracker := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+
+	tracker.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), baseTime)
+	snap := tracker.Snapshot()
+
+	if got, want := snap.PreviousEmitted.Nanosecond()%int(time.Millisecond), 0; got != want {
+		t.Fatalf("expected PreviousEmitted truncated to millisecond precision (sub-ms remainder 0), got remainder %dns in %v", got, snap.PreviousEmitted)
+	}
+	if got, want := snap.PartitionHighWatermark[0].Nanosecond()%int(time.Millisecond), 0; got != want {
+		t.Fatalf("expected PartitionHighWatermark truncated to millisecond precision, got remainder %dns", got)
+	}
+	if got, want := snap.PartitionLastActivity[0].Nanosecond()%int(time.Millisecond), 0; got != want {
+		t.Fatalf("expected PartitionLastActivity truncated to millisecond precision, got remainder %dns", got)
+	}
+
+	// Restoring the truncated checkpoint must not itself look like a
+	// regression versus the checkpoint's own (already-truncated) floor.
+	restored := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+	restored.Restore(snap)
+	if wm := restored.CurrentWatermark(baseTime.Add(time.Minute)); wm.Before(snap.PreviousEmitted) {
+		t.Fatalf("restored watermark %v is before the checkpoint's own PreviousEmitted %v", wm, snap.PreviousEmitted)
+	}
+}
