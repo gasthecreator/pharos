@@ -50,25 +50,59 @@ wait_for_log() {
   done
 }
 
-log "Checking Cassandra and Kafka are up"
-if ! docker ps --format '{{.Names}}' | grep -q '^pharos-cassandra$'; then
-  info "Starting Cassandra and Kafka via docker compose (this can take ~30-40s the first time)..."
-  docker compose up -d
+log "Checking TLS materials (Slice 15: Auth & TLS)"
+if [ ! -f "certs/ca-cert.pem" ]; then
+  info "No certs/ca-cert.pem found -- generating project CA + service certs..."
+  ./scripts/generate_certs.sh
+else
+  info "certs/ca-cert.pem already present, reusing it."
 fi
-info "Waiting for both containers to report healthy..."
-for i in $(seq 1 60); do
-  cass_ok=$(docker inspect --format '{{.State.Health.Status}}' pharos-cassandra 2>/dev/null || echo "missing")
-  kafka_ok=$(docker inspect --format '{{.State.Health.Status}}' pharos-kafka 2>/dev/null || echo "missing")
-  if [ "$cass_ok" = "healthy" ] && [ "$kafka_ok" = "healthy" ]; then
+
+# Cassandra (dc-us: cassandra-1/2/3, dc-eu: cassandra-4) and Kafka cluster A
+# (kafka-1/2/3, dc-us) + cluster B (kafka-4, dc-eu) are what this project's
+# application code actually talks to (§2.4, Slice 7/14). MirrorMaker 2 is
+# deliberately brought up *last*, after Kafka topics exist -- starting it
+# concurrently with everything else has caused real, repeated OOM kills on
+# this host (docker-compose.yml's Kafka section comment, and
+# ARCHITECTURE_PROPOSALS.md's Slice 14 addendum #3): before any topic
+# exists, MM2 busy-loops discovery/retry, piling CPU contention on top of
+# 10 other JVMs' own startup work, which delays GC long enough for RSS to
+# balloon past the Docker VM's ceiling. This mirrors .github/workflows/ci.yml
+# exactly, which hit and fixed the identical ordering issue.
+CORE_CONTAINERS="pharos-cassandra-1 pharos-cassandra-2 pharos-cassandra-3 pharos-cassandra-4 pharos-kafka-1 pharos-kafka-2 pharos-kafka-3 pharos-kafka-4"
+
+log "Checking Cassandra + Kafka are up (without MirrorMaker 2 yet)"
+docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana
+
+info "Waiting for Cassandra + Kafka to report healthy (this can take a couple of minutes the first time)..."
+all_healthy=false
+for i in $(seq 1 90); do
+  all_healthy=true
+  for c in $CORE_CONTAINERS; do
+    status=$(docker inspect --format '{{.State.Health.Status}}' "$c" 2>/dev/null || echo "missing")
+    if [ "$status" != "healthy" ]; then
+      all_healthy=false
+    fi
+  done
+  if [ "$all_healthy" = true ]; then
     break
   fi
-  sleep 2
+  sleep 3
 done
-if [ "$cass_ok" != "healthy" ] || [ "$kafka_ok" != "healthy" ]; then
-  echo "Cassandra/Kafka did not become healthy in time (cassandra=$cass_ok, kafka=$kafka_ok)." >&2
+if [ "$all_healthy" != true ]; then
+  echo "Cassandra/Kafka did not become healthy in time:" >&2
+  for c in $CORE_CONTAINERS; do
+    echo "  $c: $(docker inspect --format '{{.State.Health.Status}}' "$c" 2>/dev/null || echo missing)" >&2
+  done
   exit 1
 fi
-info "Both healthy."
+info "Cassandra + Kafka healthy."
+
+log "Provisioning Kafka topics with regulatory retention policies (§4)"
+./scripts/create_topics.sh
+
+log "Starting MirrorMaker 2 (now that topics exist)"
+docker compose up -d mirrormaker
 
 log "Building binaries"
 make build
@@ -76,20 +110,36 @@ make build
 INGESTION_PORT=$(find_free_port 8091)
 EDGE_PORT=$(find_free_port 8080)
 
-log "Starting pharos-ingestion on :$INGESTION_PORT"
-./bin/pharos-ingestion --port "$INGESTION_PORT" > "$LOG_DIR/ingestion.log" 2>&1 &
+log "Provisioning a per-site API key for $SITE_ID (§2.1, §2.2, Slice 15: Auth & TLS)"
+KEY_OUTPUT=$(./bin/pharos-cli site create-key "$SITE_ID" --ca-cert certs/ca-cert.pem)
+API_KEY=$(printf '%s\n' "$KEY_OUTPUT" | awk '/Save this now/{getline; getline; print; exit}' | tr -d '[:space:]')
+if [ -z "$API_KEY" ]; then
+  echo "Failed to provision an API key for $SITE_ID:" >&2
+  printf '%s\n' "$KEY_OUTPUT" >&2
+  exit 1
+fi
+info "API key provisioned for $SITE_ID."
+
+log "Starting pharos-ingestion on :$INGESTION_PORT (TLS + per-site auth enabled, Slice 15)"
+./bin/pharos-ingestion --port "$INGESTION_PORT" \
+  --tls-cert certs/ingestion-cert.pem --tls-key certs/ingestion-key.pem \
+  --ca-cert certs/ca-cert.pem \
+  > "$LOG_DIR/ingestion.log" 2>&1 &
 PIDS+=($!)
 wait_for_log "$LOG_DIR/ingestion.log" "Central Ingestion ready"
 
 log "Starting pharos-consumer"
-./bin/pharos-consumer > "$LOG_DIR/consumer.log" 2>&1 &
+./bin/pharos-consumer --ca-cert certs/ca-cert.pem > "$LOG_DIR/consumer.log" 2>&1 &
 PIDS+=($!)
 wait_for_log "$LOG_DIR/consumer.log" "listening for adverse event messages"
 
 log "Starting pharos-edge for site $SITE_ID on :$EDGE_PORT"
 ./bin/pharos-edge --site-id "$SITE_ID" --port "$EDGE_PORT" \
-  --central-url "http://localhost:$INGESTION_PORT/api/v1/events" \
-  --db-path "$EDGE_DB" > "$LOG_DIR/edge.log" 2>&1 &
+  --central-url "https://localhost:$INGESTION_PORT/api/v1/events" \
+  --db-path "$EDGE_DB" \
+  --api-key "$API_KEY" \
+  --ca-cert certs/ca-cert.pem \
+  > "$LOG_DIR/edge.log" 2>&1 &
 PIDS+=($!)
 wait_for_log "$LOG_DIR/edge.log" "HTTP capture endpoint listening"
 
@@ -108,42 +158,79 @@ RESP=$(curl -s -X POST "http://localhost:$EDGE_PORT/api/v1/adverse-events" \
     \"location\": {\"reference\": \"Location/$SITE_ID\"}
   }")
 info "Edge response: $RESP"
-IDKEY="$SITE_ID:1"
+# The idempotency key's local_seq component is a composite instance-epoch +
+# counter value (§2.2, Slice 8), not a simple incrementing integer -- it
+# must be read back from the response, not assumed to be "$SITE_ID:1".
+IDKEY=$(printf '%s' "$RESP" | sed -n 's/.*"idempotency_key":"\([^"]*\)".*/\1/p')
+if [ -z "$IDKEY" ]; then
+  echo "Could not parse idempotency_key from edge response: $RESP" >&2
+  exit 1
+fi
 
 log "Waiting for it to flow edge -> Central Ingestion -> Kafka -> consumer -> Cassandra"
-for i in $(seq 1 20); do
-  if ./bin/pharos-cli query event "$IDKEY" >/dev/null 2>&1; then
+# Generous budget on purpose: the consumer group is shared and persistent
+# (Kafka topic retention is measured in days, and named Docker volumes
+# survive between runs), so a fresh consumer process here may first have to
+# catch up on backlog left by earlier demo/test runs before it ever reaches
+# this run's own event -- a few seconds is not a safe assumption.
+FOUND=false
+for i in $(seq 1 90); do
+  if ./bin/pharos-cli query event "$IDKEY" --ca-cert certs/ca-cert.pem >/dev/null 2>&1; then
+    FOUND=true
     break
   fi
-  sleep 0.5
+  if [ $((i % 15)) -eq 0 ]; then
+    info "Still waiting (${i}s)... consumer may be catching up on backlog from earlier runs."
+  fi
+  sleep 1
 done
+if [ "$FOUND" != true ]; then
+  echo "Event $IDKEY never showed up in the canonical store within the wait budget." >&2
+  echo "Check $LOG_DIR/consumer.log for consumer lag/backlog, or rerun -- this is a timing issue, not a correctness one." >&2
+  exit 1
+fi
 
 log "Querying it back by idempotency key"
-./bin/pharos-cli query event "$IDKEY"
+./bin/pharos-cli query event "$IDKEY" --ca-cert certs/ca-cert.pem
 
 log "Querying by site (answers: all events from site Z)"
-./bin/pharos-cli query site "$SITE_ID"
+./bin/pharos-cli query site "$SITE_ID" --ca-cert certs/ca-cert.pem
 
 log "Querying by study and date range (answers: all events for trial X in range Y)"
-./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z
+./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem
 
 log "Submitting a malformed event (missing subject and event fields)"
 info "The edge buffers it durably anyway — it never validates, by design (PLAN.md §2.3)."
-curl -s -X POST "http://localhost:$EDGE_PORT/api/v1/adverse-events" \
+RESP2=$(curl -s -X POST "http://localhost:$EDGE_PORT/api/v1/adverse-events" \
   -H "Content-Type: application/json" \
-  -d "{\"resourceType\":\"AdverseEvent\",\"actuality\":\"actual\",\"date\":\"2026-08-28T09:00:00Z\",\"recordedDate\":\"2026-08-30T05:14:00Z\",\"location\":{\"reference\":\"Location/$SITE_ID\"}}"
-echo
+  -d "{\"resourceType\":\"AdverseEvent\",\"actuality\":\"actual\",\"date\":\"2026-08-28T09:00:00Z\",\"recordedDate\":\"2026-08-30T05:14:00Z\",\"location\":{\"reference\":\"Location/$SITE_ID\"}}")
+info "Edge response: $RESP2"
+IDKEY2=$(printf '%s' "$RESP2" | sed -n 's/.*"idempotency_key":"\([^"]*\)".*/\1/p')
+if [ -z "$IDKEY2" ]; then
+  echo "Could not parse idempotency_key from edge response: $RESP2" >&2
+  exit 1
+fi
 
 log "Waiting for Central Ingestion to reject it and route it to the dead-letter store"
-for i in $(seq 1 20); do
-  if ./bin/pharos-cli dlq list --site "$SITE_ID" 2>/dev/null | grep -q "$SITE_ID:2"; then
+# The DLQ write happens directly in Central Ingestion's request path (it
+# writes dead_letter_events to Cassandra itself, not via the consumer), so
+# this should be fast -- but give it a real budget rather than assuming so.
+FOUND=false
+for i in $(seq 1 30); do
+  if ./bin/pharos-cli dlq list --site "$SITE_ID" --ca-cert certs/ca-cert.pem 2>/dev/null | grep -q "$IDKEY2"; then
+    FOUND=true
     break
   fi
-  sleep 0.5
+  sleep 1
 done
+if [ "$FOUND" != true ]; then
+  echo "Rejected event $IDKEY2 never showed up in the DLQ within the wait budget." >&2
+  echo "Check $LOG_DIR/ingestion.log for the rejection, or rerun." >&2
+  exit 1
+fi
 
 log "Inspecting the dead-letter queue for this site"
-./bin/pharos-cli dlq list --site "$SITE_ID"
+./bin/pharos-cli dlq list --site "$SITE_ID" --ca-cert certs/ca-cert.pem
 
 log "Demo complete."
 info "Nothing was lost, nothing was duplicated, and the rejection is fully inspectable."

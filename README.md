@@ -42,20 +42,55 @@ Go, Apache Kafka (KRaft mode, no ZooKeeper), Apache Cassandra — all self-hoste
 
 ## Running it locally
 
+Cassandra runs as a 2-datacenter, 4-node cluster (dc-us: 3 nodes/RF=3, dc-eu:
+1 node/RF=1) and Kafka as two independent clusters (cluster A: 3 brokers/
+dc-us, cluster B: 1 broker/dc-eu) with MirrorMaker 2 replicating between
+them (Slices 7, 14). Bring MirrorMaker 2 up *after* Cassandra/Kafka are
+healthy and topics exist, not concurrently with everything else — starting
+it before any topic exists makes it busy-loop discovery/retry, which has
+caused real OOM kills on a memory-constrained host (see `docker-compose.yml`'s
+own comments and `ARCHITECTURE_PROPOSALS.md`'s Slice 14 addendum).
+
+Every Cassandra/Kafka client connection and Central Ingestion's own HTTP
+listener require TLS by default (Slice 15) — `scripts/generate_certs.sh`
+issues a project-owned CA and every service certificate into `certs/`
+(gitignored; regenerate any time). Central Ingestion also requires per-site
+API key auth by default (`--enable-auth` defaults `true`) — a site must be
+provisioned with `pharos-cli site create-key` before its edge collector can
+submit anything.
+
 ```bash
-docker compose up -d       # Kafka + Cassandra
-make build                 # builds bin/pharos-edge, pharos-ingestion, pharos-consumer, pharos-cli
-./bin/pharos-ingestion --port 8091 &
-./bin/pharos-consumer &
+./scripts/generate_certs.sh   # one-time: project CA + every service's TLS cert, into certs/
+
+docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 \
+  kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana   # Cassandra + Kafka + observability
+# wait for all eight to report healthy: docker compose ps
+
+./scripts/create_topics.sh    # provisions topics with their real retention policies
+docker compose up -d mirrormaker   # bring this up last -- see note above
+
+make build                    # builds bin/pharos-edge, pharos-ingestion, pharos-consumer, pharos-cli
+
+./bin/pharos-cli site create-key SITE-DEMO-NG --ca-cert certs/ca-cert.pem
+# API key created for site SITE-DEMO-NG. Save this now -- it cannot be shown again:
+#   phk_...
+# save the printed key, e.g.: SITE_API_KEY=phk_...
+
+./bin/pharos-ingestion --port 8091 \
+  --tls-cert certs/ingestion-cert.pem --tls-key certs/ingestion-key.pem \
+  --ca-cert certs/ca-cert.pem &
+./bin/pharos-consumer --ca-cert certs/ca-cert.pem &
 ./bin/pharos-edge --site-id SITE-DEMO-NG --port 8080 \
-  --central-url http://localhost:8091/api/v1/events --db-path /tmp/demo-edge.db &
+  --central-url https://localhost:8091/api/v1/events \
+  --api-key "$SITE_API_KEY" --ca-cert certs/ca-cert.pem \
+  --db-path /tmp/demo-edge.db &
 ```
 
 Schemas and Kafka topic retention are bootstrapped automatically on startup — no manual migration step.
 
 ### Watch it work
 
-Prefer to just watch it happen? `./scripts/demo.sh` runs every step below automatically against real Cassandra/Kafka — starts the three services, submits a valid event, queries it back through the full pipeline, submits a malformed one, and shows it land in the DLQ — then shuts everything down. What follows is the same walkthrough by hand.
+Prefer to just watch it happen? `./scripts/demo.sh` runs every step below automatically against the real multi-node Cassandra/Kafka cluster — generates TLS certs if needed, brings up the full topology in the sequence above, provisions a per-site API key, starts the three services, submits a valid event, queries it back through the full pipeline, submits a malformed one, and shows it land in the DLQ — then shuts everything down. What follows is the same walkthrough by hand.
 
 Submit a valid adverse event to the edge:
 
@@ -73,15 +108,23 @@ curl -X POST http://localhost:8080/api/v1/adverse-events \
     "study": [{"reference": "ResearchStudy/LILLY-401"}],
     "location": {"reference": "Location/SITE-DEMO-NG"}
   }'
-# {"status":"QUEUED","idempotency_key":"SITE-DEMO-NG:1", ...}
+# {"status":"QUEUED","idempotency_key":"SITE-DEMO-NG:1758...", "local_seq":1758..., ...}
 ```
 
-A few seconds later, query it back through the full pipeline (edge → Central Ingestion → Kafka → consumer → Cassandra):
+The edge is still a plain local HTTP listener (TLS in Slice 15 is scoped to
+the connections that actually leave the trusted site network — Central
+Ingestion, Cassandra, Kafka — not the on-site capture endpoint). The
+`local_seq` in the response is a composite instance-epoch + counter value
+(Slice 8), not a simple incrementing integer, so copy the actual
+`idempotency_key` from your own response for the next step rather than
+assuming `SITE-DEMO-NG:1`.
+
+A few seconds later, query it back through the full pipeline (edge → Central Ingestion → Kafka → consumer → Cassandra) using the `idempotency_key` from the response above:
 
 ```bash
-./bin/pharos-cli query event SITE-DEMO-NG:1
-./bin/pharos-cli query site SITE-DEMO-NG
-./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z
+./bin/pharos-cli query event SITE-DEMO-NG:1758... --ca-cert certs/ca-cert.pem
+./bin/pharos-cli query site SITE-DEMO-NG --ca-cert certs/ca-cert.pem
+./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem
 ```
 
 Now submit something invalid (missing `subject` and `event`) — the edge still buffers it durably (it never validates, by design), Central Ingestion rejects it with a structured reason, and it lands somewhere you can actually see it:
@@ -91,11 +134,11 @@ curl -X POST http://localhost:8080/api/v1/adverse-events \
   -H "Content-Type: application/json" \
   -d '{"resourceType":"AdverseEvent","actuality":"actual","date":"2026-08-28T09:00:00Z","recordedDate":"2026-08-30T05:14:00Z","location":{"reference":"Location/SITE-DEMO-NG"}}'
 
-./bin/pharos-cli dlq list --site SITE-DEMO-NG
-# SITE-DEMO-NG:2  ...  subject reference is required (e.g., 'Patient/<id>')  PUBLISHED
+./bin/pharos-cli dlq list --site SITE-DEMO-NG --ca-cert certs/ca-cert.pem
+# SITE-DEMO-NG:1758...  ...  subject reference is required (e.g., 'Patient/<id>')  PUBLISHED
 ```
 
-Add `--memory` to any `pharos-cli` command to try it with built-in sample data, no Docker required.
+Add `--memory` to any `pharos-cli` command to try it with built-in sample data, no Docker (and no `--ca-cert`) required.
 
 ## How this was actually verified
 
@@ -113,7 +156,7 @@ Every decision, review finding, and fix is in `WORKLOG.md` and `ARCHITECTURE_PRO
 
 ## What's here vs. what's next
 
-This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. There's no authentication or TLS anywhere; nothing has been load-tested at real throughput; there's no deployment automation, backup/DR plan, or multi-instance scaling ever exercised. Observability (Prometheus + Grafana, Slice 6) and a genuine multi-node cluster — 3-node Cassandra at replication factor 3, 3-broker Kafka, `LOCAL_QUORUM` reads/writes (Slice 7) — are both real, not aspirational; closing the rest of the gap is ongoing work, not a gap in what's already been built; see `PLAN.md`'s roadmap section for the specifics.
+This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. There's no deployment automation (Kubernetes manifests, Slice 17, in progress), backup/DR plan, multi-instance scaling, or compliance/access-audit logging exercised yet. Observability (Prometheus + Grafana, Slice 6), a genuine multi-region cluster — dc-us: 3-node Cassandra/RF=3 + 3-broker Kafka, dc-eu: 1-node Cassandra/RF=1 + 1-broker Kafka, MirrorMaker 2 replication, `LOCAL_QUORUM` reads/writes (Slices 7, 14) — real per-site API-key auth and project-owned TLS across every service (Slice 15), and real load-test numbers under real multi-site traffic (Slice 16: p95 ~101ms, confirmed per-site rate-limit isolation, the Cassandra outbox's Paxos LWT insert identified as the actual bottleneck) are all real, not aspirational; closing the rest of the gap is ongoing work, not a gap in what's already been built; see `PLAN.md`'s roadmap section for the specifics.
 
 ### Observability
 
