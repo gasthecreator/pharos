@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 	kafkaGo "github.com/segmentio/kafka-go"
 )
 
@@ -59,7 +60,22 @@ func DefaultTopicConfigs() []TopicConfig {
 
 // EnsureTopics creates or configures Kafka topics with explicit retention policies (§4).
 // Follows the same bootstrap-on-connect pattern established for Cassandra (EnsureSchema).
+// Defaults to this project's own TLS (§2.4, Slice 15) via tlsutil.DefaultCACertPath
+// the same way DefaultConfig/DefaultEngineConfig do -- real Kafka's
+// client-facing listener requires it, so a plaintext default couldn't
+// connect at all.
 func EnsureTopics(ctx context.Context, brokers []string, configs []TopicConfig) error {
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
+	return EnsureTopicsTLS(ctx, brokers, configs, tlsCfg)
+}
+
+// EnsureTopicsTLS is EnsureTopics with an optional TLS config for the admin
+// connection (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"). Nil
+// means plaintext, matching EnsureTopics' existing behavior exactly.
+func EnsureTopicsTLS(ctx context.Context, brokers []string, configs []TopicConfig, tlsCfg *tlsutil.ClientConfig) error {
 	if len(brokers) == 0 {
 		return fmt.Errorf("no brokers provided")
 	}
@@ -68,6 +84,13 @@ func EnsureTopics(ctx context.Context, brokers []string, configs []TopicConfig) 
 	client := &kafkaGo.Client{
 		Addr:    addr,
 		Timeout: 15 * time.Second,
+	}
+	if tlsCfg != nil {
+		stdTLS, err := tlsCfg.StdTLSConfig()
+		if err != nil {
+			return fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		client.Transport = &kafkaGo.Transport{TLS: stdTLS}
 	}
 
 	// 1. Create topics if they don't exist yet

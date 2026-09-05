@@ -17,7 +17,6 @@ import (
 	"github.com/gasthecreator/pharos/internal/model"
 	"github.com/gasthecreator/pharos/internal/ratelimit"
 	"github.com/google/uuid"
-	kafkaGo "github.com/segmentio/kafka-go"
 )
 
 // TestOutOfOrderDelivery_QueryLayerOrdersCorrectlyRegardlessOfArrival proves
@@ -112,15 +111,14 @@ func TestOutOfOrderDelivery_QueryLayerOrdersCorrectlyRegardlessOfArrival(t *test
 	engineCfg.LatenessTolerance = 10 * time.Minute
 	engineCfg.IdleTimeout = 30 * time.Second
 
-	reader := kafkaGo.NewReader(kafkaGo.ReaderConfig{
-		Brokers:        engineCfg.Brokers,
-		GroupID:        engineCfg.GroupID,
-		Topic:          engineCfg.Topic,
-		MinBytes:       10,
-		MaxBytes:       10e6,
-		CommitInterval: 0,
-		StartOffset:    kafkaGo.FirstOffset,
-	})
+	// NewKafkaReader (not a raw kafkaGo.NewReader) so the reader's Dialer
+	// picks up engineCfg.TLS -- real Kafka's client-facing listener is
+	// SSL-only as of Slice 15 (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15:
+	// Auth & TLS"), and a plaintext Dialer against it fails with EOF.
+	reader, err := consumer.NewKafkaReader(engineCfg)
+	if err != nil {
+		t.Fatalf("failed to create Kafka reader: %v", err)
+	}
 	defer reader.Close()
 
 	tracker := consumer.NewWatermarkTracker(engineCfg.LatenessTolerance, engineCfg.IdleTimeout)

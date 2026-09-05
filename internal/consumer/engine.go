@@ -11,6 +11,7 @@ import (
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/metrics"
 	"github.com/gasthecreator/pharos/internal/model"
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 	kafkaGo "github.com/segmentio/kafka-go"
 )
 
@@ -29,12 +30,23 @@ type EngineConfig struct {
 	LatenessTolerance time.Duration
 	IdleTimeout       time.Duration
 	PollTimeout       time.Duration
+	// TLS, if set, encrypts and authenticates the connection to every
+	// broker against this project's own CA (§2.4, ARCHITECTURE_PROPOSALS.md
+	// "Slice 15: Auth & TLS"). Nil means plaintext.
+	TLS *tlsutil.ClientConfig
 }
 
 // DefaultEngineConfig returns production defaults for the canonical consumer group.
 func DefaultEngineConfig(brokers []string) EngineConfig {
 	if len(brokers) == 0 {
 		brokers = []string{"127.0.0.1:9092", "127.0.0.1:9094", "127.0.0.1:9095"}
+	}
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
+		// Real Kafka's client-facing (EXTERNAL) listener requires TLS
+		// (§2.4, Slice 15) -- see dedup.DefaultCassandraConfig's docs for
+		// why this is a default, not just an opt-in.
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
 	}
 	return EngineConfig{
 		Brokers:           brokers,
@@ -43,6 +55,7 @@ func DefaultEngineConfig(brokers []string) EngineConfig {
 		LatenessTolerance: 15 * time.Minute,
 		IdleTimeout:       10 * time.Minute,
 		PollTimeout:       5 * time.Second,
+		TLS:               tlsCfg,
 	}
 }
 
@@ -77,8 +90,8 @@ func NewEngine(reader MessageReader, store CanonicalStore, tracker *WatermarkTra
 }
 
 // NewKafkaReader builds a standard segmentio/kafka-go reader configured for consumer group processing.
-func NewKafkaReader(cfg EngineConfig) *kafkaGo.Reader {
-	return kafkaGo.NewReader(kafkaGo.ReaderConfig{
+func NewKafkaReader(cfg EngineConfig) (*kafkaGo.Reader, error) {
+	readerCfg := kafkaGo.ReaderConfig{
 		Brokers:        cfg.Brokers,
 		GroupID:        cfg.GroupID,
 		Topic:          cfg.Topic,
@@ -86,7 +99,19 @@ func NewKafkaReader(cfg EngineConfig) *kafkaGo.Reader {
 		MaxBytes:       10e6, // 10MB
 		CommitInterval: 0,    // Manual commits only via CommitMessages after Cassandra write
 		StartOffset:    kafkaGo.FirstOffset,
-	})
+	}
+	if cfg.TLS != nil {
+		tlsCfg, err := cfg.TLS.StdTLSConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		readerCfg.Dialer = &kafkaGo.Dialer{
+			Timeout:   10 * time.Second,
+			DualStack: true,
+			TLS:       tlsCfg,
+		}
+	}
+	return kafkaGo.NewReader(readerCfg), nil
 }
 
 // Tracker returns the underlying WatermarkTracker.

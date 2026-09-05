@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 	"github.com/gocql/gocql"
 )
 
@@ -34,10 +35,19 @@ type CassandraStoreConfig struct {
 	// Slice 14: Multi-Region Cassandra + Kafka) -- see that type's docs.
 	LocalDC   string
 	RemoteDCs map[string]int
+	// TLS mirrors dedup.CassandraConfig's field -- see that type's docs.
+	TLS *tlsutil.ClientConfig
 }
 
 // DefaultCassandraStoreConfig returns defaults for the Pharos 3-node Cassandra cluster.
 func DefaultCassandraStoreConfig() CassandraStoreConfig {
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
+		// Real Cassandra now requires TLS on its client port (§2.4, Slice
+		// 15) -- see dedup.DefaultCassandraConfig's docs for why this is a
+		// default, not just an opt-in.
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
 	return CassandraStoreConfig{
 		Hosts:             []string{"127.0.0.1"},
 		Port:              9042,
@@ -46,7 +56,8 @@ func DefaultCassandraStoreConfig() CassandraStoreConfig {
 		ConnectTimeout:    10 * time.Second,
 		ReplicationFactor: 3,
 		LocalDC:           "dc-us",
-		RemoteDCs:         map[string]int{"dc-eu": 2},
+		RemoteDCs:         map[string]int{"dc-eu": 1},
+		TLS:               tlsCfg,
 	}
 }
 
@@ -72,8 +83,20 @@ type CassandraCanonicalStore struct {
 	closed  bool
 }
 
-// NewCassandraCanonicalStore connects to Cassandra and bootstraps canonical schemas.
-func NewCassandraCanonicalStore(cfg CassandraStoreConfig) (*CassandraCanonicalStore, error) {
+// newClusterConfig builds a fresh *gocql.ClusterConfig from cfg, optionally
+// overriding the keyspace. A *new* ClusterConfig (and, critically, a *new*
+// HostSelectionPolicy instance) is required for every CreateSession attempt,
+// not just the first: gocql's TokenAwareHostPolicy.Init panics if the same
+// policy instance is ever handed to a second session
+// ("sharing token aware host selection policy between sessions is not
+// supported") -- and a failed CreateSession call still runs Init before it
+// fails for some other reason, so reusing one *gocql.ClusterConfig across a
+// "try with keyspace, fall back without it" retry sequence panics on the
+// second attempt. This bug was latent from the moment DC-aware
+// TokenAwareHostPolicy was introduced (§2.4, Slice 14) -- gocql's default
+// policy has no such single-use restriction, so nothing surfaced it until a
+// connection attempt could actually fail and fall through to a retry.
+func newClusterConfig(cfg CassandraStoreConfig, keyspace string) (*gocql.ClusterConfig, error) {
 	cluster := gocql.NewCluster(cfg.Hosts...)
 	if cfg.Port > 0 {
 		cluster.Port = cfg.Port
@@ -81,18 +104,37 @@ func NewCassandraCanonicalStore(cfg CassandraStoreConfig) (*CassandraCanonicalSt
 	cluster.Timeout = cfg.ConnectTimeout
 	cluster.Consistency = cfg.Consistency
 	cluster.DisableInitialHostLookup = true // Required for Docker-on-Mac localhost port mapping
+	cluster.Keyspace = keyspace
 	if cfg.LocalDC != "" {
 		// DC-aware host selection (§2.4, Slice 14) -- see dedup.CassandraConfig's
 		// LocalDC docs for why this matters once a second DC genuinely exists.
 		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
 	}
+	if cfg.TLS != nil {
+		sslOpts, err := cfg.TLS.GocqlSslOptions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		cluster.SslOpts = sslOpts
+	}
+	return cluster, nil
+}
 
-	cluster.Keyspace = cfg.Keyspace
+// NewCassandraCanonicalStore connects to Cassandra and bootstraps canonical schemas.
+func NewCassandraCanonicalStore(cfg CassandraStoreConfig) (*CassandraCanonicalStore, error) {
+	cluster, err := newClusterConfig(cfg, cfg.Keyspace)
+	if err != nil {
+		return nil, err
+	}
 	session, err := cluster.CreateSession()
 	if err != nil {
-		// Fallback: connect without keyspace to create keyspace if missing
-		cluster.Keyspace = ""
-		initSession, initErr := cluster.CreateSession()
+		// Fallback: connect without keyspace to create keyspace if missing.
+		// A fresh cluster config per attempt -- see newClusterConfig's docs.
+		initCluster, cErr := newClusterConfig(cfg, "")
+		if cErr != nil {
+			return nil, cErr
+		}
+		initSession, initErr := initCluster.CreateSession()
 		if initErr != nil {
 			return nil, fmt.Errorf("failed to connect to Cassandra cluster: %w", initErr)
 		}
@@ -108,8 +150,11 @@ func NewCassandraCanonicalStore(cfg CassandraStoreConfig) (*CassandraCanonicalSt
 		}
 		initSession.Close()
 
-		cluster.Keyspace = cfg.Keyspace
-		session, err = cluster.CreateSession()
+		retryCluster, cErr := newClusterConfig(cfg, cfg.Keyspace)
+		if cErr != nil {
+			return nil, cErr
+		}
+		session, err = retryCluster.CreateSession()
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to keyspace %s: %w", cfg.Keyspace, err)
 		}

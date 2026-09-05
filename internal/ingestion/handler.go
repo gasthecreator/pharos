@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/metrics"
@@ -55,7 +56,8 @@ type Handler struct {
 	outboxStore  dedup.OutboxStore
 	producer     kafka.Producer
 	leaseTimeout time.Duration
-	keyLocks     sync.Map // In-process per-key mutex map as optimization layer (§2.2)
+	keyStore     auth.KeyStore // nil disables per-site API key auth (§2.1, §2.2, Slice 15)
+	keyLocks     sync.Map      // In-process per-key mutex map as optimization layer (§2.2)
 
 	// Observability counters
 	acceptedEvents uint64
@@ -86,6 +88,17 @@ func NewHandlerWithOutbox(limiter ratelimit.RateLimiter, outbox dedup.OutboxStor
 	}
 }
 
+// SetKeyStore enables per-site API key authentication (§2.1, §2.2, Slice
+// 15) on the site-scoped routes (event submission, DLQ replay) the next
+// time RegisterRoutes is called. Kept as a post-construction setter, not a
+// constructor parameter, so every existing caller of NewHandler/
+// NewHandlerWithOutbox (including this project's own tests) keeps working
+// unchanged; auth is opt-in per deployment, not a breaking change to how
+// the handler is built.
+func (h *Handler) SetKeyStore(store auth.KeyStore) {
+	h.keyStore = store
+}
+
 func (h *Handler) lockKey(key string) func() {
 	if key == "" {
 		return func() {}
@@ -98,10 +111,20 @@ func (h *Handler) lockKey(key string) func() {
 	}
 }
 
-// RegisterRoutes sets up HTTP routes on the given mux.
+// RegisterRoutes sets up HTTP routes on the given mux. If SetKeyStore was
+// called, the site-scoped routes (event submission, DLQ replay) require a
+// valid X-Site-ID/X-API-Key pair (§2.1, §2.2, Slice 15); /healthz never
+// does, since health checks have no site to authenticate as.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/api/v1/events", h.HandleEvents)
-	mux.HandleFunc("POST /api/v1/dlq/{key}/replay", h.HandleDLQReplay)
+	eventsHandler := http.Handler(http.HandlerFunc(h.HandleEvents))
+	replayHandler := http.Handler(http.HandlerFunc(h.HandleDLQReplay))
+	if h.keyStore != nil {
+		requireAuth := auth.RequireAPIKey(h.keyStore)
+		eventsHandler = requireAuth(eventsHandler)
+		replayHandler = requireAuth(replayHandler)
+	}
+	mux.Handle("/api/v1/events", eventsHandler)
+	mux.Handle("POST /api/v1/dlq/{key}/replay", replayHandler)
 	mux.HandleFunc("/healthz", h.HandleHealth)
 }
 
@@ -422,6 +445,22 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 2b. If RequireAPIKey ran, the caller has proven ownership of exactly
+	// one site_id -- reject if the site_id resolved above (from envelope or
+	// event payload, which the middleware never inspects) claims to be a
+	// *different* site. Without this check, an authenticated site could
+	// submit events on another site's behalf just by putting a different
+	// site_id in the payload, defeating the whole point of authenticating
+	// per site (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+	if authenticatedSiteID, ok := auth.SiteIDFromContext(r.Context()); ok && authenticatedSiteID != siteID {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("authenticated as site %s, cannot submit events claiming site %s", authenticatedSiteID, siteID),
+		})
+		return
+	}
+
 	// 3. Apply per-site rate limiting (§2.3)
 	allowed, limitRes, err := h.rateLimiter.Allow(r.Context(), siteID)
 	if err != nil {
@@ -550,6 +589,18 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": fmt.Sprintf("cannot replay %s: record status is %s, expected PUBLISHED", key, rec.Status),
+		})
+		return
+	}
+
+	// Only the owning site may replay its own rejected event (§2.1, §2.2,
+	// ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- without this, any
+	// authenticated site could replay any other site's DLQ record.
+	if authenticatedSiteID, ok := auth.SiteIDFromContext(r.Context()); ok && authenticatedSiteID != rec.SiteID {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("authenticated as site %s, cannot replay a DLQ record owned by site %s", authenticatedSiteID, rec.SiteID),
 		})
 		return
 	}

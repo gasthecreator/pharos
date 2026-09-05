@@ -59,11 +59,11 @@ jobs:
       # which lets RSS balloon before it can be reclaimed. mirrormaker starts
       # in its own step below, only after topics genuinely exist.
       - name: Bring up Cassandra + Kafka (without MirrorMaker 2)
-        run: docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 cassandra-5 kafka-1 kafka-2 kafka-3 kafka-4 kafka-5 prometheus grafana
+        run: docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana
 
       - name: Wait for Cassandra + Kafka to report healthy
         run: |
-          containers="pharos-cassandra-1 pharos-cassandra-2 pharos-cassandra-3 pharos-cassandra-4 pharos-cassandra-5 pharos-kafka-1 pharos-kafka-2 pharos-kafka-3 pharos-kafka-4 pharos-kafka-5"
+          containers="pharos-cassandra-1 pharos-cassandra-2 pharos-cassandra-3 pharos-cassandra-4 pharos-kafka-1 pharos-kafka-2 pharos-kafka-3 pharos-kafka-4"
           for i in $(seq 1 60); do
             all_healthy=true
             for c in $containers; do
@@ -88,7 +88,7 @@ jobs:
         run: |
           for f in migrations/*.cql; do
             echo "Applying $f"
-            docker exec -i pharos-cassandra-1 cqlsh 127.0.0.1 9042 < "$f"
+            docker exec -i -e SSL_CERTFILE=/tls/ca-cert.pem pharos-cassandra-1 cqlsh 127.0.0.1 9042 --ssl < "$f"
           done
 
       - name: Provision Kafka topics
@@ -99,8 +99,15 @@ jobs:
           docker compose up -d mirrormaker
           sleep 15
 
+      # -p 1 serializes package execution (§2.4, ARCHITECTURE_PROPOSALS.md
+      # "Slice 15: Auth & TLS" addendum): running every package's real
+      # Cassandra/Kafka integration tests concurrently genuinely OOM-killed a
+      # Cassandra node on this project's dev host once TLS was added -- the
+      # -race detector's own overhead plus N packages' worth of simultaneous
+      # connections/LWT races is real added load this already-tight topology
+      # doesn't have headroom for, confirmed by a clean pass once serialized.
       - name: go test -race
-        run: go test -race -count=1 ./...
+        run: go test -race -count=1 -p 1 ./...
 
       - name: Show container logs on failure
         if: failure()

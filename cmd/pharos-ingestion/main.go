@@ -12,11 +12,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/ingestion"
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/metrics"
 	"github.com/gasthecreator/pharos/internal/ratelimit"
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
 
 func main() {
@@ -30,6 +32,10 @@ func main() {
 	leaseTimeout := flag.Duration("lease-timeout", 30*time.Second, "Outbox publishing claim lease timeout")
 	sweeperInterval := flag.Duration("sweeper-interval", 10*time.Second, "Background outbox sweeper interval")
 	useMemoryStore := flag.Bool("use-memory-store", false, "Use in-memory outbox store and mock producer (for testing without Docker)")
+	tlsCert := flag.String("tls-cert", "", "TLS certificate file (enables HTTPS; requires --tls-key too)")
+	tlsKey := flag.String("tls-key", "", "TLS private key file (enables HTTPS; requires --tls-cert too)")
+	caCert := flag.String("ca-cert", "", "CA certificate file for verifying TLS connections to Cassandra (§2.4, Slice 15)")
+	enableAuth := flag.Bool("enable-auth", true, "Require per-site API key authentication on event submission and DLQ replay (§2.1, §2.2, Slice 15); always off with --use-memory-store")
 	flag.Parse()
 
 	log.Printf("[pharos-ingestion] Starting Central Ingestion Service on port %d...", *port)
@@ -40,6 +46,7 @@ func main() {
 	// 2. Initialize Cassandra Outbox Store & Kafka Producer (§2.2, §2.3)
 	var outboxStore dedup.OutboxStore
 	var producer kafka.Producer
+	var keyStore auth.KeyStore
 
 	if *useMemoryStore {
 		log.Println("[pharos-ingestion] Running with MemoryOutboxStore and MockProducer (standalone mode)")
@@ -51,6 +58,9 @@ func main() {
 		cCfg.Hosts = hosts
 		cCfg.Port = *cassandraPort
 		cCfg.Keyspace = *cassandraKeyspace
+		if *caCert != "" {
+			cCfg.TLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+		}
 
 		log.Printf("[pharos-ingestion] Connecting to Cassandra at %s:%d (keyspace: %s)...", hosts[0], *cassandraPort, *cassandraKeyspace)
 		cStore, err := dedup.NewCassandraOutboxStore(cCfg)
@@ -62,13 +72,39 @@ func main() {
 			log.Println("[pharos-ingestion] Cassandra Outbox Store connected and schemas ensured.")
 		}
 
+		if *enableAuth {
+			authCfg := auth.DefaultCassandraConfig()
+			authCfg.Hosts = hosts
+			authCfg.Port = *cassandraPort
+			authCfg.Keyspace = *cassandraKeyspace
+			if *caCert != "" {
+				authCfg.TLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+			}
+			ks, err := auth.NewCassandraKeyStore(authCfg)
+			if err != nil {
+				// Fail closed, not open: a security feature that's silently
+				// disabled when its backing store is unreachable is worse
+				// than the process refusing to start (§2.1, §2.2, Slice 15).
+				log.Fatalf("[pharos-ingestion] --enable-auth is set but the API key store could not be reached: %v", err)
+			}
+			keyStore = ks
+			log.Println("[pharos-ingestion] Per-site API key authentication ENABLED on event submission and DLQ replay.")
+		} else {
+			log.Println("[pharos-ingestion] WARNING: --enable-auth=false -- any caller can submit events or replay DLQ records as any site.")
+		}
+
 		brokers := strings.Split(*kafkaBrokers, ",")
-		if err := kafka.EnsureTopics(context.Background(), brokers, kafka.DefaultTopicConfigs()); err != nil {
+		var kafkaTLS *tlsutil.ClientConfig
+		if *caCert != "" {
+			kafkaTLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+		}
+		if err := kafka.EnsureTopicsTLS(context.Background(), brokers, kafka.DefaultTopicConfigs(), kafkaTLS); err != nil {
 			log.Printf("[pharos-ingestion] WARNING: Could not ensure Kafka topic retention configs: %v", err)
 		} else {
 			log.Printf("[pharos-ingestion] Kafka topics ensured with regulatory retention policies (§4).")
 		}
 		kCfg := kafka.DefaultConfig(brokers)
+		kCfg.TLS = kafkaTLS
 		producer = kafka.NewWriterProducer(kCfg)
 		log.Printf("[pharos-ingestion] Kafka producer configured for brokers %v", brokers)
 	}
@@ -81,6 +117,9 @@ func main() {
 
 	// 4. Initialize ingestion HTTP handler
 	handler := ingestion.NewHandlerWithOutbox(limiter, outboxStore, producer, *leaseTimeout)
+	if keyStore != nil {
+		handler.SetKeyStore(keyStore)
+	}
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	mux.Handle("/metrics", metrics.Handler())
@@ -92,9 +131,18 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
+	useTLS := *tlsCert != "" && *tlsKey != ""
 	go func() {
-		log.Printf("[pharos-ingestion] Central Ingestion ready on http://localhost:%d/api/v1/events", *port)
-		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		var err error
+		if useTLS {
+			log.Printf("[pharos-ingestion] Central Ingestion ready on https://localhost:%d/api/v1/events", *port)
+			err = httpServer.ListenAndServeTLS(*tlsCert, *tlsKey)
+		} else {
+			log.Printf("[pharos-ingestion] WARNING: --tls-cert/--tls-key not set -- serving plaintext HTTP.")
+			log.Printf("[pharos-ingestion] Central Ingestion ready on http://localhost:%d/api/v1/events", *port)
+			err = httpServer.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[pharos-ingestion] HTTP server failed: %v", err)
 		}
 	}()
@@ -121,6 +169,9 @@ func main() {
 	}
 	if outboxStore != nil {
 		_ = outboxStore.Close()
+	}
+	if keyStore != nil {
+		_ = keyStore.Close()
 	}
 
 	accepted, rejected, throttled, dedupHits, dlqCount := handler.ExtendedStats()

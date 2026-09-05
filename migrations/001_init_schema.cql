@@ -6,12 +6,14 @@
 -- bootstrap code (internal/dedup, internal/consumer) builds at runtime, so
 -- CI applying this file first (before any Go code runs) doesn't leave the
 -- keyspace on the old SimpleStrategy that a later "IF NOT EXISTS" would then
--- silently leave in place. dc-eu is RF=2 (not 3) matching its 2-node
+-- silently leave in place. dc-eu is RF=1 (not 3) matching its 1-node
 -- topology in docker-compose.yml -- see that file's Cassandra section
--- comment for why dc-eu specifically was trimmed from the originally-planned
--- 3 nodes to fit this project's 8GB host.
+-- comment for why dc-eu specifically was trimmed, first from the
+-- originally-planned 3 nodes to 2 (Slice 14), then to 1 (Slice 15, once
+-- TLS's added memory cost genuinely didn't fit this project's ~6.3GB
+-- Docker VM budget alongside a 2-node dc-eu).
 CREATE KEYSPACE IF NOT EXISTS pharos
-WITH replication = {'class': 'NetworkTopologyStrategy', 'dc-us': 3, 'dc-eu': 2};
+WITH replication = {'class': 'NetworkTopologyStrategy', 'dc-us': 3, 'dc-eu': 1};
 
 -- 1. Dedup & Transactional Outbox
 -- Primary key idempotency_key (<site_id>:<local_seq>) guarantees strict uniqueness via LWT.

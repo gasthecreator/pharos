@@ -13,9 +13,11 @@ import (
 	"time"
 
 	"github.com/gasthecreator/pharos/internal/archive"
+	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/query"
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
 
 func printUsage() {
@@ -41,11 +43,16 @@ Archive Commands (§2.4, Slice 11 -- requires Cassandra, not --memory):
   archive run [--older-than 90d] [--archive-dir <path>] [--dry-run]
                                                              Move records older than the threshold to cold storage
 
+Site API Key Commands (§2.1, §2.2, Slice 15 -- requires Cassandra, not --memory):
+  site create-key <site_id>                                 Issue a new API key for a site (prints plaintext once)
+  site revoke-key <site_id>                                 Immediately invalidate a site's current key
+
 Flags:
   --hosts        Comma-separated Cassandra hosts (default: 127.0.0.1)
   --port         Cassandra port (default: 9042)
   --keyspace     Cassandra keyspace (default: pharos)
   --central-url  Central Ingestion base URL, for dlq replay only (default: http://localhost:8091)
+  --ca-cert      CA certificate file for verifying TLS connections to Cassandra (§2.4, Slice 15)
   --json         Output results in JSON format (default: false)
   --memory       Run with in-memory sample store for offline demo (default: false)
 
@@ -72,6 +79,7 @@ func main() {
 		portFlag       int
 		keyspaceFlag   string
 		centralURLFlag string
+		caCertFlag     string
 		jsonOutput     bool
 		useMemory      bool
 	)
@@ -121,6 +129,7 @@ func main() {
 			{"hosts", &hostsFlag},
 			{"keyspace", &keyspaceFlag},
 			{"central-url", &centralURLFlag},
+			{"ca-cert", &caCertFlag},
 		} {
 			if val, matched := valueFlag(arg, f.name); matched {
 				consumed = true
@@ -171,6 +180,9 @@ func main() {
 		cfg.Hosts = strings.Split(hostsFlag, ",")
 		cfg.Port = portFlag
 		cfg.Keyspace = keyspaceFlag
+		if caCertFlag != "" {
+			cfg.TLS = &tlsutil.ClientConfig{CACertPath: caCertFlag, ServerName: "localhost"}
+		}
 
 		cSvc, err := query.NewCassandraService(cfg)
 		if err != nil {
@@ -192,7 +204,13 @@ func main() {
 			fmt.Fprintf(os.Stderr, "archive is not meaningful with --memory: there's no real Cassandra data to archive\n")
 			os.Exit(1)
 		}
-		handleArchive(ctx, remainingArgs[1:], hostsFlag, portFlag, keyspaceFlag)
+		handleArchive(ctx, remainingArgs[1:], hostsFlag, portFlag, keyspaceFlag, caCertFlag)
+	case "site":
+		if useMemory {
+			fmt.Fprintf(os.Stderr, "site is not meaningful with --memory: there's no real Cassandra data to store keys in\n")
+			os.Exit(1)
+		}
+		handleSite(ctx, remainingArgs[1:], hostsFlag, portFlag, keyspaceFlag, caCertFlag)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
@@ -492,7 +510,7 @@ func replayDLQRecord(centralURL, idempotencyKey string) (*dlqReplayResponse, int
 // is a Cassandra-specific operational concern the in-memory demo store has
 // no meaningful equivalent for) and moves rows older than the threshold to
 // the local cold-tier archive.
-func handleArchive(ctx context.Context, args []string, hosts string, port int, keyspace string) {
+func handleArchive(ctx context.Context, args []string, hosts string, port int, keyspace string, caCert string) {
 	if len(args) == 0 || args[0] != "run" {
 		fmt.Fprintf(os.Stderr, "Usage: pharos-cli archive run [--older-than 90d] [--archive-dir <path>] [--dry-run]\n")
 		os.Exit(1)
@@ -511,10 +529,16 @@ func handleArchive(ctx context.Context, args []string, hosts string, port int, k
 	}
 	cutoff := time.Now().UTC().Add(-age)
 
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert != "" {
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
+
 	cStoreCfg := consumer.DefaultCassandraStoreConfig()
 	cStoreCfg.Hosts = strings.Split(hosts, ",")
 	cStoreCfg.Port = port
 	cStoreCfg.Keyspace = keyspace
+	cStoreCfg.TLS = tlsCfg
 	canonicalStore, err := consumer.NewCassandraCanonicalStore(cStoreCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to connect canonical store: %v\n", err)
@@ -526,6 +550,7 @@ func handleArchive(ctx context.Context, args []string, hosts string, port int, k
 	dedupCfg.Hosts = strings.Split(hosts, ",")
 	dedupCfg.Port = port
 	dedupCfg.Keyspace = keyspace
+	dedupCfg.TLS = tlsCfg
 	outboxStore, err := dedup.NewCassandraOutboxStore(dedupCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to connect outbox store: %v\n", err)
@@ -551,6 +576,51 @@ func handleArchive(ctx context.Context, args []string, hosts string, port int, k
 	fmt.Printf("\nCanonical: %d archived, %d failed\nDLQ:       %d archived, %d failed\n",
 		canonArchived, canonFailed, dlqArchived, dlqFailed)
 	if canonFailed > 0 || dlqFailed > 0 {
+		os.Exit(1)
+	}
+}
+
+// handleSite implements the "site" command family for per-site API key
+// management (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+func handleSite(ctx context.Context, args []string, hosts string, port int, keyspace string, caCert string) {
+	if len(args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: pharos-cli site create-key <site_id>\n       pharos-cli site revoke-key <site_id>\n")
+		os.Exit(1)
+	}
+	subcommand, siteID := args[0], args[1]
+
+	authCfg := auth.DefaultCassandraConfig()
+	authCfg.Hosts = strings.Split(hosts, ",")
+	authCfg.Port = port
+	authCfg.Keyspace = keyspace
+	if caCert != "" {
+		authCfg.TLS = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
+	keyStore, err := auth.NewCassandraKeyStore(authCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to connect to API key store: %v\n", err)
+		os.Exit(1)
+	}
+	defer keyStore.Close()
+
+	switch subcommand {
+	case "create-key":
+		plaintext, err := keyStore.CreateKey(ctx, siteID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create key for site %s: %v\n", siteID, err)
+			os.Exit(1)
+		}
+		fmt.Printf("API key created for site %s.\n", siteID)
+		fmt.Printf("Save this now -- it cannot be shown again:\n\n  %s\n\n", plaintext)
+		fmt.Printf("Configure the edge collector for this site with this key (e.g. --api-key or PHAROS_API_KEY).\n")
+	case "revoke-key":
+		if err := keyStore.RevokeKey(ctx, siteID); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to revoke key for site %s: %v\n", siteID, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Key for site %s revoked. Issue a new one with 'site create-key %s' when ready.\n", siteID, siteID)
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown site subcommand: %s\n", subcommand)
 		os.Exit(1)
 	}
 }

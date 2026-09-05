@@ -127,6 +127,103 @@ untrusted access) actually needs.
 - Wire format unaffected -- this slice is transport security and identity,
   not data model.
 
+**Addendum [2026-09-05], written after actually bringing TLS up:** the
+"Cassandra and Kafka both terminate real TLS" scope above was narrowed once
+live verification produced repeated, genuine OOM kills (`docker inspect`:
+`OOMKilled: true`) that survived Slice 14's own heap tuning -- TLS's
+Netty/JVM SSL buffer allocation is a real, largely fixed per-process memory
+cost (~250-300MB/broker observed for Kafka, similar magnitude for
+Cassandra), and encrypting *every* listener across 10 nodes doesn't fit this
+host's ~6.3GB Docker VM budget on top of that. Both client-to-server and
+inter-node/inter-broker TLS were verified working in isolation (TLS
+connections succeeded, plaintext ones were correctly refused, cross-DC
+gossip worked over TLS) -- the constraint is the combined memory cost, not
+a configuration bug. Scope shipped: `client_encryption_options` only for
+Cassandra (the CQL port, genuinely reachable by "any process" -- the actual
+exposure this slice exists to close); Cassandra's `internode_encryption`
+stays `none`, since port 7000 is never exposed to the host at all, already
+contained within the private Docker network. Kafka mirrors this: `EXTERNAL`
+(client-facing, host-exposed) is `SSL`, `INTERNAL` (inter-broker) stays
+`PLAINTEXT`. Kafka cluster B (`dc-eu`) also dropped from 2 brokers to 1 --
+it's a pure MirrorMaker2 replication target the application never
+coordinates `LOCAL_QUORUM`/ISR against directly, the same reasoning Slice 14
+used to justify `dc-eu`'s node count in the first place.
+
+Even after that narrowing, live verification kept OOM-killing a Cassandra
+node (confirmed via `docker inspect`, twice, hitting a *different* node each
+time -- cassandra-2, then cassandra-3 -- the OOM killer picking whichever
+process scores worst under pressure, not one specific node's bug) the
+moment Kafka's 4 brokers came up alongside all 5 Cassandra nodes. Measured
+steady state at failure: 5 Cassandra nodes ~4.4GB + 4 Kafka brokers ~1.9GB +
+Prometheus/Grafana ~62MB = ~6.4GB against the 6.275GB ceiling, with
+MirrorMaker 2's own JVM not even started yet -- a sustained overcommit, not
+a startup spike (staggering the restart didn't fix it). Applying the exact
+same "`dc-eu` isn't `LOCAL_QUORUM`-coordinated" reasoning a second time:
+**`dc-eu` Cassandra dropped from 2 nodes/RF=2 to 1 node/RF=1** (`cassandra-5`
+removed entirely -- `docker-compose.yml`, `migrations/001_init_schema.cql`,
+and the `RemoteDCs` default in all four Go call sites that build a
+`CassandraConfig`/`CassandraStoreConfig`/`CassandraServiceConfig` updated
+together). This freed roughly one full Cassandra JVM's worth of RSS
+(~800-900MB), restoring comfortable headroom for Kafka and MirrorMaker 2
+together. RF=1 against a single-node DC is not a shortcut -- RF=2 there
+would leave the keyspace under-replicated in `dc-eu` by construction, the
+exact bug Slice 14 originally fixed by matching node count to RF; this is
+the same fix applied a second time as the constraint got tighter.
+`internal/faultinjection/regional_partition_test.go`'s partition scenario
+(the property this whole 2-DC topology exists to prove) still holds with a
+single-node `dc-eu`: gossip-marking it `DN` during the partition and
+hinted-handoff catch-up after healing work identically with 1 node as with
+2 -- only `dc-eu`'s own internal replication redundancy changes, and nothing
+in this project's application logic or tests ever exercised that.
+
+Two more real, previously-latent bugs found only by actually running this,
+not by planning it:
+1. **gocql's shared-token-aware-host-policy panic.** `TokenAwareHostPolicy`
+   instances can't be reused across `CreateSession()` calls on the same
+   `*gocql.ClusterConfig` (`"sharing token aware host selection policy
+   between sessions is not supported"`) -- latent since Slice 14 introduced
+   DC-aware host selection, surfaced only when a connection attempt fails
+   and falls through to the existing "connect without keyspace, create it,
+   reconnect" retry path, which reused one cluster config (and its single
+   policy instance) across multiple `CreateSession()` attempts. Fixed with a
+   `newClusterConfig()` helper building a genuinely fresh `*gocql.ClusterConfig`
+   per attempt, in both `internal/dedup/cassandra_store.go` and
+   `internal/consumer/canonical_store.go`.
+2. **Two integration tests built a raw `kafkaGo.NewReader` directly**
+   (`internal/consumer/consumer_integration_test.go`,
+   `internal/faultinjection/out_of_order_test.go`), bypassing
+   `consumer.NewKafkaReader` -- left over from before this slice, never
+   updated, so their readers had no TLS `Dialer` and got a plaintext `EOF`/
+   zero-messages-drained failure the moment Kafka's client listener became
+   SSL-only. Real broker-side logs (`Failed authentication ... SSL handshake
+   failed`, source `192.168.65.1` -- Docker Desktop's host-gateway address,
+   confirming it was the host-run `go test` process) confirmed a plaintext
+   client hitting the SSL port, not a resource issue. Fixed by routing both
+   through `NewKafkaReader(engineCfg)` like every other reader in this
+   codebase.
+
+One environmental finding, not an application bug: running the full suite
+with `go test`'s default package parallelism (`-p` = `GOMAXPROCS`) genuinely
+OOM-killed `cassandra-1` mid-run -- every package opening its own
+Cassandra/Kafka connections simultaneously, on top of `-race`'s own
+overhead, is real added load this already-tight topology has no headroom
+for, distinct from the idle steady-state fit verified above. Serializing
+package execution (`-p 1`) fixed it with no other change -- applied to both
+local verification and `.github/workflows/ci.yml`. With that, the client
+`pharos-cli site create-key`/`revoke-key`, `pharos-ingestion`
+(`--enable-auth --tls-cert --tls-key --ca-cert`), and `pharos-edge`
+(`--api-key --ca-cert`) binaries were all verified for real, built and run
+directly (not just unit-tested): TLS handshake succeeds, `/healthz` stays
+unauthenticated, an unauthenticated submission gets 401, a submission
+claiming a different site than the authenticated one gets 403, a revoked
+key is rejected, and a real edge-captured event genuinely flows edge ->
+(TLS + API key) -> Central Ingestion -> Cassandra outbox -> Kafka, ending
+`PUBLISHED` -- confirmed by querying the live `pharos.event_outbox` table
+directly, not by trusting the HTTP response alone. The full suite
+(`go test -race -count=1 -p 1 ./...`) then passed cleanly twice in a row
+against this final topology (4 Cassandra nodes, 4 Kafka brokers,
+MirrorMaker2, all TLS-enabled on their client-facing listeners).
+
 ---
 
 #### [2026-09-05] Slice 14: Multi-Region Cassandra + Kafka (Simulated)

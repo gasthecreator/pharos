@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 	"github.com/segmentio/kafka-go"
 )
 
@@ -37,12 +38,24 @@ type Config struct {
 	BatchTimeout    time.Duration
 	WriteTimeout    time.Duration
 	AllowAutoCreate bool
+	// TLS, if set, encrypts and authenticates the connection to every
+	// broker against this project's own CA (§2.4, ARCHITECTURE_PROPOSALS.md
+	// "Slice 15: Auth & TLS"). Nil means plaintext.
+	TLS *tlsutil.ClientConfig
 }
 
 // DefaultConfig provides production-ready idempotent producer defaults.
 func DefaultConfig(brokers []string) Config {
 	if len(brokers) == 0 {
 		brokers = []string{"127.0.0.1:9092", "127.0.0.1:9094", "127.0.0.1:9095"}
+	}
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
+		// Real Kafka's client-facing (EXTERNAL) listener requires TLS
+		// (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- see
+		// dedup.DefaultCassandraConfig's docs for why this is a default,
+		// not just an opt-in.
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
 	}
 	return Config{
 		Brokers:         brokers,
@@ -51,6 +64,7 @@ func DefaultConfig(brokers []string) Config {
 		BatchTimeout:    10 * time.Millisecond,
 		WriteTimeout:    5 * time.Second,
 		AllowAutoCreate: true,
+		TLS:             tlsCfg,
 	}
 }
 
@@ -70,12 +84,12 @@ func NewWriterProducer(cfg Config) *WriterProducer {
 	}
 }
 
-func (p *WriterProducer) getWriter(topic string) *kafka.Writer {
+func (p *WriterProducer) getWriter(topic string) (*kafka.Writer, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	if p.closed {
-		return nil
+		return nil, nil
 	}
 
 	w, exists := p.writers[topic]
@@ -92,14 +106,24 @@ func (p *WriterProducer) getWriter(topic string) *kafka.Writer {
 			Compression:            kafka.Snappy,
 			AllowAutoTopicCreation: p.cfg.AllowAutoCreate,
 		}
+		if p.cfg.TLS != nil {
+			tlsCfg, err := p.cfg.TLS.StdTLSConfig()
+			if err != nil {
+				return nil, fmt.Errorf("failed to build TLS config: %w", err)
+			}
+			w.Transport = &kafka.Transport{TLS: tlsCfg}
+		}
 		p.writers[topic] = w
 	}
-	return w
+	return w, nil
 }
 
 // Publish publishes a message with the specified partition key and headers.
 func (p *WriterProducer) Publish(ctx context.Context, topic string, key []byte, value []byte, headers map[string]string) (KafkaMetadata, error) {
-	w := p.getWriter(topic)
+	w, err := p.getWriter(topic)
+	if err != nil {
+		return KafkaMetadata{}, err
+	}
 	if w == nil {
 		return KafkaMetadata{}, fmt.Errorf("producer is closed")
 	}
@@ -119,8 +143,7 @@ func (p *WriterProducer) Publish(ctx context.Context, topic string, key []byte, 
 		Time:    time.Now().UTC(),
 	}
 
-	err := w.WriteMessages(ctx, msg)
-	if err != nil {
+	if err := w.WriteMessages(ctx, msg); err != nil {
 		return KafkaMetadata{}, fmt.Errorf("failed to write message to topic %s: %w", topic, err)
 	}
 

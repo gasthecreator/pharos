@@ -43,3 +43,4 @@ data/
 # Editor/agent scratch output
 *.log
 /tmp/
+/certs/

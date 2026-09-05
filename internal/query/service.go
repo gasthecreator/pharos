@@ -10,6 +10,7 @@ import (
 	"github.com/gasthecreator/pharos/internal/archive"
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/dedup"
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 	"github.com/gocql/gocql"
 )
 
@@ -32,10 +33,19 @@ type CassandraServiceConfig struct {
 	// for correct LOCAL_QUORUM read routing.
 	LocalDC   string
 	RemoteDCs map[string]int
+	// TLS mirrors dedup.CassandraConfig's field -- see that type's docs.
+	TLS *tlsutil.ClientConfig
 }
 
 // DefaultCassandraServiceConfig returns standard connection settings for the Pharos Cassandra cluster.
 func DefaultCassandraServiceConfig() CassandraServiceConfig {
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
+		// Real Cassandra now requires TLS on its client port (§2.4, Slice
+		// 15) -- see dedup.DefaultCassandraConfig's docs for why this is a
+		// default, not just an opt-in.
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
 	return CassandraServiceConfig{
 		Hosts:          []string{"127.0.0.1"},
 		Port:           9042,
@@ -44,7 +54,8 @@ func DefaultCassandraServiceConfig() CassandraServiceConfig {
 		ConnectTimeout: 10 * time.Second,
 		ArchiveDir:     archive.DefaultConfig().Dir,
 		LocalDC:        "dc-us",
-		RemoteDCs:      map[string]int{"dc-eu": 2},
+		RemoteDCs:      map[string]int{"dc-eu": 1},
+		TLS:            tlsCfg,
 	}
 }
 
@@ -69,6 +80,7 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 		ReplicationFactor: 3,
 		LocalDC:           cfg.LocalDC,
 		RemoteDCs:         cfg.RemoteDCs,
+		TLS:               cfg.TLS,
 	}
 
 	cStore, err := consumer.NewCassandraCanonicalStore(cStoreCfg)
@@ -88,6 +100,14 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 		// DC-aware host selection (§2.4, Slice 14) -- see dedup.CassandraConfig's
 		// LocalDC docs for why this matters once a second DC genuinely exists.
 		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
+	}
+	if cfg.TLS != nil {
+		sslOpts, err := cfg.TLS.GocqlSslOptions()
+		if err != nil {
+			cStore.Close()
+			return nil, fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		cluster.SslOpts = sslOpts
 	}
 
 	session, err := cluster.CreateSession()

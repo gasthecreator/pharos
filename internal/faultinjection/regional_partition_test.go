@@ -14,13 +14,14 @@ import (
 
 // dcUSCassandraContainers and dcEUCassandraContainers name the real
 // containers docker-compose.yml stands up for each simulated datacenter
-// (§2.4, Slice 14: Multi-Region Cassandra + Kafka). dc-eu is 2 containers,
-// not the originally-planned 3 -- see docker-compose.yml's Cassandra section
-// comment for the full reasoning (a real, empirically-confirmed 8GB-host
-// memory ceiling).
+// (§2.4, Slice 14: Multi-Region Cassandra + Kafka). dc-eu is down to 1
+// container as of Slice 15 (was 2, was originally planned as 3) -- see
+// docker-compose.yml's Cassandra section comment for the full reasoning (a
+// real, empirically-confirmed ~6.3GB Docker VM memory ceiling, tightened
+// further once TLS was added).
 var (
 	dcUSCassandraContainers = []string{"pharos-cassandra-1", "pharos-cassandra-2", "pharos-cassandra-3"}
-	dcEUCassandraContainers = []string{"pharos-cassandra-4", "pharos-cassandra-5"}
+	dcEUCassandraContainers = []string{"pharos-cassandra-4"}
 )
 
 // containerIP returns a running container's IP address on pharos-net, looked
@@ -235,7 +236,10 @@ func TestRegionalPartition_DcUsLocalQuorumSurvivesDcEuUnreachable(t *testing.T) 
 	deadline := time.Now().Add(60 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		out, err := exec.Command("docker", "exec", "-i", dcEUCassandraContainers[0], "cqlsh", "-e",
+		// Client encryption is on as of Slice 15 (§2.4, ARCHITECTURE_PROPOSALS.md
+		// "Slice 15: Auth & TLS") -- a plaintext cqlsh call against the CQL
+		// port would fail outright, same as the docker-compose healthchecks.
+		out, err := exec.Command("docker", "exec", "-i", "-e", "SSL_CERTFILE=/tls/ca-cert.pem", dcEUCassandraContainers[0], "cqlsh", "--ssl", "-e",
 			fmt.Sprintf("CONSISTENCY ONE; SELECT idempotency_key FROM pharos.canonical_events WHERE idempotency_key = '%s';", partitionKey),
 		).CombinedOutput()
 		if err == nil && strings.Contains(string(out), partitionKey) {
