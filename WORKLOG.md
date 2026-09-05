@@ -40,6 +40,122 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 15 — Auth & TLS
+
+**Author:** Claude Code
+
+**What:** Added per-site API key authentication (new `internal/auth` package:
+`KeyStore`/`CassandraKeyStore`/`MemoryKeyStore`, `RequireAPIKey` HTTP
+middleware) and project-owned CA-issued TLS (new `internal/tlsutil`,
+`scripts/generate_certs.sh`) across every hop: edge→Central Ingestion, and
+Central Ingestion/consumer/query→Cassandra and →Kafka. `cmd/pharos-cli`
+gained `site create-key`/`site revoke-key`; `cmd/pharos-ingestion` gained
+`--enable-auth`/`--tls-cert`/`--tls-key`/`--ca-cert`; `cmd/pharos-edge`
+gained `--api-key`/`--ca-cert`. `Default*Config()` functions across
+`internal/dedup`, `internal/consumer`, `internal/query`, `internal/auth`,
+and `internal/kafka` now default to this TLS, the same way `LocalDC`/
+`RemoteDCs` became defaults in Slice 14.
+
+**Why:** Per PLAN.md's Slice 15 — nothing in this system authenticated or
+encrypted anything before this; any process that could reach the HTTP ports
+could submit or read adverse event data. Design decisions (per-site API
+keys over mTLS, one project-owned CA rather than a real one, TLS scope) are
+recorded and approved in ARCHITECTURE_PROPOSALS.md's Slice 15 entry before
+any code was written, per this project's standing review discipline.
+
+**How:** Like Slice 14, most of the real work was in what happened once
+this actually ran against live infrastructure, not what the design said on
+paper.
+
+TLS has real, mostly-fixed-per-process memory cost (Netty/JVM SSL buffer
+allocation, ~250-300MB/broker observed for Kafka, similar for Cassandra) —
+confirmed via repeated, genuine OOM kills (`docker inspect`: `OOMKilled:
+true`) that survived Slice 14's own heap tuning. Scope narrowed twice in
+response, both times documented rather than hidden (full detail in
+ARCHITECTURE_PROPOSALS.md's Slice 15 addendum): first, TLS itself scoped to
+client-facing listeners only (Cassandra's `client_encryption_options`,
+Kafka's `EXTERNAL` listener) with internode/inter-broker traffic staying
+plaintext — both were verified working in isolation before being scoped
+back, so this is a real memory-budget constraint, not a shortcut around a
+harder problem. Kafka cluster B (`dc-eu`) also dropped 2→1 broker at the
+same time. That still weren't enough — Kafka's 4 brokers coming up
+alongside 5 Cassandra nodes kept OOM-killing a Cassandra node (a different
+one each time: cassandra-2, then cassandra-3), so `dc-eu`'s Cassandra count
+dropped 2 nodes/RF=2 → 1 node/RF=1 too (`cassandra-5` removed, migration
+and all four Go `RemoteDCs` defaults updated together). Both `dc-eu`
+reductions reuse the exact reasoning Slice 14 already established: nothing
+in this project's application logic ever coordinates `LOCAL_QUORUM`/ISR
+against `dc-eu` directly, so its own internal replication redundancy isn't
+a property this project's tests exercise — `dc-us` (and Kafka cluster A)
+keep their full node counts throughout.
+
+Two real, previously-latent bugs found only by actually running this: (1)
+gocql's `TokenAwareHostPolicy` panics if reused across `CreateSession()`
+calls sharing one `*gocql.ClusterConfig` — latent since Slice 14, surfaced
+only via the existing no-keyspace-fallback retry path reusing one cluster
+config across attempts; fixed with a `newClusterConfig()` helper building a
+fresh config per attempt in `internal/dedup` and `internal/consumer`. (2)
+Two integration tests (`internal/consumer/consumer_integration_test.go`,
+`internal/faultinjection/out_of_order_test.go`) built a raw
+`kafkaGo.NewReader` directly instead of `consumer.NewKafkaReader`, so their
+readers never got a TLS `Dialer` — leftover from before this slice, causing
+plaintext `EOF`/zero-messages-drained failures against Kafka's now-SSL-only
+client listener. Confirmed via real broker-side `SSL handshake failed`
+logs (source `192.168.65.1`, Docker Desktop's host-gateway address,
+matching the host-run `go test` process) rather than guessed at, and fixed
+by routing both through `NewKafkaReader`.
+
+One environmental finding, not a code bug: `go test`'s default package
+parallelism (`-p` = `GOMAXPROCS`) genuinely OOM-killed `cassandra-1`
+mid-suite — every package's real Cassandra/Kafka connections opening
+concurrently, stacked on `-race`'s own overhead, is real load this
+already-tight topology has no headroom for beyond its idle steady state.
+Fixed by serializing package execution (`-p 1`), applied to both local
+verification and `.github/workflows/ci.yml`.
+
+**Files/modules touched:** new `internal/auth/` (`keystore.go`,
+`middleware.go`, plus tests), new `internal/tlsutil/tlsutil.go`, new
+`scripts/generate_certs.sh`; `internal/ingestion/handler.go` (key store
+wiring, site-mismatch checks on submit and DLQ replay); `internal/dedup/cassandra_store.go`,
+`internal/consumer/canonical_store.go` (`newClusterConfig` fix, TLS config,
+`RemoteDCs` dc-eu 2→1), `internal/consumer/engine.go` (`NewKafkaReader` now
+returns an error, TLS `Dialer`), `internal/query/service.go` (TLS,
+`RemoteDCs` dc-eu 2→1), `internal/kafka/producer.go` + `internal/kafka/topics.go`
+(TLS `Transport`), `internal/edge/forwarder.go` (`X-API-Key` header);
+`cmd/pharos-ingestion`, `cmd/pharos-consumer`, `cmd/pharos-cli`,
+`cmd/pharos-edge` (new flags); `docker-compose.yml` (TLS mounts/env for
+Cassandra + Kafka, `cassandra-5` removed, `kafka-5` removed, heap bumped
+208M/224M); `migrations/001_init_schema.cql` (`dc-eu` RF 2→1);
+`internal/faultinjection/regional_partition_test.go` (dc-eu container list,
+TLS-aware `cqlsh` call); `.github/workflows/ci.yml` (TLS-aware schema
+apply, `cassandra-5` removed from bring-up/health-wait, `-p 1`);
+`ARCHITECTURE_PROPOSALS.md` (Slice 15 entry + addendum), `PLAN.md` (Slice
+15 marked done).
+
+**Tests added/updated:** `internal/auth/keystore_test.go` (8 tests),
+`internal/auth/middleware_test.go` (7 tests), `internal/ingestion/auth_test.go`
+(5 tests against a real mux via `RegisterRoutes`, since the auth context
+value can only be set by the real middleware chain — covers cross-site
+submission (403), self-submission (200), no-key rejection (401),
+`/healthz` bypass, and DLQ replay ownership (403)).
+
+**Verification:** `go build ./...`, `go vet ./...`, `gofmt -l .` clean. Full
+suite (`go test -race -count=1 -p 1 ./...`) passed cleanly twice in a row
+against the final topology (4 Cassandra nodes, 4 Kafka brokers,
+MirrorMaker2, client-facing TLS everywhere). Beyond the automated suite,
+built binaries were run directly against live infrastructure:
+`pharos-cli site create-key`/`revoke-key`, `pharos-ingestion --enable-auth
+--tls-cert --tls-key --ca-cert`, `pharos-edge --api-key --ca-cert` — TLS
+handshake succeeds, `/healthz` stays unauthenticated, a request with no key
+gets 401, one claiming a different site than it authenticated as gets 403,
+a revoked key is rejected, and a real edge-captured event genuinely flows
+edge → (TLS + API key) → Central Ingestion → Cassandra outbox → Kafka,
+ending `PUBLISHED` — confirmed by querying `pharos.event_outbox` directly.
+
+**Follow-ups / left open:** none deliberately deferred — every genuinely
+open question from PLAN.md's Slice 15 entry was resolved in
+ARCHITECTURE_PROPOSALS.md before implementation.
+
 ## [2026-09-05] Claude Code: Slice 14 — multi-region Cassandra + Kafka (simulated)
 
 **Author:** Claude Code

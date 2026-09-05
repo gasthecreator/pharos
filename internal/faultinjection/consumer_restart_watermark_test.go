@@ -137,7 +137,10 @@ func TestConsumerRestart_WatermarkCheckpointPreventsRegression(t *testing.T) {
 	key1 := publishFaultInjectionEvent(t, ctx, realProducer, testTopic, siteID, 1, baseTime.Add(60*time.Minute))
 
 	tracker1 := consumer.NewWatermarkTracker(latenessTolerance, idleTimeout)
-	reader1 := consumer.NewKafkaReader(engineCfg)
+	reader1, err := consumer.NewKafkaReader(engineCfg)
+	if err != nil {
+		t.Fatalf("failed to build Kafka reader: %v", err)
+	}
 	engine1 := consumer.NewEngine(reader1, store, tracker1, engineCfg)
 
 	stepCtx1, stepCancel1 := context.WithTimeout(ctx, 15*time.Second)
@@ -195,7 +198,10 @@ func TestConsumerRestart_WatermarkCheckpointPreventsRegression(t *testing.T) {
 		t.Fatalf("CRITICAL REGRESSION: restored watermark %v is below pre-crash watermark %v", restoredWatermark, preCrashWatermark)
 	}
 
-	reader2 := consumer.NewKafkaReader(engineCfg)
+	reader2, err := consumer.NewKafkaReader(engineCfg)
+	if err != nil {
+		t.Fatalf("failed to build Kafka reader: %v", err)
+	}
 	defer reader2.Close()
 	engine2 := consumer.NewEngine(reader2, store, tracker2, engineCfg)
 

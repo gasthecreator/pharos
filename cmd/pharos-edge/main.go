@@ -13,6 +13,7 @@ import (
 
 	"github.com/gasthecreator/pharos/internal/edge"
 	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
 
 func main() {
@@ -24,6 +25,8 @@ func main() {
 	pollInterval := flag.Duration("poll-interval", 1*time.Second, "Forwarder queue poll interval")
 	backupPath := flag.String("backup-path", "", "Path for periodic SQLite backups (§2.1, Slice 12); empty disables backup/restore")
 	backupInterval := flag.Duration("backup-interval", 5*time.Minute, "Interval between periodic SQLite backups")
+	apiKey := flag.String("api-key", "", "This site's API key for Central Ingestion (§2.1, §2.2, Slice 15); required unless Central Ingestion runs with --enable-auth=false")
+	caCert := flag.String("ca-cert", "", "CA certificate file for verifying Central Ingestion's TLS certificate (§2.1, Slice 15); required if --central-url is https://")
 	flag.Parse()
 
 	log.Printf("[pharos-edge] Initializing edge collector for site: %s (db: %s)", *siteID, *dbPath)
@@ -61,8 +64,24 @@ func main() {
 	fwdCfg := edge.DefaultForwarderConfig(*centralURL, *siteID)
 	fwdCfg.BatchSize = *batchSize
 	fwdCfg.PollInterval = *pollInterval
+	fwdCfg.APIKey = *apiKey
+	if *apiKey == "" {
+		log.Printf("[pharos-edge] WARNING: --api-key not set -- requests to Central Ingestion will carry no X-API-Key header.")
+	}
 
-	forwarder := edge.NewForwarder(store, nil, fwdCfg)
+	var httpClient edge.HTTPClient
+	if *caCert != "" {
+		tlsCfg, err := (tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}).StdTLSConfig()
+		if err != nil {
+			log.Fatalf("[pharos-edge] Failed to load CA cert for Central Ingestion TLS: %v", err)
+		}
+		httpClient = &http.Client{
+			Timeout:   fwdCfg.RequestTimeout,
+			Transport: &http.Transport{TLSClientConfig: tlsCfg},
+		}
+	}
+
+	forwarder := edge.NewForwarder(store, httpClient, fwdCfg)
 	go func() {
 		log.Printf("[pharos-edge] Forwarder worker active -> streaming to %s", *centralURL)
 		if err := forwarder.Run(ctx); err != nil && err != context.Canceled {

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 	"github.com/gocql/gocql"
 )
 
@@ -31,10 +32,22 @@ type CassandraConfig struct {
 	// with adding a DC later without an ALTER KEYSPACE), just with only
 	// LocalDC in the replication map.
 	RemoteDCs map[string]int
+	// TLS, if set, encrypts and authenticates the client-to-node connection
+	// against this project's own CA (§2.4, ARCHITECTURE_PROPOSALS.md "Slice
+	// 15: Auth & TLS"). Nil means plaintext, e.g. for tests that don't stand
+	// up TLS-enabled Cassandra.
+	TLS *tlsutil.ClientConfig
 }
 
 // DefaultCassandraConfig provides connection defaults for the Pharos 3-node Cassandra cluster.
 func DefaultCassandraConfig() CassandraConfig {
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
+		// Real Cassandra now requires TLS on its client port (§2.4, Slice
+		// 15) -- defaulting to plaintext here would be a default that
+		// simply can't connect, not a safer fallback.
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
 	return CassandraConfig{
 		Hosts:             []string{"127.0.0.1"},
 		Port:              9042,
@@ -44,7 +57,8 @@ func DefaultCassandraConfig() CassandraConfig {
 		ConnectTimeout:    10 * time.Second,
 		ReplicationFactor: 3,
 		LocalDC:           "dc-us",
-		RemoteDCs:         map[string]int{"dc-eu": 2},
+		RemoteDCs:         map[string]int{"dc-eu": 1},
+		TLS:               tlsCfg,
 	}
 }
 
@@ -69,8 +83,20 @@ func networkTopologyReplicationMap(localDC string, localRF int, remoteDCs map[st
 	return "{'class': 'NetworkTopologyStrategy', " + strings.Join(parts, ", ") + "}"
 }
 
-// NewCassandraOutboxStore creates and bootstraps a new CassandraOutboxStore.
-func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error) {
+// newClusterConfig builds a fresh *gocql.ClusterConfig from cfg, optionally
+// overriding the keyspace. A *new* ClusterConfig (and, critically, a *new*
+// HostSelectionPolicy instance) is required for every CreateSession attempt,
+// not just the first: gocql's TokenAwareHostPolicy.Init panics if the same
+// policy instance is ever handed to a second session
+// ("sharing token aware host selection policy between sessions is not
+// supported") -- and a failed CreateSession call still runs Init before it
+// fails for some other reason, so reusing one *gocql.ClusterConfig across a
+// "try with keyspace, fall back without it" retry sequence panics on the
+// second attempt. This bug was latent from the moment DC-aware
+// TokenAwareHostPolicy was introduced (§2.4, Slice 14) -- gocql's default
+// policy has no such single-use restriction, so nothing surfaced it until a
+// connection attempt could actually fail and fall through to a retry.
+func newClusterConfig(cfg CassandraConfig, keyspace string) (*gocql.ClusterConfig, error) {
 	cluster := gocql.NewCluster(cfg.Hosts...)
 	if cfg.Port > 0 {
 		cluster.Port = cfg.Port
@@ -79,6 +105,7 @@ func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error)
 	cluster.Consistency = cfg.Consistency
 	cluster.SerialConsistency = cfg.SerialConsistency
 	cluster.DisableInitialHostLookup = true // Critical for Docker-on-Mac to route to 127.0.0.1:9042 directly
+	cluster.Keyspace = keyspace
 	if cfg.LocalDC != "" {
 		// DC-aware host selection (§2.4, Slice 14): without this, LOCAL_QUORUM's
 		// meaning depends on whichever DC gocql's default round-robin policy
@@ -86,14 +113,32 @@ func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error)
 		// wrong once a second one exists.
 		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
 	}
+	if cfg.TLS != nil {
+		sslOpts, err := cfg.TLS.GocqlSslOptions()
+		if err != nil {
+			return nil, fmt.Errorf("failed to build TLS config: %w", err)
+		}
+		cluster.SslOpts = sslOpts
+	}
+	return cluster, nil
+}
 
+// NewCassandraOutboxStore creates and bootstraps a new CassandraOutboxStore.
+func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error) {
 	// 1. Attempt direct connection to the target keyspace
-	cluster.Keyspace = cfg.Keyspace
+	cluster, err := newClusterConfig(cfg, cfg.Keyspace)
+	if err != nil {
+		return nil, err
+	}
 	session, err := cluster.CreateSession()
 	if err != nil {
-		// Fallback: connect without keyspace to create keyspace if missing
-		cluster.Keyspace = ""
-		initSession, initErr := cluster.CreateSession()
+		// Fallback: connect without keyspace to create keyspace if missing.
+		// A fresh cluster config per attempt -- see newClusterConfig's docs.
+		initCluster, cErr := newClusterConfig(cfg, "")
+		if cErr != nil {
+			return nil, cErr
+		}
+		initSession, initErr := initCluster.CreateSession()
 		if initErr != nil {
 			return nil, fmt.Errorf("failed to connect to Cassandra cluster: %w", initErr)
 		}
@@ -109,8 +154,11 @@ func NewCassandraOutboxStore(cfg CassandraConfig) (*CassandraOutboxStore, error)
 		}
 		initSession.Close()
 
-		cluster.Keyspace = cfg.Keyspace
-		session, err = cluster.CreateSession()
+		retryCluster, cErr := newClusterConfig(cfg, cfg.Keyspace)
+		if cErr != nil {
+			return nil, cErr
+		}
+		session, err = retryCluster.CreateSession()
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to keyspace %s: %w", cfg.Keyspace, err)
 		}

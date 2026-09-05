@@ -15,6 +15,217 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-05] Slice 15: Auth & TLS
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-05).
+
+**What in PLAN.md this touches:** §2.1, §2.2, §2.4, §5, Phase 2 Slice 15.
+PLAN.md flags this slice specifically as needing real review before
+building ("this is exactly the kind of decision that shouldn't get made
+unattended overnight") -- the review mechanism this project has used for
+every slice since Slice 8 is exactly this file: a proposal written and
+weighed before implementation, approved here rather than left for a live
+conversation that the user's standing instruction for this session
+explicitly won't happen. Held to the same bar as every other open-design
+slice this session (11, 13, 14): real alternatives named, real tradeoffs
+weighed, decision recorded before a line of code changes.
+
+**Edge → Central Ingestion: per-site API keys, not mTLS.** Both give the
+same practical guarantee here (a request is provably from a specific,
+authorized site), but the operational shape is different. mTLS means
+issuing, distributing, and eventually rotating/revoking a client
+certificate *per site* -- a real PKI lifecycle -- for a deployment model
+this project's own language already describes as "a resource-constrained
+trial site," not a fleet with dedicated IT running certificate management.
+A per-site API key is a single opaque secret an edge deployment is
+configured with once; rotation is "issue a new one, retire the old one,"
+no certificate tooling required. This isn't a security downgrade as long
+as the key travels over TLS (below) -- the key secures *identity*, TLS
+secures the *channel*, and conflating the two is what makes mTLS feel like
+it's doing double duty it doesn't actually need to here. mTLS remains the
+right call in a deployment model with real per-site infrastructure teams;
+it isn't the right call for this project's stated one.
+
+**Key handling:** stored server-side as a SHA-256 hash, never plaintext
+(the token itself is a random 256-bit value with no human-memorable
+structure to protect against -- unlike a password, it doesn't need a
+per-key salt to defeat precomputation; a fixed-cost hash of a
+high-entropy secret is exactly what services like Stripe and GitHub do for
+their own API tokens). A new `pharos-cli site create-key <site-id>`
+subcommand generates the key, stores only its hash, and prints the
+plaintext exactly once -- the same "copy this now, it's gone" UX those
+services use, because the alternative (storing it reversibly, so it can be
+shown again) is a real liability for no operational benefit; a lost key is
+solved by rotating, not by retrieving. New `site_api_keys` Cassandra table
+(`site_id text PRIMARY KEY, key_hash text, created_at timestamp, revoked
+boolean`), read once per request by new `internal/auth` middleware that
+resolves the authenticated site from `X-API-Key` and rejects any request
+whose optional `X-Site-ID`/envelope-embedded site doesn't match it --
+closing the actual gap this slice exists to close: today, anything can
+claim to be any site just by setting a header.
+
+**TLS: this project's own CA, not a real one.** No cloud spend and no real
+domain means no path to a publicly-trusted certificate anyway, and none is
+needed for traffic that never leaves Docker-simulated infrastructure this
+project itself controls end to end. A single self-signed root CA (`scripts/
+generate_certs.sh`, openssl-based, matching this project's existing
+shell-script conventions) issues every certificate used everywhere:
+Central Ingestion's HTTP listener, Cassandra's client + inter-node
+listeners, Kafka's client + inter-broker listeners. Edge and every Go
+service trust that one CA file rather than doing no verification at all
+(today's actual state) or trying to stand up a real ACME-style flow that
+would serve no one outside this project's own Docker network.
+
+**Cassandra and Kafka both terminate real TLS, not just the HTTP edge.**
+It would be inconsistent to encrypt the edge→ingestion hop while leaving
+every other hop -- Central Ingestion/consumer/query to Cassandra, the
+Kafka client traffic, and inter-node/inter-broker traffic across the two
+simulated regions from Slice 14 -- in plaintext. PLAN.md's own Slice 15
+wording asks for exactly this ("TLS termination approach for
+Cassandra/Kafka inter-node and client traffic, now across two simulated
+regions"), and a partial answer wouldn't actually close the "any process
+that can reach the port" gap for the ports it left open. One shared
+keystore (signed by the project CA) across all 5 Cassandra nodes and one
+across all 5 Kafka brokers, rather than a uniquely-issued identity cert
+per node: this is a private cluster of trusted, project-owned nodes, not a
+zero-trust mesh of independently-operated ones, so the marginal security
+value of per-node identity doesn't justify roughly 5x the certificate
+bookkeeping for no property this project's own threat model (external,
+untrusted access) actually needs.
+
+**Alternatives considered and rejected:**
+- **mTLS for edge→ingestion**, covered above -- rejected on operational
+  grounds for this deployment model, not security ones.
+- **JWT session tokens instead of a static API key**: rejected as
+  unnecessary complexity -- a JWT's main advantage (short-lived, so a leak
+  self-heals) matters most for interactive user sessions; a site's
+  edge-to-ingestion traffic is a long-running service-to-service
+  relationship where a rotatable static key with an explicit revoke path
+  is simpler and just as controllable.
+- **Per-node Cassandra/Kafka identity certificates**: rejected above.
+- **A real ACME/Let's-Encrypt-style CA**: not applicable -- nothing here
+  has a publicly resolvable domain, and doing so would add real operational
+  weight (renewal automation, rate limits) for traffic that's entirely
+  internal to this project's own simulated infrastructure.
+
+**Impact if approved:**
+- `scripts/generate_certs.sh`: new, generates the project CA plus
+  Cassandra/Kafka/Central-Ingestion certs and keystores.
+- New `internal/auth` package: API key hashing/verification, HTTP
+  middleware.
+- `internal/dedup` (or a new small store): `site_api_keys` table and
+  accessors.
+- `cmd/pharos-cli`: new `site create-key`/`site revoke-key` subcommands.
+- `cmd/pharos-ingestion`, `cmd/pharos-edge`: TLS server/client wiring,
+  API-key middleware and header.
+- `internal/dedup`, `internal/consumer`, `internal/query`: gocql
+  `SslOpts`/TLS config.
+- `internal/kafka`: kafka-go TLS config for producer and reader.
+- `docker-compose.yml`: Cassandra `client_encryption_options`/
+  `server_encryption_options`, Kafka `SSL://` listeners, mounted
+  certs/keystores.
+- Wire format unaffected -- this slice is transport security and identity,
+  not data model.
+
+**Addendum [2026-09-05], written after actually bringing TLS up:** the
+"Cassandra and Kafka both terminate real TLS" scope above was narrowed once
+live verification produced repeated, genuine OOM kills (`docker inspect`:
+`OOMKilled: true`) that survived Slice 14's own heap tuning -- TLS's
+Netty/JVM SSL buffer allocation is a real, largely fixed per-process memory
+cost (~250-300MB/broker observed for Kafka, similar magnitude for
+Cassandra), and encrypting *every* listener across 10 nodes doesn't fit this
+host's ~6.3GB Docker VM budget on top of that. Both client-to-server and
+inter-node/inter-broker TLS were verified working in isolation (TLS
+connections succeeded, plaintext ones were correctly refused, cross-DC
+gossip worked over TLS) -- the constraint is the combined memory cost, not
+a configuration bug. Scope shipped: `client_encryption_options` only for
+Cassandra (the CQL port, genuinely reachable by "any process" -- the actual
+exposure this slice exists to close); Cassandra's `internode_encryption`
+stays `none`, since port 7000 is never exposed to the host at all, already
+contained within the private Docker network. Kafka mirrors this: `EXTERNAL`
+(client-facing, host-exposed) is `SSL`, `INTERNAL` (inter-broker) stays
+`PLAINTEXT`. Kafka cluster B (`dc-eu`) also dropped from 2 brokers to 1 --
+it's a pure MirrorMaker2 replication target the application never
+coordinates `LOCAL_QUORUM`/ISR against directly, the same reasoning Slice 14
+used to justify `dc-eu`'s node count in the first place.
+
+Even after that narrowing, live verification kept OOM-killing a Cassandra
+node (confirmed via `docker inspect`, twice, hitting a *different* node each
+time -- cassandra-2, then cassandra-3 -- the OOM killer picking whichever
+process scores worst under pressure, not one specific node's bug) the
+moment Kafka's 4 brokers came up alongside all 5 Cassandra nodes. Measured
+steady state at failure: 5 Cassandra nodes ~4.4GB + 4 Kafka brokers ~1.9GB +
+Prometheus/Grafana ~62MB = ~6.4GB against the 6.275GB ceiling, with
+MirrorMaker 2's own JVM not even started yet -- a sustained overcommit, not
+a startup spike (staggering the restart didn't fix it). Applying the exact
+same "`dc-eu` isn't `LOCAL_QUORUM`-coordinated" reasoning a second time:
+**`dc-eu` Cassandra dropped from 2 nodes/RF=2 to 1 node/RF=1** (`cassandra-5`
+removed entirely -- `docker-compose.yml`, `migrations/001_init_schema.cql`,
+and the `RemoteDCs` default in all four Go call sites that build a
+`CassandraConfig`/`CassandraStoreConfig`/`CassandraServiceConfig` updated
+together). This freed roughly one full Cassandra JVM's worth of RSS
+(~800-900MB), restoring comfortable headroom for Kafka and MirrorMaker 2
+together. RF=1 against a single-node DC is not a shortcut -- RF=2 there
+would leave the keyspace under-replicated in `dc-eu` by construction, the
+exact bug Slice 14 originally fixed by matching node count to RF; this is
+the same fix applied a second time as the constraint got tighter.
+`internal/faultinjection/regional_partition_test.go`'s partition scenario
+(the property this whole 2-DC topology exists to prove) still holds with a
+single-node `dc-eu`: gossip-marking it `DN` during the partition and
+hinted-handoff catch-up after healing work identically with 1 node as with
+2 -- only `dc-eu`'s own internal replication redundancy changes, and nothing
+in this project's application logic or tests ever exercised that.
+
+Two more real, previously-latent bugs found only by actually running this,
+not by planning it:
+1. **gocql's shared-token-aware-host-policy panic.** `TokenAwareHostPolicy`
+   instances can't be reused across `CreateSession()` calls on the same
+   `*gocql.ClusterConfig` (`"sharing token aware host selection policy
+   between sessions is not supported"`) -- latent since Slice 14 introduced
+   DC-aware host selection, surfaced only when a connection attempt fails
+   and falls through to the existing "connect without keyspace, create it,
+   reconnect" retry path, which reused one cluster config (and its single
+   policy instance) across multiple `CreateSession()` attempts. Fixed with a
+   `newClusterConfig()` helper building a genuinely fresh `*gocql.ClusterConfig`
+   per attempt, in both `internal/dedup/cassandra_store.go` and
+   `internal/consumer/canonical_store.go`.
+2. **Two integration tests built a raw `kafkaGo.NewReader` directly**
+   (`internal/consumer/consumer_integration_test.go`,
+   `internal/faultinjection/out_of_order_test.go`), bypassing
+   `consumer.NewKafkaReader` -- left over from before this slice, never
+   updated, so their readers had no TLS `Dialer` and got a plaintext `EOF`/
+   zero-messages-drained failure the moment Kafka's client listener became
+   SSL-only. Real broker-side logs (`Failed authentication ... SSL handshake
+   failed`, source `192.168.65.1` -- Docker Desktop's host-gateway address,
+   confirming it was the host-run `go test` process) confirmed a plaintext
+   client hitting the SSL port, not a resource issue. Fixed by routing both
+   through `NewKafkaReader(engineCfg)` like every other reader in this
+   codebase.
+
+One environmental finding, not an application bug: running the full suite
+with `go test`'s default package parallelism (`-p` = `GOMAXPROCS`) genuinely
+OOM-killed `cassandra-1` mid-run -- every package opening its own
+Cassandra/Kafka connections simultaneously, on top of `-race`'s own
+overhead, is real added load this already-tight topology has no headroom
+for, distinct from the idle steady-state fit verified above. Serializing
+package execution (`-p 1`) fixed it with no other change -- applied to both
+local verification and `.github/workflows/ci.yml`. With that, the client
+`pharos-cli site create-key`/`revoke-key`, `pharos-ingestion`
+(`--enable-auth --tls-cert --tls-key --ca-cert`), and `pharos-edge`
+(`--api-key --ca-cert`) binaries were all verified for real, built and run
+directly (not just unit-tested): TLS handshake succeeds, `/healthz` stays
+unauthenticated, an unauthenticated submission gets 401, a submission
+claiming a different site than the authenticated one gets 403, a revoked
+key is rejected, and a real edge-captured event genuinely flows edge ->
+(TLS + API key) -> Central Ingestion -> Cassandra outbox -> Kafka, ending
+`PUBLISHED` -- confirmed by querying the live `pharos.event_outbox` table
+directly, not by trusting the HTTP response alone. The full suite
+(`go test -race -count=1 -p 1 ./...`) then passed cleanly twice in a row
+against this final topology (4 Cassandra nodes, 4 Kafka brokers,
+MirrorMaker2, all TLS-enabled on their client-facing listeners).
+
+---
+
 #### [2026-09-05] Slice 14: Multi-Region Cassandra + Kafka (Simulated)
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-05).

@@ -16,6 +16,7 @@ import (
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
 
 func main() {
@@ -26,6 +27,7 @@ func main() {
 	cassandraHosts := flag.String("cassandra-hosts", "127.0.0.1", "Comma-separated Cassandra host addresses")
 	cassandraPort := flag.Int("cassandra-port", 9042, "Cassandra port")
 	cassandraKeyspace := flag.String("cassandra-keyspace", "pharos", "Cassandra keyspace")
+	caCert := flag.String("ca-cert", "", "CA certificate file for verifying TLS connections to Cassandra (§2.4, Slice 15)")
 	latenessTolerance := flag.Duration("lateness-tolerance", 15*time.Minute, "Event-time bounded lateness tolerance")
 	idleTimeout := flag.Duration("idle-timeout", 10*time.Minute, "Idle partition exclusion threshold")
 	useMemoryStore := flag.Bool("use-memory-store", false, "Use in-memory canonical store (for standalone testing)")
@@ -44,6 +46,9 @@ func main() {
 		cCfg.Hosts = hosts
 		cCfg.Port = *cassandraPort
 		cCfg.Keyspace = *cassandraKeyspace
+		if *caCert != "" {
+			cCfg.TLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+		}
 
 		log.Printf("[pharos-consumer] Connecting to Cassandra at %s:%d (keyspace: %s)...", hosts[0], *cassandraPort, *cassandraKeyspace)
 		cStore, err := consumer.NewCassandraCanonicalStore(cCfg)
@@ -77,16 +82,26 @@ func main() {
 
 	// 3. Initialize Kafka Consumer Engine
 	brokers := strings.Split(*kafkaBrokers, ",")
+	var kafkaTLS *tlsutil.ClientConfig
+	if *caCert != "" {
+		kafkaTLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+	}
 	if !*useMemoryStore {
-		_ = kafka.EnsureTopics(context.Background(), brokers, kafka.DefaultTopicConfigs())
+		_ = kafka.EnsureTopicsTLS(context.Background(), brokers, kafka.DefaultTopicConfigs(), kafkaTLS)
 	}
 	engineCfg := consumer.DefaultEngineConfig(brokers)
 	engineCfg.Topic = *kafkaTopic
 	engineCfg.GroupID = *kafkaGroup
 	engineCfg.LatenessTolerance = *latenessTolerance
 	engineCfg.IdleTimeout = *idleTimeout
+	if kafkaTLS != nil {
+		engineCfg.TLS = kafkaTLS
+	}
 
-	reader := consumer.NewKafkaReader(engineCfg)
+	reader, err := consumer.NewKafkaReader(engineCfg)
+	if err != nil {
+		log.Fatalf("[pharos-consumer] Failed to build Kafka reader: %v", err)
+	}
 	engine := consumer.NewEngine(reader, store, tracker, engineCfg)
 
 	ctx, cancel := context.WithCancel(context.Background())

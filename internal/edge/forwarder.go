@@ -23,8 +23,13 @@ type HTTPClient interface {
 
 // ForwarderConfig defines the operational parameters for the edge store-and-forward worker (§2.1).
 type ForwarderConfig struct {
-	CentralURL     string        `json:"central_url"`
-	SiteID         string        `json:"site_id"`
+	CentralURL string `json:"central_url"`
+	SiteID     string `json:"site_id"`
+	// APIKey authenticates this site to Central Ingestion (§2.1, §2.2,
+	// ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"). Empty means no
+	// X-API-Key header is sent -- fine against an ingestion instance
+	// running with --enable-auth=false, rejected otherwise.
+	APIKey         string        `json:"-"`
 	BatchSize      int           `json:"batch_size"`
 	PollInterval   time.Duration `json:"poll_interval"`
 	RequestTimeout time.Duration `json:"request_timeout"`
@@ -127,6 +132,9 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Site-ID", f.cfg.SiteID)
+	if f.cfg.APIKey != "" {
+		httpReq.Header.Set("X-API-Key", f.cfg.APIKey)
+	}
 
 	// 3. Send HTTP request to Central Ingestion
 	metrics.ForwarderAttemptsTotal.Inc()

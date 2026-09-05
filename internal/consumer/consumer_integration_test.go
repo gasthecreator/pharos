@@ -10,7 +10,6 @@ import (
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/model"
 	"github.com/google/uuid"
-	kafkaGo "github.com/segmentio/kafka-go"
 )
 
 func TestCassandraCanonicalStore_RealIntegration(t *testing.T) {
@@ -163,15 +162,14 @@ func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {
 	engineCfg.LatenessTolerance = 10 * time.Minute
 	engineCfg.IdleTimeout = 30 * time.Second
 
-	reader := kafkaGo.NewReader(kafkaGo.ReaderConfig{
-		Brokers:        engineCfg.Brokers,
-		GroupID:        engineCfg.GroupID,
-		Topic:          engineCfg.Topic,
-		MinBytes:       10,
-		MaxBytes:       10e6,
-		CommitInterval: 0,
-		StartOffset:    kafkaGo.FirstOffset,
-	})
+	// NewKafkaReader (not a raw kafkaGo.NewReader) so the reader's Dialer
+	// picks up engineCfg.TLS -- real Kafka's client-facing listener is
+	// SSL-only as of Slice 15 (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15:
+	// Auth & TLS"), and a plaintext Dialer against it fails with EOF.
+	reader, err := NewKafkaReader(engineCfg)
+	if err != nil {
+		t.Fatalf("failed to create Kafka reader: %v", err)
+	}
 	defer reader.Close()
 
 	tracker := NewWatermarkTracker(engineCfg.LatenessTolerance, engineCfg.IdleTimeout)
