@@ -121,7 +121,13 @@ appear on cluster B. New fault-injection test passed against the real
 topology: real `tc`-induced partition, gossip genuinely marking `dc-eu`
 `DN` (via `nodetool status`, not assumed), real write+read via the actual
 application code succeeding throughout, partition healed, during-partition
-write confirmed reaching `dc-eu` via hinted handoff.
+write confirmed reaching `dc-eu` via hinted handoff. Separately verified the
+steady-state simulated-WAN-latency half of "Simulated WAN conditions" (not
+just the full-partition case): applied real `tc netem delay 100ms 20ms`
+(not `loss`) surgically between `dc-us` and `dc-eu` via the same `tc filter`
+u32-matching mechanism, confirmed `LOCAL_QUORUM` operations against `dc-us`
+stayed fast and unaffected while the artificial cross-region delay was
+active, then cleaned up.
 
 ---
 
