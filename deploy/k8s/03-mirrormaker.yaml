@@ -1,0 +1,48 @@
+# MirrorMaker 2: dc-us -> dc-eu replication (§2.4, PLAN.md Slice 17:
+# Deployment automation) -- a single Deployment, not a StatefulSet, since
+# MM2's own internal state topics live inside the Kafka clusters it
+# connects to, not on local disk (matching Docker Compose's own
+# container, which has no persistent volume either).
+#
+# The mm2-config ConfigMap this Deployment mounts is NOT defined here --
+# deploy/k8s/deploy.sh creates it directly from deploy/k8s/mm2.properties
+# (`kubectl create configmap mm2-config --from-file=...`) so that file
+# stays the single source of truth rather than being duplicated inline.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mirrormaker
+  namespace: pharos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mirrormaker
+  template:
+    metadata:
+      labels:
+        app: mirrormaker
+    spec:
+      containers:
+        - name: mirrormaker
+          image: apache/kafka:3.8.0
+          command: ["/opt/kafka/bin/connect-mirror-maker.sh", "/mm2/mm2.properties"]
+          env:
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx192M -Xms192M"
+          volumeMounts:
+            - name: mm2-config
+              mountPath: /mm2
+            - name: tls
+              mountPath: /etc/kafka/secrets
+              readOnly: true
+      volumes:
+        - name: mm2-config
+          configMap:
+            name: mm2-config
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: kafka-truststore.jks
+                path: kafka-truststore.jks

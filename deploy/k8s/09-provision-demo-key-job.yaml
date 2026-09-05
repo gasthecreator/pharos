@@ -1,0 +1,37 @@
+# One-shot Job provisioning SITE-K8S-DEMO's API key entirely in-cluster
+# (§2.4, PLAN.md Slice 17: Deployment automation) -- runs pharos-cli
+# against Cassandra's in-cluster DNS name directly, so deploy.sh never
+# needs a host-side `kubectl port-forward` just to run one admin command.
+# deploy.sh greps the Job's own pod logs for the printed key and stores it
+# in a Secret; the key itself is never written to this file.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pharos-provision-demo-key
+  namespace: pharos
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: pharos-cli
+          image: pharos-cli:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--hosts=cassandra-us-0.cassandra.pharos.svc.cluster.local"
+            - "--ca-cert=/tls/ca-cert.pem"
+            - "site"
+            - "create-key"
+            - "SITE-K8S-DEMO"
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: ca-cert.pem
+                path: ca-cert.pem

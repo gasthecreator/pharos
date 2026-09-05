@@ -1,0 +1,246 @@
+# Cassandra: two StatefulSets (dc-us: 3 replicas, dc-eu: 1 replica) sharing
+# one headless Service for gossip discovery -- the same topology already
+# proven in Docker Compose (Slice 14/15), translated to K8s primitives
+# (§2.4, PLAN.md Slice 17: Deployment automation). Two StatefulSets, not
+# one with per-pod CASSANDRA_DC logic, because CASSANDRA_DC/RACK are
+# static per Cassandra "rack" (K8s rack-awareness/topology scheduling is
+# out of this slice's scope -- one simplified rack per DC, not the 2-3
+# racks Docker Compose used, since nothing in this project's application
+# logic or tests depends on intra-DC rack placement, only cross-DC
+# LOCAL_QUORUM routing).
+apiVersion: v1
+kind: Service
+metadata:
+  name: cassandra
+  namespace: pharos
+  labels:
+    app: cassandra
+spec:
+  clusterIP: None
+  selector:
+    app: cassandra
+  ports:
+    - name: cql
+      port: 9042
+    - name: intra-node
+      port: 7000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cassandra-us
+  namespace: pharos
+spec:
+  serviceName: cassandra
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cassandra
+      statefulset: cassandra-us
+  template:
+    metadata:
+      labels:
+        app: cassandra
+        statefulset: cassandra-us
+    spec:
+      # ConfigMap volumes are always read-only in K8s -- unlike Docker
+      # Compose's non-":ro" bind mount for the same file, which happens to
+      # be read-write by default. The stock Cassandra entrypoint does
+      # `find "$CASSANDRA_CONF" ... -exec chown cassandra` under `set -e`
+      # (the exact same behavior Slice 15 already found and worked around
+      # for TLS materials by relocating them to /tls/), and it fails
+      # outright on a read-only cassandra.yaml -- found by watching the
+      # pod actually CrashLoopBackOff on first deploy, not anticipated.
+      # Fixed by copying the ConfigMap's file into a writable emptyDir via
+      # an initContainer, then subPath-mounting *that* (subPath mounts a
+      # single file without shadowing the rest of /etc/cassandra, and
+      # inherits the emptyDir's read-write nature) at the real path.
+      initContainers:
+        - name: cassandra-yaml-init
+          image: cassandra:5.0
+          command: ["sh", "-c", "cp /configmap/cassandra.yaml /writable/cassandra.yaml"]
+          volumeMounts:
+            - name: cassandra-yaml-configmap
+              mountPath: /configmap
+            - name: cassandra-yaml-writable
+              mountPath: /writable
+      containers:
+        - name: cassandra
+          image: cassandra:5.0
+          ports:
+            - containerPort: 9042
+              name: cql
+            - containerPort: 7000
+              name: intra-node
+          env:
+            - name: CASSANDRA_CLUSTER_NAME
+              value: "PharosCluster"
+            - name: CASSANDRA_DC
+              value: "dc-us"
+            - name: CASSANDRA_RACK
+              value: "rack1"
+            - name: CASSANDRA_ENDPOINT_SNITCH
+              value: "GossipingPropertyFileSnitch"
+            - name: CASSANDRA_SEEDS
+              value: "cassandra-us-0.cassandra.pharos.svc.cluster.local,cassandra-eu-0.cassandra.pharos.svc.cluster.local"
+            - name: MAX_HEAP_SIZE
+              value: "208M"
+            - name: HEAP_NEWSIZE
+              value: "52M"
+            - name: JVM_EXTRA_OPTS
+              value: "-XX:MaxDirectMemorySize=224M"
+          volumeMounts:
+            - name: cassandra-data
+              mountPath: /var/lib/cassandra
+            - name: cassandra-yaml-writable
+              mountPath: /etc/cassandra/cassandra.yaml
+              subPath: cassandra.yaml
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "SSL_CERTFILE=/tls/ca-cert.pem cqlsh 127.0.0.1 9042 --ssl -e 'DESCRIBE CLUSTER'"]
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 20
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "SSL_CERTFILE=/tls/ca-cert.pem cqlsh 127.0.0.1 9042 --ssl -e 'DESCRIBE CLUSTER'"]
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 6
+      volumes:
+        - name: cassandra-yaml-configmap
+          configMap:
+            name: cassandra-yaml
+        - name: cassandra-yaml-writable
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: cassandra-keystore.jks
+                path: cassandra-keystore.jks
+              - key: ca-cert.pem
+                path: ca-cert.pem
+  volumeClaimTemplates:
+    - metadata:
+        name: cassandra-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cassandra-eu
+  namespace: pharos
+spec:
+  serviceName: cassandra
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cassandra
+      statefulset: cassandra-eu
+  template:
+    metadata:
+      labels:
+        app: cassandra
+        statefulset: cassandra-eu
+    spec:
+      # ConfigMap volumes are always read-only in K8s -- unlike Docker
+      # Compose's non-":ro" bind mount for the same file, which happens to
+      # be read-write by default. The stock Cassandra entrypoint does
+      # `find "$CASSANDRA_CONF" ... -exec chown cassandra` under `set -e`
+      # (the exact same behavior Slice 15 already found and worked around
+      # for TLS materials by relocating them to /tls/), and it fails
+      # outright on a read-only cassandra.yaml -- found by watching the
+      # pod actually CrashLoopBackOff on first deploy, not anticipated.
+      # Fixed by copying the ConfigMap's file into a writable emptyDir via
+      # an initContainer, then subPath-mounting *that* (subPath mounts a
+      # single file without shadowing the rest of /etc/cassandra, and
+      # inherits the emptyDir's read-write nature) at the real path.
+      initContainers:
+        - name: cassandra-yaml-init
+          image: cassandra:5.0
+          command: ["sh", "-c", "cp /configmap/cassandra.yaml /writable/cassandra.yaml"]
+          volumeMounts:
+            - name: cassandra-yaml-configmap
+              mountPath: /configmap
+            - name: cassandra-yaml-writable
+              mountPath: /writable
+      containers:
+        - name: cassandra
+          image: cassandra:5.0
+          ports:
+            - containerPort: 9042
+              name: cql
+            - containerPort: 7000
+              name: intra-node
+          env:
+            - name: CASSANDRA_CLUSTER_NAME
+              value: "PharosCluster"
+            - name: CASSANDRA_DC
+              value: "dc-eu"
+            - name: CASSANDRA_RACK
+              value: "rack1"
+            - name: CASSANDRA_ENDPOINT_SNITCH
+              value: "GossipingPropertyFileSnitch"
+            - name: CASSANDRA_SEEDS
+              value: "cassandra-us-0.cassandra.pharos.svc.cluster.local,cassandra-eu-0.cassandra.pharos.svc.cluster.local"
+            - name: MAX_HEAP_SIZE
+              value: "208M"
+            - name: HEAP_NEWSIZE
+              value: "52M"
+            - name: JVM_EXTRA_OPTS
+              value: "-XX:MaxDirectMemorySize=224M"
+          volumeMounts:
+            - name: cassandra-data
+              mountPath: /var/lib/cassandra
+            - name: cassandra-yaml-writable
+              mountPath: /etc/cassandra/cassandra.yaml
+              subPath: cassandra.yaml
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "SSL_CERTFILE=/tls/ca-cert.pem cqlsh 127.0.0.1 9042 --ssl -e 'DESCRIBE CLUSTER'"]
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 15
+            failureThreshold: 20
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "SSL_CERTFILE=/tls/ca-cert.pem cqlsh 127.0.0.1 9042 --ssl -e 'DESCRIBE CLUSTER'"]
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 15
+            failureThreshold: 6
+      volumes:
+        - name: cassandra-yaml-configmap
+          configMap:
+            name: cassandra-yaml
+        - name: cassandra-yaml-writable
+          emptyDir: {}
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: cassandra-keystore.jks
+                path: cassandra-keystore.jks
+              - key: ca-cert.pem
+                path: ca-cert.pem
+  volumeClaimTemplates:
+    - metadata:
+        name: cassandra-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

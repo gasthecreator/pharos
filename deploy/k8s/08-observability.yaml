@@ -1,0 +1,80 @@
+# Prometheus scraping the three app services' /metrics endpoints directly
+# by their K8s Service DNS names (§2.4, PLAN.md Slice 17: Deployment
+# automation) -- the K8s-native equivalent of observability/prometheus.yml's
+# host.docker.internal targets. Grafana omitted here deliberately: it adds
+# no new deployment-automation surface beyond what Prometheus already
+# demonstrates (a Deployment + ConfigMap + Service, wired to Slice 6's
+# metrics), and this slice's stated scope is proving health/readiness
+# probes and the deploy mechanics work, not re-shipping every observability
+# component from Slice 6 into a second runtime.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: pharos
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 10s
+    scrape_configs:
+      - job_name: "pharos-ingestion"
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        static_configs:
+          - targets: ["pharos-ingestion.pharos.svc.cluster.local:8443"]
+      - job_name: "pharos-consumer"
+        static_configs:
+          - targets: ["pharos-consumer.pharos.svc.cluster.local:9091"]
+      - job_name: "pharos-edge-site-k8s-demo"
+        static_configs:
+          - targets: ["pharos-edge-site-k8s-demo.pharos.svc.cluster.local:8080"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: pharos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          readinessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: 9090
+            initialDelaySeconds: 10
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: pharos
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090

@@ -51,16 +51,31 @@ EOF
 # 2. Cassandra: shared cert across all 5 nodes (dc-us: 1-3, dc-eu: 4-5),
 # covering both container-internal names (inter-node + in-container client
 # access) and localhost/127.0.0.1 (host-side Go clients via the exposed port).
-issue_cert "cassandra" "Pharos Cassandra Cluster" \
-  "DNS:localhost,DNS:pharos-cassandra-1,DNS:pharos-cassandra-2,DNS:pharos-cassandra-3,DNS:pharos-cassandra-4,DNS:pharos-cassandra-5,IP:127.0.0.1"
+# EXTRA_CASSANDRA_SANS/EXTRA_KAFKA_SANS (empty by default, unused by the
+# Docker Compose flow) let deploy/k8s's own cert-generation step (§2.4,
+# PLAN.md Slice 17: Deployment automation) append K8s headless-Service DNS
+# names to the same shared cert/CA rather than duplicating this whole
+# script for a second SAN list.
+CASSANDRA_SANS="DNS:localhost,DNS:pharos-cassandra-1,DNS:pharos-cassandra-2,DNS:pharos-cassandra-3,DNS:pharos-cassandra-4,DNS:pharos-cassandra-5,IP:127.0.0.1"
+if [ -n "${EXTRA_CASSANDRA_SANS:-}" ]; then
+  CASSANDRA_SANS="${CASSANDRA_SANS},${EXTRA_CASSANDRA_SANS}"
+fi
+issue_cert "cassandra" "Pharos Cassandra Cluster" "${CASSANDRA_SANS}"
 
 # 3. Kafka: shared cert across all 5 brokers (cluster A: 1-3, cluster B: 4-5).
-issue_cert "kafka" "Pharos Kafka Clusters" \
-  "DNS:localhost,DNS:pharos-kafka-1,DNS:pharos-kafka-2,DNS:pharos-kafka-3,DNS:pharos-kafka-4,DNS:pharos-kafka-5,IP:127.0.0.1"
+KAFKA_SANS="DNS:localhost,DNS:pharos-kafka-1,DNS:pharos-kafka-2,DNS:pharos-kafka-3,DNS:pharos-kafka-4,DNS:pharos-kafka-5,IP:127.0.0.1"
+if [ -n "${EXTRA_KAFKA_SANS:-}" ]; then
+  KAFKA_SANS="${KAFKA_SANS},${EXTRA_KAFKA_SANS}"
+fi
+issue_cert "kafka" "Pharos Kafka Clusters" "${KAFKA_SANS}"
 
-# 4. Central Ingestion: host-process HTTP listener, not containerized.
-issue_cert "ingestion" "Pharos Central Ingestion" \
-  "DNS:localhost,IP:127.0.0.1"
+# 4. Central Ingestion: host-process HTTP listener, not containerized
+# (except under deploy/k8s, which appends its own Service DNS name here).
+INGESTION_SANS="DNS:localhost,IP:127.0.0.1"
+if [ -n "${EXTRA_INGESTION_SANS:-}" ]; then
+  INGESTION_SANS="${INGESTION_SANS},${EXTRA_INGESTION_SANS}"
+fi
+issue_cert "ingestion" "Pharos Central Ingestion" "${INGESTION_SANS}"
 
 # 5. Cassandra/Kafka need Java keystores (JKS), not raw PEM -- both images
 # bundle a JVM with keytool, but building the keystore here (on the host,

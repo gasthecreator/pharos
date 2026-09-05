@@ -1,0 +1,104 @@
+# Edge Collector Deployment (§2.4, PLAN.md Slice 17: Deployment
+# automation) -- one example site (SITE-K8S-DEMO). Real deployments run
+# one of these per clinical trial site (§2.1); this is a template to copy
+# per site, not a fleet controller (that's out of scope -- this project's
+# deployment model is "one binary per site," not multi-tenant, per
+# PLAN.md §2.1's own resolved decision). A real PVC, not emptyDir, for its
+# SQLite durability queue: the whole point of Slice 12/13's crash/restart
+# hardening is that this queue survives a pod restart.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pharos-edge-site-k8s-demo-data
+  namespace: pharos
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pharos-edge-site-k8s-demo
+  namespace: pharos
+spec:
+  selector:
+    app: pharos-edge-site-k8s-demo
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pharos-edge-site-k8s-demo
+  namespace: pharos
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # exactly one writer for this site's SQLite file at a time
+  selector:
+    matchLabels:
+      app: pharos-edge-site-k8s-demo
+  template:
+    metadata:
+      labels:
+        app: pharos-edge-site-k8s-demo
+    spec:
+      containers:
+        - name: pharos-edge
+          image: pharos-edge:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--site-id=SITE-K8S-DEMO"
+            - "--port=8080"
+            - "--db-path=/data/pharos-edge.db"
+            - "--central-url=https://pharos-ingestion.pharos.svc.cluster.local:8443/api/v1/events"
+            - "--ca-cert=/tls/ca-cert.pem"
+            - "--api-key=$(PHAROS_API_KEY)"
+          env:
+            - name: PHAROS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pharos-site-k8s-demo-key
+                  key: api-key
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: pharos-edge-site-k8s-demo-data
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: ca-cert.pem
+                path: ca-cert.pem

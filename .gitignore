@@ -49,3 +49,7 @@ data/
 # scripts/loadtest_setup.sh; live plaintext API keys, never committed)
 /loadtest/sites.json
 /loadtest/results/
+
+# Slice 17 K8s-targeted TLS materials (generated fresh per deploy by
+# deploy/k8s/generate_k8s_certs.sh; private keys, same reasoning as /certs/)
+/deploy/k8s/certs/

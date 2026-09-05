@@ -1,0 +1,18 @@
+# pharos-cli container image (PLAN.md Slice 17: Deployment automation) --
+# used as a one-off in-cluster Job for admin tasks like provisioning a
+# site's API key (deploy/k8s/09-provision-demo-key-job.yaml), so it never
+# needs a host-side port-forward to reach Cassandra just to run a CLI
+# command. See Dockerfile.ingestion for why scratch + CGO_ENABLED=0 is
+# genuinely sufficient (no cgo anywhere in this project).
+FROM golang:1.25-alpine AS builder
+RUN apk add --no-cache ca-certificates
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /out/pharos-cli ./cmd/pharos-cli
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/pharos-cli /pharos-cli
+ENTRYPOINT ["/pharos-cli"]
