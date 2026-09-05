@@ -48,6 +48,21 @@ jobs:
         with:
           go-version: "1.25"
 
+      # generate_certs.sh needs `keytool` (to build Cassandra/Kafka's JKS
+      # keystores/truststores) -- ubuntu-latest doesn't guarantee a JDK on
+      # PATH without this.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # certs/ is gitignored (private keys must never be committed), so a
+      # fresh checkout has none -- generate the project CA and every
+      # service cert/keystore before anything mounts them (§2.4,
+      # ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+      - name: Generate TLS materials
+        run: ./scripts/generate_certs.sh
+
       # Cassandra and Kafka come up first, deliberately *without*
       # mirrormaker (§2.4, Slice 14: Multi-Region Cassandra + Kafka) --
       # starting it before any topic exists means it immediately busy-loops
