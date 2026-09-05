@@ -15,6 +15,77 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-05] Slice 12: Edge Collector Durability Hardening
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-05).
+
+**What in PLAN.md this touches:** §2.1 (edge durability), Phase 2 Slice 12.
+
+**The three options PLAN.md named, weighed against each other:**
+
+1. **Periodic backup to a second local path or removable media.** Chosen.
+2. **A lightweight local replica process.** Rejected: this means running a
+   *second daemon per site*, needing its own failure handling, its own
+   monitoring, and (if it's ever meant to actually take over on primary
+   failure) a real leader-election/failover story — a lot of new
+   operational surface for a single-machine resiliency problem, at a trial
+   site that this project's own §2.1 reasoning already assumes is
+   resource-constrained and likely unstaffed by anyone who'd notice a
+   second process misbehaving.
+3. **Document and accept the residual exposure window.** Rejected as the
+   *sole* answer, but its instinct is right and shows up in what's actually
+   built: periodic backup doesn't eliminate the exposure window either, it
+   only bounds it to "whatever changed since the last backup interval" —
+   that residual window is stated explicitly below, not hidden.
+
+**Decision: periodic `VACUUM INTO`, not raw file copying.** SQLite has a
+built-in mechanism for exactly this — `VACUUM INTO '<path>'` produces a
+complete, transactionally-consistent snapshot of the database even while
+it's actively being written to, which a naive `cp` of the `.db` file next
+to a live WAL cannot safely guarantee (a raw copy mid-write can capture an
+inconsistent state). `modernc.org/sqlite` (already this project's only
+SQLite dependency) implements the full SQLite engine, so this is a
+standard SQL statement, not a new dependency. A background goroutine in
+`pharos-edge` runs it on a configurable interval (default 5 minutes) to a
+configurable second path — same mechanism whether that path is another
+local directory or removable media; it's just a file path either way.
+
+**The other half, which makes the backup actually useful: restore-on-missing-primary.**
+A backup nobody ever reads back is not a durability story, just a second
+place to lose. `SQLiteStore`'s constructor now checks: if the primary
+database file doesn't exist *and* a backup file exists at the configured
+path, copy the backup into place before opening it, restoring transparently.
+If neither exists, this is genuinely a fresh instance and Slice 8's
+epoch-based key resilience already handles that safely. If the primary
+*does* exist, the backup is irrelevant and ignored — there's nothing to
+restore.
+
+**The residual exposure window, stated plainly:** anything captured after
+the last successful backup and lost before the next one runs is still at
+risk if the primary disk fails in that window. Bounded by the backup
+interval (default 5 minutes means at most ~5 minutes of exposure), not
+eliminated. This is an explicit, accepted tradeoff, not an oversight — a
+tighter interval trades more disk I/O for a smaller window, and is
+configurable per deployment.
+
+**Alternatives considered:** continuous (not periodic) replication via
+tailing the WAL file directly. Rejected: `VACUUM INTO` already gives a
+correct, complete snapshot with a single SQL statement and no new failure
+modes of its own; hand-rolling WAL-tailing would need to reimplement
+SQLite's own crash-consistency guarantees to be safe, for a marginal
+reduction in the exposure window over just shortening the backup interval.
+
+**Impact if approved:**
+- `internal/edge/sqlite_store.go`: restore-on-missing-primary in the
+  constructor, a new `Backup(ctx, path string) error` method wrapping
+  `VACUUM INTO`.
+- `cmd/pharos-edge/main.go`: new `--backup-path`/`--backup-interval` flags
+  and a background goroutine calling `Backup` on that interval.
+- No changes to the wire format, Central Ingestion, or any Cassandra
+  schema — this is purely an edge-local durability improvement.
+
+---
+
 #### [2026-09-05] Slice 11: Data Retention & Lifecycle (Tiered Archival)
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-05).

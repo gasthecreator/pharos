@@ -40,6 +40,68 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 12 — edge collector durability hardening
+
+**Author:** Claude Code
+
+**What:** Periodic SQLite backup (`VACUUM INTO`, not raw file copy) plus
+restore-on-missing-primary at edge startup, so a single site's disk failure
+no longer means silently losing whatever hadn't been forwarded yet.
+
+**Why:** Per `PLAN.md`'s Slice 12 — a site's entire local durability
+guarantee was one un-replicated SQLite file (the exact failure mode Slice
+8's epoch-based key resilience exists to survive *reconnection* after, but
+does nothing to prevent *data loss* from in the first place if the disk
+itself dies before forwarding completes).
+
+**How:** Weighed three options in `ARCHITECTURE_PROPOSALS.md`: periodic
+backup (chosen), a second local replica daemon (rejected — a whole new
+process with its own failure/monitoring/failover story is disproportionate
+operational surface for a single-machine problem at an unstaffed,
+resource-constrained trial site), and just documenting the exposure window
+(rejected as the *sole* answer, though its instinct — state the residual
+risk explicitly rather than pretend it's gone — is exactly what backup
+intervals do: bound the window, not eliminate it). `VACUUM INTO` was chosen
+over a raw `cp` of the `.db` file because SQLite's own mechanism produces a
+transactionally-consistent snapshot even while the database is being
+actively written to; a raw copy of a live WAL-mode file can capture an
+inconsistent mid-write state. Since `VACUUM INTO` refuses to run if its
+target already exists, `Backup` writes to a `.tmp` path first and renames
+atomically into place — this also means `RestoreFromBackupIfMissing` can
+never observe a half-written backup file.
+
+The restore check has to run *before* `NewSQLiteStore` opens the primary
+path at all: opening a nonexistent path in WAL mode immediately creates an
+empty file, at which point "genuinely fresh instance" and "primary lost,
+should restore" are indistinguishable. So `RestoreFromBackupIfMissing` is a
+free function called from `cmd/pharos-edge/main.go` ahead of
+`NewSQLiteStore`, not folded into the constructor itself — keeps
+`NewSQLiteStore`'s existing signature unchanged for every other caller
+(tests included) and makes the restore attempt an explicit, visible step in
+the edge binary's own startup sequence rather than a hidden side effect of
+opening a file.
+
+Verified with 6 new tests in `internal/edge/backup_test.go`, then live
+end-to-end against the real built `pharos-edge` binary: submitted a real
+adverse event over HTTP, waited for a real 3s backup cycle to fire, killed
+the process, deleted the primary `.db`/`-wal`/`-shm` files outright, then
+restarted with the same `--backup-path` — confirmed via `sqlite3` directly
+against the restored file that the exact row (correct `local_seq` included)
+survived, not just that a file happened to exist at the primary path.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry),
+`PLAN.md` (Slice 12 marked done), `internal/edge/sqlite_store.go`
+(`RestoreFromBackupIfMissing`, `Backup`), `internal/edge/backup_test.go`
+(new, 6 tests), `cmd/pharos-edge/main.go` (`--backup-path`/`--backup-interval`
+flags, restore-before-open call, periodic backup goroutine).
+
+**Verification:** `go build ./...`, `go vet ./...` clean. Full suite
+(`go test -race -count=1 ./...`) run twice against the live 3-node
+Cassandra / 3-broker Kafka cluster, both passes clean. Live binary
+verification as described above.
+
+---
+
 ## [2026-09-05] Claude Code: Slice 11 — data retention & lifecycle (tiered archival)
 
 **Author:** Claude Code

@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +54,55 @@ type SQLiteStore struct {
 // NewSQLiteStore opens or creates an embedded SQLite store with WAL mode enabled.
 func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 	return newSQLiteStore(dbPath, currentInstanceEpochMinutes)
+}
+
+// RestoreFromBackupIfMissing copies backupPath over dbPath when dbPath does
+// not yet exist and backupPath does (§2.1, ARCHITECTURE_PROPOSALS.md "Slice
+// 12: Edge Collector Durability Hardening"). Callers must invoke this before
+// NewSQLiteStore/NewSQLiteStoreWithEpochSource: opening a nonexistent path in
+// WAL mode immediately creates an empty file, at which point it's too late to
+// tell "genuinely new instance" apart from "primary lost, should restore."
+//
+// If dbPath already exists, or neither path exists, this is a no-op -- in the
+// no-primary-no-backup case this is genuinely a fresh instance, which Slice
+// 8's epoch-based key resilience already handles safely on its own. An empty
+// backupPath also short-circuits to a no-op, so callers can pass through an
+// unset flag unconditionally.
+func RestoreFromBackupIfMissing(dbPath, backupPath string) error {
+	if backupPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(dbPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to stat %s: %w", dbPath, err)
+	}
+	if _, err := os.Stat(backupPath); err != nil {
+		return nil
+	}
+
+	src, err := os.Open(backupPath)
+	if err != nil {
+		return fmt.Errorf("failed to open backup %s for restore: %w", backupPath, err)
+	}
+	defer src.Close()
+
+	if dir := filepath.Dir(dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create directory for %s: %w", dbPath, err)
+		}
+	}
+
+	dst, err := os.OpenFile(dbPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("failed to create %s for restore: %w", dbPath, err)
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("failed to restore %s from backup %s: %w", dbPath, backupPath, err)
+	}
+	return dst.Sync()
 }
 
 // NewSQLiteStoreWithEpochSource is NewSQLiteStore with an injectable source for
@@ -502,6 +554,48 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (QueueStats, error) {
 	}
 
 	return stats, nil
+}
+
+// Backup writes a complete, transactionally-consistent snapshot of the
+// current database to path via SQLite's own VACUUM INTO (§2.1,
+// ARCHITECTURE_PROPOSALS.md "Slice 12: Edge Collector Durability Hardening")
+// -- safe to call while the database is being actively written to, unlike a
+// raw copy of a live WAL-mode database file, which can capture an
+// inconsistent mid-write state.
+//
+// VACUUM INTO refuses to run if its target file already exists, so this
+// writes to a temporary path first and renames into place atomically -- both
+// so a retried Backup call never trips over a leftover target from a prior
+// attempt, and so RestoreFromBackupIfMissing can never observe a
+// partially-written backup file.
+func (s *SQLiteStore) Backup(ctx context.Context, path string) error {
+	if dir := filepath.Dir(path); dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("failed to create backup directory %s: %w", dir, err)
+		}
+	}
+
+	tmpPath := path + ".tmp"
+	_ = os.Remove(tmpPath)
+
+	s.mu.Lock()
+	// VACUUM INTO's target path is a SQL string literal, not a bindable
+	// parameter -- escape embedded single quotes defensively. path comes from
+	// a trusted operator-supplied CLI flag (cmd/pharos-edge), never from
+	// network input, but this keeps a stray quote from producing a confusing
+	// SQL syntax error instead of a clean one.
+	escaped := strings.ReplaceAll(tmpPath, "'", "''")
+	_, err := s.db.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s';", escaped))
+	s.mu.Unlock()
+	if err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("VACUUM INTO failed: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("failed to finalize backup at %s: %w", path, err)
+	}
+	return nil
 }
 
 // Close flushes WAL checkpoints and closes database connection.

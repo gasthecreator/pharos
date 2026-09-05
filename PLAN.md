@@ -378,6 +378,29 @@ with no change to their own content or intent.
   explicitly documenting and accepting the residual data-loss exposure
   window) rather than defaulting to the most complex option unexamined.
 
+  **Done 2026-09-05.** Periodic `VACUUM INTO` backup (not raw file copy —
+  produces a transactionally-consistent snapshot even while the primary is
+  actively being written to), plus restore-on-missing-primary at startup:
+  `RestoreFromBackupIfMissing(dbPath, backupPath)` copies the backup into
+  place before `NewSQLiteStore` ever opens the path, since opening a
+  nonexistent path in WAL mode immediately creates an empty file — too late
+  to tell "genuinely fresh instance" from "primary lost, should restore."
+  `pharos-edge` gained `--backup-path`/`--backup-interval` (default 5m) flags
+  and a background goroutine calling the new `Backup(ctx, path)` method on
+  that interval. Verified with 6 new tests in `internal/edge/backup_test.go`
+  (backup produces a genuinely restorable snapshot; repeated backups
+  overwrite cleanly via temp-file-then-rename since `VACUUM INTO` refuses an
+  existing target; restore fires only when the primary is truly absent;
+  restore is a strict no-op whenever the primary exists, even if a backup is
+  also present, so it can never clobber live data; both-absent stays a no-op
+  for Slice 8's epoch resilience to handle) and live end-to-end verification
+  against the actual built `pharos-edge` binary: submitted a real adverse
+  event, waited for a real backup cycle to fire, killed the process, deleted
+  the primary `.db`/`-wal`/`-shm` files outright (simulating full disk loss),
+  restarted with identical flags, and confirmed via `sqlite3` that the exact
+  row — correct `local_seq` included — was genuinely restored from the
+  backup file, not just present because deletion silently failed.
+
 - **Slice 13 — Consumer crash/restart fault-injection (watermark
   continuity).** Claude's own hands-on test work per §6, parallel to the
   node-failure scenarios already planned. Kill `pharos-consumer` mid-stream

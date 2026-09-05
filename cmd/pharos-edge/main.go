@@ -22,9 +22,18 @@ func main() {
 	centralURL := flag.String("central-url", "http://localhost:8081/api/v1/events", "Central Ingestion API URL")
 	batchSize := flag.Int("batch-size", 50, "Batch size for upstream forwarding")
 	pollInterval := flag.Duration("poll-interval", 1*time.Second, "Forwarder queue poll interval")
+	backupPath := flag.String("backup-path", "", "Path for periodic SQLite backups (§2.1, Slice 12); empty disables backup/restore")
+	backupInterval := flag.Duration("backup-interval", 5*time.Minute, "Interval between periodic SQLite backups")
 	flag.Parse()
 
 	log.Printf("[pharos-edge] Initializing edge collector for site: %s (db: %s)", *siteID, *dbPath)
+
+	// 0. Restore from backup if the primary database is missing but a backup
+	// exists (§2.1, Slice 12) -- must happen before the store is opened, since
+	// opening a nonexistent path in WAL mode immediately creates an empty file.
+	if err := edge.RestoreFromBackupIfMissing(*dbPath, *backupPath); err != nil {
+		log.Fatalf("[pharos-edge] Failed to restore from backup: %v", err)
+	}
 
 	// 1. Initialize embedded SQLite WAL queue store (§2.1)
 	store, err := edge.NewSQLiteStore(*dbPath)
@@ -84,6 +93,29 @@ func main() {
 			}
 		}
 	}()
+
+	// Periodic SQLite backup (§2.1, Slice 12): bounds the residual data-loss
+	// exposure window from Slice 12's design to "whatever changed since the
+	// last successful backup," in case the primary disk fails outright.
+	if *backupPath != "" {
+		go func() {
+			log.Printf("[pharos-edge] Periodic backup active -> %s every %s", *backupPath, *backupInterval)
+			ticker := time.NewTicker(*backupInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if err := store.Backup(ctx, *backupPath); err != nil {
+						log.Printf("[pharos-edge] Backup failed: %v", err)
+					}
+				}
+			}
+		}()
+	} else {
+		log.Printf("[pharos-edge] Periodic backup disabled (no --backup-path set)")
+	}
 
 	// 3. Start local HTTP capture server for site staff/EDC systems
 	edgeServer := edge.NewServer(store, *siteID)
