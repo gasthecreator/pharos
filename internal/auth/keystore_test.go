@@ -134,7 +134,10 @@ func TestMemoryKeyStore_KeysAreIsolatedPerSite(t *testing.T) {
 }
 
 func TestHashKey_Deterministic(t *testing.T) {
-	if hashKey("same-input") != hashKey("same-input") {
+	input := "same-input"
+	first := hashKey(input)
+	second := hashKey(input)
+	if first != second {
 		t.Fatalf("expected hashKey to be deterministic for the same input")
 	}
 	if hashKey("input-one") == hashKey("input-two") {
