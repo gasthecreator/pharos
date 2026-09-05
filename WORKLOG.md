@@ -40,6 +40,75 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 16 — Load testing
+
+**Author:** Claude Code
+
+**What:** Added a k6 load test (`loadtest/pharos_load_test.js`) running two
+scenarios concurrently against the real built `pharos-ingestion` (TLS +
+per-site auth, Slice 15) and `pharos-consumer` binaries, real Cassandra,
+real Kafka: `steady_state` (9 sites, ~4.5 req/s sustained combined) and
+`burst_site` (1 separate site, idle 30s then a genuine 30 req/s arrival
+rate for 15s). New `scripts/loadtest_setup.sh` provisions fresh per-site
+API keys into a gitignored `loadtest/sites.json`.
+
+**Why:** Per PLAN.md's Slice 16 — establish real baseline throughput/
+latency numbers and observe what actually happens when one site bursts,
+rather than assuming rate limiting or Cassandra/Kafka would be the
+bottleneck without ever measuring it.
+
+**How:** Ran it for real against the live Slice 15 infrastructure, three
+times, fixing two real bugs along the way rather than reporting the first
+run's numbers.
+
+First attempt: `burst_site` was a single VU looping sequentially as fast
+as it could. Result: zero 429s. Not because the rate limiter is broken —
+because real per-request backend latency (~120ms observed) naturally
+paced that one VU to ~8 req/s, which is *below* the 10 tokens/sec
+sustained refill rate the bucket never actually ran dry. A token bucket
+caps arrival rate, not "how many requests one slow client can queue up,"
+so testing it needs genuine concurrent arrival rate. Fixed by switching
+`burst_site` to k6's `constant-arrival-rate` executor (adds VUs as needed
+to hit a target rate regardless of per-request latency).
+
+Second attempt, immediately after: still zero *successful* burst requests,
+but no rejections either — checked `pharos_ingestion_validation_failures_total`
+(rather than trusting k6's own check, which only asserted "got a
+response," not "got a 200") and found every non-rate-limited burst request
+was failing FHIR validation (422). Root cause: the burst's idempotency-key
+sequence (`${__VU}-${__ITER}`, e.g. `"23-4"`) produced a non-numeric
+`local_seq` segment, which `internal/model.ParseIdempotencyKey` correctly
+rejects — a bug in the test script, not the application. Fixed with a
+plain numeric sequence (`__VU * 100000 + __ITER`).
+
+Third run, clean: **baseline** steady-state latency p50 ~50ms, p90 ~85ms,
+p95 ~101ms, max 232ms. **Burst absorption**: ~200 of the burst site's 450
+requests correctly rejected with 429 (token-bucket math: 100 + 15×10 = 250
+acceptable, 450−250=200 — matches almost exactly), while the 9 steady-state
+sites saw **zero** rejections and no latency degradation — real,
+repeated (3/3 runs) confirmation that `internal/ratelimit`'s per-site
+token buckets genuinely isolate sites from each other under concurrent
+load. **Bottleneck, actually measured, not assumed**: ingestion's own
+end-to-end request latency (~122ms avg) minus the Kafka publish step
+(~53ms avg, `pharos_ingestion_outbox_publish_duration_seconds`) minus the
+downstream consumer's canonical Cassandra write (~10ms avg,
+`pharos_consumer_cassandra_write_duration_seconds`) leaves ~69ms
+unaccounted for — the Cassandra outbox's own LWT-based idempotency insert,
+the one part of the pipeline that pays a Paxos round trip. That's the
+concrete place to optimize first if this system ever needed to go faster,
+not Kafka or the downstream consumer.
+
+**Files/modules touched:** new `loadtest/pharos_load_test.js`,
+`loadtest/README.md`, `scripts/loadtest_setup.sh`; `.gitignore`
+(`/loadtest/sites.json`, `/loadtest/results/`); `PLAN.md` (Slice 16 marked
+done).
+
+**Tests added/updated:** n/a — this slice's deliverable is the load test
+itself, run against live infrastructure, not unit/integration tests.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope.
+
 ## [2026-09-05] Claude Code: Slice 15 — Auth & TLS
 
 **Author:** Claude Code
