@@ -1,28 +1,56 @@
 services:
-  # ── Cassandra 3-node cluster ──────────────────────────────────────────
-  # Seed: cassandra-1. Nodes 2 & 3 join via CASSANDRA_SEEDS.
+  # ── Cassandra 2-datacenter cluster (§2.4, Slice 14: Multi-Region Cassandra
+  # + Kafka (Simulated)) ────────────────────────────────────────────────
+  # dc-us (cassandra-1/2/3, 3 nodes, RF=3) and dc-eu (cassandra-4/5, 2 nodes,
+  # RF=2) -- NetworkTopologyStrategy + GossipingPropertyFileSnitch
+  # (CASSANDRA_DC/CASSANDRA_RACK populate cassandra-rackdc.properties
+  # natively, no hand-written config files needed). Seeds span both DCs
+  # (cassandra-1 + cassandra-4) so cross-DC gossip bootstraps correctly.
+  #
+  # dc-eu is 2 nodes, not the originally-planned 3: this host has 8GB RAM
+  # total (Docker Desktop's VM capped near 6.3GB), and even after tuning
+  # heap down from Slice 7's 256M, six real Cassandra 5.0 JVMs plus six Kafka
+  # brokers plus MirrorMaker 2 genuinely does not fit -- confirmed by an
+  # actual OOM kill (docker inspect: OOMKilled=true) when this was tried at
+  # 192M heap/6+6, and heap alone barely moved the needle further at 128M
+  # (Cassandra's real floor here is JVM+off-heap baseline overhead, not the
+  # configured heap -- observed ~700-950MB RSS per node at *both* 128M and
+  # 192M heap). dc-eu is the right place to trim, not dc-us: nothing in this
+  # project's application logic ever coordinates LOCAL_QUORUM against dc-eu
+  # (LocalDC defaults to dc-us everywhere -- see internal/dedup's
+  # CassandraConfig docs), so dc-eu's own internal node-failure tolerance
+  # isn't a property this project's tests actually exercise. dc-us keeps its
+  # full 3 nodes/RF=3, preserving the one fault-tolerance property (survive
+  # 1 node down, still satisfy LOCAL_QUORUM) that Slice 7's original design
+  # was built to prove and that this slice's own tests depend on.
+  #
   # Node 1 exposes port 9042 to the host; gocql with DisableInitialHostLookup=true
-  # routes queries through the seed, which coordinates with replicas across pharos-net.
+  # routes queries through it, which coordinates with replicas across pharos-net.
+  # cap_add: NET_ADMIN enables tc netem for the simulated-WAN-latency and
+  # regional-partition fault-injection scenarios.
   cassandra-1:
     image: cassandra:5.0
     container_name: pharos-cassandra-1
+    cap_add:
+      - NET_ADMIN
     ports:
       - "9042:9042"
     environment:
       CASSANDRA_CLUSTER_NAME: "PharosCluster"
-      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_DC: "dc-us"
+      CASSANDRA_RACK: "rack1"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
-      CASSANDRA_SEEDS: "pharos-cassandra-1"
-      MAX_HEAP_SIZE: "256M"
-      HEAP_NEWSIZE: "64M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"
+      CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
+      MAX_HEAP_SIZE: "128M"
+      HEAP_NEWSIZE: "32M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
     volumes:
       - cassandra-data-1:/var/lib/cassandra
     healthcheck:
       test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 15s
-      retries: 15
+      retries: 20
       start_period: 90s
     networks:
       - pharos-net
@@ -30,14 +58,17 @@ services:
   cassandra-2:
     image: cassandra:5.0
     container_name: pharos-cassandra-2
+    cap_add:
+      - NET_ADMIN
     environment:
       CASSANDRA_CLUSTER_NAME: "PharosCluster"
-      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_DC: "dc-us"
+      CASSANDRA_RACK: "rack2"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
-      CASSANDRA_SEEDS: "pharos-cassandra-1"
-      MAX_HEAP_SIZE: "256M"
-      HEAP_NEWSIZE: "64M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"
+      CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
+      MAX_HEAP_SIZE: "128M"
+      HEAP_NEWSIZE: "32M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
     volumes:
       - cassandra-data-2:/var/lib/cassandra
     depends_on:
@@ -47,7 +78,7 @@ services:
       test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 15s
-      retries: 15
+      retries: 20
       start_period: 90s
     networks:
       - pharos-net
@@ -55,14 +86,17 @@ services:
   cassandra-3:
     image: cassandra:5.0
     container_name: pharos-cassandra-3
+    cap_add:
+      - NET_ADMIN
     environment:
       CASSANDRA_CLUSTER_NAME: "PharosCluster"
-      CASSANDRA_DC: "datacenter1"
+      CASSANDRA_DC: "dc-us"
+      CASSANDRA_RACK: "rack3"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
-      CASSANDRA_SEEDS: "pharos-cassandra-1"
-      MAX_HEAP_SIZE: "256M"
-      HEAP_NEWSIZE: "64M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=256M"
+      CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
+      MAX_HEAP_SIZE: "128M"
+      HEAP_NEWSIZE: "32M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
     volumes:
       - cassandra-data-3:/var/lib/cassandra
     depends_on:
@@ -72,23 +106,94 @@ services:
       test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 15s
-      retries: 15
+      retries: 20
       start_period: 90s
     networks:
       - pharos-net
 
-  # ── Kafka 3-broker KRaft cluster ──────────────────────────────────────
-  # Broker 1 is broker+controller. Brokers 2 and 3 are brokers.
-  # External ports 9092, 9094, 9095 are mapped to the host so host-side clients
-  # can connect to partition leaders across all 3 brokers.
-  # Inter-broker communication uses the internal PLAINTEXT listener on port 19092.
+  cassandra-4:
+    image: cassandra:5.0
+    container_name: pharos-cassandra-4
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CASSANDRA_CLUSTER_NAME: "PharosCluster"
+      CASSANDRA_DC: "dc-eu"
+      CASSANDRA_RACK: "rack1"
+      CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
+      CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
+      MAX_HEAP_SIZE: "128M"
+      HEAP_NEWSIZE: "32M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+    volumes:
+      - cassandra-data-4:/var/lib/cassandra
+    depends_on:
+      # Depends on cassandra-3 (not cassandra-1) specifically: Cassandra
+      # refuses to let two nodes bootstrap into the ring concurrently
+      # (cassandra.consistent.rangemovement), so all 6 nodes must join in one
+      # strictly sequential chain, not two parallel per-DC chains forking
+      # from a shared root.
+      cassandra-3:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 20
+      start_period: 90s
+    networks:
+      - pharos-net
+
+  cassandra-5:
+    image: cassandra:5.0
+    container_name: pharos-cassandra-5
+    cap_add:
+      - NET_ADMIN
+    environment:
+      CASSANDRA_CLUSTER_NAME: "PharosCluster"
+      CASSANDRA_DC: "dc-eu"
+      CASSANDRA_RACK: "rack2"
+      CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
+      CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
+      MAX_HEAP_SIZE: "128M"
+      HEAP_NEWSIZE: "32M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+    volumes:
+      - cassandra-data-5:/var/lib/cassandra
+    depends_on:
+      cassandra-4:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh 127.0.0.1 9042 -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 20
+      start_period: 90s
+    networks:
+      - pharos-net
+
+  # ── Kafka: two independent clusters (§2.4, Slice 14) ──────────────────
+  # Cluster A (kafka-1/2/3, dc-us) is the existing 3-broker KRaft cluster
+  # from Slice 7, now with broker.rack set. Cluster B (kafka-4/5/6, dc-eu)
+  # is a genuinely separate cluster -- its own KRaft controller quorum, its
+  # own CLUSTER_ID (a shared CLUSTER_ID would make it the same cluster, not
+  # two independent ones) -- with MirrorMaker 2 (below) replicating both
+  # application topics A -> B for cross-region DR. KAFKA_HEAP_OPTS is
+  # explicit for the first time (Slice 7 never set one, defaulting to the
+  # image's 1G/1G and using 650-900MB RSS per broker for no real reason at
+  # this project's scale) so six brokers fit the same host that used to run
+  # three untuned ones.
   kafka-1:
     image: apache/kafka:3.8.0
     container_name: pharos-kafka-1
+    cap_add:
+      - NET_ADMIN
     ports:
       - "9092:9092"
     environment:
+      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
       KAFKA_NODE_ID: 1
+      KAFKA_BROKER_RACK: "dc-us-rack1"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
       KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
@@ -119,10 +224,14 @@ services:
   kafka-2:
     image: apache/kafka:3.8.0
     container_name: pharos-kafka-2
+    cap_add:
+      - NET_ADMIN
     ports:
       - "9094:9094"
     environment:
+      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
       KAFKA_NODE_ID: 2
+      KAFKA_BROKER_RACK: "dc-us-rack2"
       KAFKA_PROCESS_ROLES: "broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
       KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9094"
@@ -153,10 +262,14 @@ services:
   kafka-3:
     image: apache/kafka:3.8.0
     container_name: pharos-kafka-3
+    cap_add:
+      - NET_ADMIN
     ports:
       - "9095:9095"
     environment:
+      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
       KAFKA_NODE_ID: 3
+      KAFKA_BROKER_RACK: "dc-us-rack3"
       KAFKA_PROCESS_ROLES: "broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
       KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9095"
@@ -181,6 +294,107 @@ services:
       timeout: 15s
       retries: 15
       start_period: 45s
+    networks:
+      - pharos-net
+
+  kafka-4:
+    image: apache/kafka:3.8.0
+    container_name: pharos-kafka-4
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "9096:9096"
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_NODE_ID: 4
+      KAFKA_BROKER_RACK: "dc-eu-rack1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "4@pharos-kafka-4:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9096,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://pharos-kafka-4:19092,EXTERNAL://127.0.0.1:9096"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "pharos-kraft-cluster-02"
+    volumes:
+      - kafka-data-4:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9096 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - pharos-net
+
+  kafka-5:
+    image: apache/kafka:3.8.0
+    container_name: pharos-kafka-5
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "9097:9097"
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_NODE_ID: 5
+      KAFKA_BROKER_RACK: "dc-eu-rack2"
+      KAFKA_PROCESS_ROLES: "broker"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "4@pharos-kafka-4:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:19092,EXTERNAL://0.0.0.0:9097"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://pharos-kafka-5:19092,EXTERNAL://127.0.0.1:9097"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 2
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 2
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 2
+      KAFKA_MIN_INSYNC_REPLICAS: 2
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "pharos-kraft-cluster-02"
+    volumes:
+      - kafka-data-5:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9097 --list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 15s
+      retries: 15
+      start_period: 45s
+    networks:
+      - pharos-net
+
+  # ── MirrorMaker 2: dc-us -> dc-eu cross-region replication (§2.2, §2.3,
+  # Slice 14) ────────────────────────────────────────────────────────────
+  # connect-mirror-maker.sh is bundled in the same apache/kafka image this
+  # project already depends on -- no new image. Runs in standalone mode
+  # (embeds its own single-node Connect worker), replicating
+  # pharos.events.adverse and pharos.events.dlq one-directionally, per
+  # kafka/mm2.properties.
+  mirrormaker:
+    image: apache/kafka:3.8.0
+    container_name: pharos-mirrormaker
+    cap_add:
+      - NET_ADMIN
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+    entrypoint: ["/opt/kafka/bin/connect-mirror-maker.sh", "/mm2/mm2.properties"]
+    volumes:
+      - ./kafka/mm2.properties:/mm2/mm2.properties:ro
+    depends_on:
+      kafka-1:
+        condition: service_healthy
+      kafka-4:
+        condition: service_healthy
     networks:
       - pharos-net
 
@@ -229,8 +443,12 @@ volumes:
   cassandra-data-1:
   cassandra-data-2:
   cassandra-data-3:
+  cassandra-data-4:
+  cassandra-data-5:
   kafka-data-1:
   kafka-data-2:
   kafka-data-3:
+  kafka-data-4:
+  kafka-data-5:
   prometheus-data:
   grafana-data:

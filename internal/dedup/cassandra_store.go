@@ -26,7 +26,7 @@ type CassandraConfig struct {
 	// which is undefined across a genuinely multi-DC cluster.
 	LocalDC string
 	// RemoteDCs maps each additional datacenter to its own replication
-	// factor, e.g. {"dc-eu": 3}. Empty for a single-DC deployment, in which
+	// factor, e.g. {"dc-eu": 2}. Empty for a single-DC deployment, in which
 	// case the keyspace still uses NetworkTopologyStrategy (forward-compatible
 	// with adding a DC later without an ALTER KEYSPACE), just with only
 	// LocalDC in the replication map.
@@ -44,7 +44,7 @@ func DefaultCassandraConfig() CassandraConfig {
 		ConnectTimeout:    10 * time.Second,
 		ReplicationFactor: 3,
 		LocalDC:           "dc-us",
-		RemoteDCs:         map[string]int{"dc-eu": 3},
+		RemoteDCs:         map[string]int{"dc-eu": 2},
 	}
 }
 

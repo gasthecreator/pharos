@@ -46,7 +46,7 @@ func DefaultCassandraStoreConfig() CassandraStoreConfig {
 		ConnectTimeout:    10 * time.Second,
 		ReplicationFactor: 3,
 		LocalDC:           "dc-us",
-		RemoteDCs:         map[string]int{"dc-eu": 3},
+		RemoteDCs:         map[string]int{"dc-eu": 2},
 	}
 }
 

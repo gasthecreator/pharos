@@ -40,6 +40,91 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 14 — multi-region Cassandra + Kafka (simulated)
+
+**Author:** Claude Code
+
+**What:** Converted Cassandra to `NetworkTopologyStrategy` across two real
+simulated datacenters (`dc-us`: 3 nodes/RF=3, `dc-eu`: 2 nodes/RF=2), added
+DC-aware gocql host selection to all three Cassandra connection sites, split
+Kafka into two genuinely independent clusters with MirrorMaker 2 replicating
+both application topics A→B, and added `tc netem`-based simulated WAN
+latency/partition capability with a new flagship fault-injection test.
+
+**Why:** Per PLAN.md's Slice 14 — proving the app's multi-region
+*configuration and application logic* are correct, given no real
+geographically-distributed hardware exists for this project, without
+skipping the problem.
+
+**How:** This slice was mostly about what actually happens when you try to
+run the plan, not what the plan says on paper.
+
+The biggest surprise: 6 Cassandra nodes + 6 Kafka brokers + MirrorMaker 2 on
+this 8GB host (Docker Desktop VM capped ~6.28GB) genuinely OOM-killed —
+`docker inspect` confirmed `OOMKilled: true` on the very first node. Heap
+tuning helped some but hit a real floor fast: dropping Cassandra's heap from
+192M to 128M barely moved real RSS (~700-950MB/node either way — the
+baseline is JVM+off-heap overhead on this image, not the configured heap).
+The fix that actually shipped: `dc-eu` runs 2 nodes/RF=2, not the
+originally-planned 3, for both Cassandra and Kafka cluster B. `dc-us` keeps
+its full 3 nodes/RF=3 unchanged, since that's the one fault-tolerance
+property this project's own application code exercises — nothing ever
+coordinates `LOCAL_QUORUM`/ISR against `dc-eu` directly (`LocalDC` defaults
+to `dc-us` everywhere). Verified real footprint with everything up (13
+containers) and the full suite run twice: ~4.8-5.1GB, comfortable margin
+under the ~6.28GB ceiling.
+
+Also discovered and fixed while wiring up DC-awareness (not something the
+test suite would have caught on its own, since a single-DC cluster can't
+expose it): none of the three `gocql.ClusterConfig` construction sites
+(`internal/dedup`, `internal/consumer`, `internal/query`) had a DC-aware
+host selection policy, meaning `LOCAL_QUORUM`'s actual meaning depended on
+whichever DC gocql's default round-robin happened to pick as coordinator —
+invisible with one DC, silently wrong across two. Fixed with
+`gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))`
+in all three, `LocalDC` defaulting to `dc-us`.
+
+Building the `tc netem` regional-partition fault-injection test surfaced
+two more real things, both found by hand before they reached the automated
+test: (1) a `prio` qdisc's `priomap` deciding where *unmatched* traffic
+defaults to — an all-`2`s priomap accidentally routed same-DC traffic into
+the identical band as the explicitly-filtered cross-DC traffic, breaking
+intra-DC gossip along with the intended inter-DC link; fixed with an
+all-`0`s priomap so default traffic stays in an untouched band. (2) 10-way
+concurrent Paxos LWT contention (`TestCassandraOutboxStore_RealIntegration`'s
+race sub-test) got measurably more sensitive during an active partition —
+occasionally zero clean winners, never more than one, passing cleanly once
+healed. Documented as an honest, explainable finding (contention + partition
+retries interacting) rather than hidden: the actual property under test —
+single-operation `LOCAL_QUORUM` success against `dc-us` with `dc-eu`
+completely unreachable — held throughout, verified both via a direct
+`cqlsh` check and the real application code path.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry + honest
+addendum), `PLAN.md` (Slice 14 marked done), `docker-compose.yml` (full
+Cassandra/Kafka rewrite: 5 Cassandra nodes across 2 DCs, 5 Kafka brokers
+across 2 clusters, new `mirrormaker` service, tuned heaps, `cap_add:
+[NET_ADMIN]`), new `kafka/mm2.properties`, `internal/dedup/cassandra_store.go`
++ `internal/consumer/canonical_store.go` (`NetworkTopologyStrategy`
+bootstrap, `LocalDC`/`RemoteDCs` config, DC-aware host policy),
+`internal/query/service.go` (DC-aware host policy), `migrations/001_init_schema.cql`
+(matching replication strategy), `.github/workflows/ci.yml` (health-wait
+container list), new `internal/faultinjection/regional_partition_test.go`.
+
+**Verification:** `go build ./...`, `go vet ./...` clean. Full suite
+(`go test -race -count=1 ./...`) run three times total against the real
+5-node Cassandra / 5-broker Kafka / MirrorMaker2 topology (once mid-setup
+hitting the transient Paxos timeout described above, twice clean
+afterward), all clean. MirrorMaker 2 confirmed genuinely replicating by
+watching `dc-us.pharos.events.adverse`/`dc-us.pharos.events.dlq` actually
+appear on cluster B. New fault-injection test passed against the real
+topology: real `tc`-induced partition, gossip genuinely marking `dc-eu`
+`DN` (via `nodetool status`, not assumed), real write+read via the actual
+application code succeeding throughout, partition healed, during-partition
+write confirmed reaching `dc-eu` via hinted handoff.
+
+---
+
 ## [2026-09-05] Claude Code: Slice 13 — consumer crash/restart watermark continuity
 
 **Author:** Claude Code

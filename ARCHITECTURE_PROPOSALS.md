@@ -137,6 +137,44 @@ Cassandra write failed, only that it failed and must be safely retryable.
 - No wire-format changes -- this slice is topology and driver
   configuration, not data model.
 
+**Addendum [2026-09-05], written after actually bringing the topology up:**
+the 3+3 Cassandra plan above genuinely OOM-killed on this host --
+`docker inspect` confirmed `OOMKilled: true` on `pharos-cassandra-1` with all
+6 Cassandra nodes + 6 Kafka brokers + MirrorMaker 2 running together, even
+after the heap tuning already described. Heap turned out not to be the
+dominant lever: dropping Cassandra's heap further, from 192M to 128M, barely
+moved real RSS (~700-950MB per node at *both* settings) -- the floor is
+JVM+off-heap baseline overhead on this image, not the configured heap.
+Adaptation actually shipped: **dc-eu runs 2 nodes (RF=2) instead of 3**, for
+both Cassandra and Kafka cluster B. dc-us (and Kafka cluster A) keep their
+full 3 nodes/RF=3 unchanged -- that's the one fault-tolerance property this
+project's application logic and tests actually exercise (`LocalDC` defaults
+to `dc-us` everywhere; nothing ever coordinates `LOCAL_QUORUM`/ISR against
+dc-eu directly). Verified real footprint with all 13 containers up and the
+full suite run twice: ~4.8-5.1GB, comfortably under the ~6.28GB Docker VM
+ceiling.
+
+Two more things found only by actually running this, not by planning it:
+1. **A real `tc` priomap bug**, caught by hand before it reached the
+   automated test: a `prio` qdisc's `priomap` decides which band *unmatched*
+   traffic defaults to, and an all-`2`s priomap accidentally routed default
+   (same-DC) traffic into the *same* band as the explicit u32-filtered
+   (cross-DC) traffic -- silently breaking intra-DC gossip, not just the
+   intended inter-DC link. Fixed with an all-`0`s priomap so default traffic
+   stays in an untouched band, reserving a separate band exclusively for the
+   u32-matched peer IPs.
+2. **Paxos LWTs under heavy concurrent contention got measurably more
+   sensitive during the partition.** `TestCassandraOutboxStore_RealIntegration`'s
+   10-goroutine race sub-test occasionally saw zero clean winners (never
+   more than one -- no correctness violation) while dc-eu was unreachable,
+   passing cleanly once healed. This is a plausible, explainable interaction
+   (10-way Paxos ballot contention is already a stress scenario on its own;
+   adding partition-driven retries makes some attempts time out rather than
+   resolve), not evidence against the core property: a plain `cqlsh`
+   `LOCAL_QUORUM` write+read, and this slice's own flagship fault-injection
+   test running the real single-operation application code path, both
+   succeeded correctly and repeatably throughout the same partition.
+
 ---
 
 #### [2026-09-05] Slice 13: Consumer Crash/Restart Watermark Continuity

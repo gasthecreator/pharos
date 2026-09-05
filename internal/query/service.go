@@ -44,7 +44,7 @@ func DefaultCassandraServiceConfig() CassandraServiceConfig {
 		ConnectTimeout: 10 * time.Second,
 		ArchiveDir:     archive.DefaultConfig().Dir,
 		LocalDC:        "dc-us",
-		RemoteDCs:      map[string]int{"dc-eu": 3},
+		RemoteDCs:      map[string]int{"dc-eu": 2},
 	}
 }
 
