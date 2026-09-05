@@ -722,6 +722,58 @@ verified against real infrastructure the same way every earlier slice was.
   manifests or an equivalent IaC approach for every service, health/
   readiness probes wired to the metrics from Slice 6, basic CI image build.
 
+  **Done 2026-09-05.** Kubernetes chosen over a vaguer "equivalent IaC" --
+  more recognizable and directly demonstrable for this project's stated
+  recruiting audience. `deploy/docker/Dockerfile.{ingestion,consumer,edge,cli}`
+  (multi-stage, `CGO_ENABLED=0` scratch images -- every dependency in this
+  project, including `modernc.org/sqlite`, is pure Go, so scratch is
+  genuinely sufficient, not just minimal for its own sake); `deploy/k8s/`
+  manifests for every service (two Cassandra StatefulSets mirroring
+  Slice 14/15's exact 2-DC topology, two independent Kafka KRaft
+  StatefulSets, MirrorMaker 2, migrations/topic-provisioning Jobs, the
+  three Go services with liveness/readiness probes against their real
+  `/healthz` endpoints, Prometheus); `deploy/k8s/deploy.sh` orchestrating
+  the whole bring-up against a local `kind` cluster (no cloud spend,
+  matching §5.1).
+
+  Verified for real against `kind`, not just written and assumed correct --
+  see `deploy/k8s/README.md` for full detail. Three real bugs found and
+  fixed: (1) ConfigMap volumes are always read-only in K8s, and the stock
+  Cassandra entrypoint's `chown` (the same behavior Slice 15 already
+  worked around for TLS materials) fails outright on a read-only
+  `cassandra.yaml` -- fixed with an initContainer copying it into a
+  writable `emptyDir` first. (2) A compound, two-layer KRaft
+  controller-quorum deadlock: `OrderedReady`'s default sequential pod
+  creation can't succeed (pod 0 needs voters that don't exist yet) --
+  fixed with `podManagementPolicy: Parallel` -- and even then, K8s
+  headless Services don't publish a pod's DNS record until it's already
+  Ready, a second deadlock beneath the first -- fixed with
+  `publishNotReadyAddresses: true`. (3) `deploy.sh` originally regenerated
+  a brand-new CA on every run, silently rotating the Secret's cert
+  material out from under already-running pods whose JVMs kept the old
+  keystore loaded -- fixed by generating once and reusing on subsequent
+  runs.
+
+  Live end-to-end verification hit the same class of resource constraint
+  every earlier slice already found with Docker Compose, now compounded by
+  `kind`'s own control-plane overhead sharing the same ~6.3GB host budget
+  as the application pods -- confirmed via `docker stats` (5.1GB/82% and
+  climbing, pods cycling through real OOM/eviction restarts). Applying the
+  same reasoning Slice 14/15 already established, verification proceeded
+  at reduced scale (`dc-eu`/cluster B trimmed first, then `cassandra-us`/
+  `kafka-a` scaled to 1 replica each for the live pass specifically,
+  settling at 2.3GB/36%) while the committed manifests keep `replicas: 3`
+  as the intended production shape -- this slice's job is proving
+  deployment *mechanics* work, not re-proving full 2-DC distributed
+  correctness a second time in a different runtime, which Slice 14 already
+  did once against Docker Compose. At that scale: a real event was
+  submitted through `pharos-edge` (K8s pod) over TLS + API key to
+  `pharos-ingestion` (K8s pod), landed in the Cassandra outbox, published
+  to Kafka, consumed by `pharos-consumer` (K8s pod), and confirmed
+  `PUBLISHED`/queryable in the Cassandra canonical store via direct
+  `cqlsh` -- not by trusting the HTTP response alone. Prometheus confirmed
+  scraping all three app services successfully.
+
 - **Slice 18 — Backup & disaster recovery** *(was Slice 11)*. Cassandra
   snapshot/restore procedure for the multi-node cluster from Slice 7, an
   actual tested restore drill (not just a documented procedure that's never

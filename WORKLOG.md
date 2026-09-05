@@ -40,6 +40,118 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 17 — Deployment automation
+
+**Author:** Claude Code
+
+**What:** Dockerfiles for all four Go binaries (`deploy/docker/`, multi-stage,
+`CGO_ENABLED=0` scratch images) and a full set of Kubernetes manifests
+(`deploy/k8s/`) for every service: two Cassandra StatefulSets mirroring
+Slice 14/15's 2-DC topology, two independent Kafka KRaft StatefulSets,
+MirrorMaker 2, migrations/topic-provisioning Jobs, the three Go services
+with liveness/readiness probes against their real `/healthz` endpoints,
+and Prometheus. `deploy/k8s/deploy.sh` orchestrates the whole bring-up.
+
+**Why:** Per PLAN.md's Slice 17 — Kubernetes manifests for every service,
+health/readiness probes wired to Slice 6's metrics, basic CI image build.
+Kubernetes over a vaguer "equivalent IaC" since it's more directly
+demonstrable for this project's stated recruiting audience.
+
+**How:** Verified for real against a local `kind` cluster (no cloud spend),
+not just written and assumed correct — three real bugs found and fixed
+along the way, plus a real resource-constraint finding that required an
+honest, documented scope reduction, matching every earlier slice's own
+pattern.
+
+Bug 1: ConfigMap volumes are always read-only in K8s — unlike Docker
+Compose's non-`:ro` bind mount for the same `cassandra.yaml`, which
+happens to be read-write by default. The stock Cassandra entrypoint's
+`find $CASSANDRA_CONF ... -exec chown` (the exact same behavior Slice 15
+already worked around for TLS materials by relocating them to `/tls/`)
+fails outright on the read-only file, crash-looping the pod — found by
+watching it happen on first deploy, not anticipated. Fixed with an
+initContainer copying the ConfigMap's file into a writable `emptyDir`
+first, then subPath-mounting *that* at the real path (subPath mounts a
+single file without shadowing the rest of `/etc/cassandra`, and inherits
+the emptyDir's read-write nature).
+
+Bug 2, compound and two layers deep: KRaft's 3-node controller quorum
+needs all 3 pods mutually reachable to elect a Raft leader, but
+`podManagementPolicy: OrderedReady` (the StatefulSet default) won't create
+pod 1 until pod 0 is Ready — and pod 0 can never become Ready alone, since
+it can't complete leader election against voters that don't exist yet.
+Fixed with `podManagementPolicy: Parallel`. That wasn't enough on its own:
+K8s headless Services only publish a pod's DNS A record once it passes
+its *own* readiness probe, so even with all 3 pods created simultaneously,
+none could resolve the others' DNS names to even attempt election — a
+second deadlock underneath the first, found by watching kafka-a-0 log a
+real `UnknownHostException` for kafka-a-1/-2 even after they existed and
+were `Running`. Fixed with `publishNotReadyAddresses: true` on the
+headless Service.
+
+Bug 3: `deploy.sh` originally called `generate_certs.sh` (which
+deliberately regenerates a brand-new CA and every cert on each run — fine
+for Docker Compose, which tears down every container at the same time)
+unconditionally on every run. Re-running it against an already-deployed
+cluster rotates the Secret's CA/certs out from under already-running
+pods, whose JVMs keep the *old* keystore loaded in memory — the readiness
+probe (reading the freshly-rotated `ca-cert.pem` from the same Secret
+volume) then can't verify the server's still-old certificate, and
+already-Ready pods start failing. Found by watching previously-healthy
+Cassandra pods go NotReady after a second `deploy.sh` run. Fixed by
+generating once and reusing on subsequent runs.
+
+Resource finding: live end-to-end verification hit the same class of
+constraint every earlier slice already found with Docker Compose, now
+compounded by `kind`'s own control-plane processes (etcd, kube-apiserver,
+scheduler, controller-manager, kubelet, CoreDNS, kube-proxy) sharing the
+same single container and the same ~6.3GB host budget as the application
+pods — confirmed via `docker stats` showing `pharos-control-plane` at
+5.1GB/82% and climbing, with pods cycling through real OOM/eviction
+restarts, not a one-off fluke. Applying the exact reasoning Slice 14/15
+already established (trim `dc-eu`/cluster B — the side this project's
+application logic never coordinates `LOCAL_QUORUM`/ISR against — before
+touching `dc-us`/cluster A), verification proceeded at that reduced
+scale, then — when even that kept cycling — scaled `cassandra-us` and
+`kafka-a` down to 1 replica each for the live pass specifically (with
+`nodetool removenode` cleaning up gossip entries for the scaled-down
+peers and a live `ALTER KEYSPACE` correcting `dc-us`'s replication factor
+to match — the same "topology change leaves stale state behind" lesson
+from Slice 15's own `cassandra-5` removal). Settled at 2.3GB/36%,
+comfortably stable. The committed manifests keep `replicas: 3` as the
+intended production shape; this slice's job is proving deployment
+*mechanics* work, not re-proving full 2-DC distributed correctness a
+second time in a different runtime, which Slice 14 already did once
+against Docker Compose.
+
+At the verified scale: a real event was submitted through `pharos-edge`
+(K8s pod) over TLS + API key to `pharos-ingestion` (K8s pod), landed in
+the Cassandra outbox, published to Kafka, consumed by `pharos-consumer`
+(K8s pod), and confirmed `PUBLISHED`/queryable in the Cassandra canonical
+store via direct `cqlsh` — not by trusting the HTTP response alone.
+Prometheus confirmed scraping all three app services successfully
+(`pharos-ingestion`, `pharos-consumer`, `pharos-edge-site-k8s-demo` all
+reporting `up`).
+
+**Files/modules touched:** new `deploy/docker/Dockerfile.{ingestion,consumer,edge,cli}`;
+new `deploy/k8s/` (`00`-`09` manifests, `deploy.sh`, `generate_k8s_certs.sh`,
+`mm2.properties`, `README.md`); `scripts/generate_certs.sh` (`EXTRA_*_SANS`
+env vars so `deploy/k8s`'s own cert generation can append K8s
+headless-Service DNS names to the same shared CA); `.gitignore`
+(`/deploy/k8s/certs/`); `PLAN.md` (Slice 17 marked done).
+
+**Tests added/updated:** n/a — this slice's deliverable is the deployment
+tooling itself, verified live against a real `kind` cluster, not
+unit/integration tests.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope. The full 2-DC/4-broker topology this slice's manifests
+describe was not live-verified at full replica count on this host, for
+the documented resource reasons above — a host with more memory (or a
+managed K8s cluster, out of scope per this project's zero-cloud-spend
+constraint) could complete that verification without any manifest
+changes, just `replicas` staying at their committed values.
+
 ## [2026-09-05] Claude Code: Slice 16 — Load testing
 
 **Author:** Claude Code

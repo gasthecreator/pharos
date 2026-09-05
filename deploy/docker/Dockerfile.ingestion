@@ -1,0 +1,24 @@
+# Pharos Central Ingestion container image (PLAN.md Slice 17: Deployment automation).
+#
+# CGO_ENABLED=0 static build: both gocql and segmentio/kafka-go are pure Go,
+# and the edge binary's modernc.org/sqlite driver (this image doesn't need
+# it, but the module graph is shared) is also pure Go -- no cgo anywhere in
+# this project, so a scratch final image is genuinely sufficient, not just
+# convenient.
+FROM golang:1.25-alpine AS builder
+RUN apk add --no-cache ca-certificates
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /out/pharos-ingestion ./cmd/pharos-ingestion
+
+FROM scratch
+# CA certs for any outbound TLS this process itself initiates (Cassandra,
+# Kafka client connections use their own --ca-cert flag pointing at a
+# mounted Secret, not the system trust store, but the Go standard library
+# still touches this path for TLS negotiation internals).
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/pharos-ingestion /pharos-ingestion
+EXPOSE 8081
+ENTRYPOINT ["/pharos-ingestion"]

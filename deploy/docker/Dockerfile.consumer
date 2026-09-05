@@ -1,0 +1,16 @@
+# Pharos Downstream Consumer container image (PLAN.md Slice 17: Deployment automation).
+# See Dockerfile.ingestion for why scratch + CGO_ENABLED=0 is genuinely
+# sufficient here, not just convenient.
+FROM golang:1.25-alpine AS builder
+RUN apk add --no-cache ca-certificates
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /out/pharos-consumer ./cmd/pharos-consumer
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/pharos-consumer /pharos-consumer
+EXPOSE 9091
+ENTRYPOINT ["/pharos-consumer"]

@@ -1,0 +1,305 @@
+# Kafka: two genuinely independent KRaft clusters (cluster A / dc-us: 3
+# brokers, cluster B / dc-eu: 1 broker), matching the Docker Compose
+# topology from Slice 14/15 (§2.4, PLAN.md Slice 17: Deployment
+# automation). KAFKA_NODE_ID and KAFKA_ADVERTISED_LISTENERS must differ
+# per pod (unlike Cassandra's DC/RACK, which is static per StatefulSet) --
+# a small shell wrapper derives both from the pod's own StatefulSet
+# ordinal (the numeric suffix K8s gives the hostname) before exec'ing the
+# image's real entrypoint, since apache/kafka:3.8.0 has no built-in
+# per-replica templating of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-a
+  namespace: pharos
+  labels:
+    app: kafka-a
+spec:
+  clusterIP: None
+  # publishNotReadyAddresses: without this, K8s only publishes a DNS A
+  # record for a pod once it passes its OWN readiness probe -- a second,
+  # deeper deadlock beneath the podManagementPolicy one above: all 3
+  # KRaft controller-quorum pods need to resolve each other's DNS names to
+  # even attempt Raft leader election, but none of them can pass their
+  # readiness probe (which needs a functioning cluster) without that
+  # election succeeding first. Found by watching kafka-a-0 log a real
+  # UnknownHostException for kafka-a-1/-2 even after they existed and were
+  # Running, not anticipated from podManagementPolicy alone.
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka-a
+  ports:
+    - name: internal
+      port: 19092
+    - name: external
+      port: 9092
+    - name: controller
+      port: 9093
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-b
+  namespace: pharos
+  labels:
+    app: kafka-b
+spec:
+  clusterIP: None
+  # See kafka-a's Service above for why this matters (not strictly needed
+  # at 1 replica, but kept consistent in case this is ever scaled up).
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka-b
+  ports:
+    - name: internal
+      port: 19092
+    - name: external
+      port: 9092
+    - name: controller
+      port: 9093
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-a
+  namespace: pharos
+spec:
+  serviceName: kafka-a
+  replicas: 3
+  # Parallel, not the default OrderedReady: KRaft's 3-node controller
+  # quorum needs all 3 pods mutually reachable to elect a Raft leader, but
+  # OrderedReady won't create pod 1 until pod 0 is Ready -- and pod 0 can
+  # never become Ready alone, since it can't complete leader election
+  # against voters that don't exist yet. A real deadlock found by watching
+  # kafka-a-0 log real UnknownHostException errors for kafka-a-1/-2 (which
+  # OrderedReady hadn't created), not anticipated up front.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: kafka-a
+  template:
+    metadata:
+      labels:
+        app: kafka-a
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              ordinal=$(hostname | grep -o '[0-9]*$')
+              export KAFKA_NODE_ID=$((ordinal + 1))
+              export KAFKA_BROKER_RACK="dc-us-rack$((ordinal + 1))"
+              export KAFKA_ADVERTISED_LISTENERS="INTERNAL://$(hostname).kafka-a.pharos.svc.cluster.local:19092,EXTERNAL://$(hostname).kafka-a.pharos.svc.cluster.local:9092"
+              exec /__cacert_entrypoint.sh /etc/kafka/docker/run
+          ports:
+            - containerPort: 19092
+              name: internal
+            - containerPort: 9092
+              name: external
+            - containerPort: 9093
+              name: controller
+          env:
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx192M -Xms192M"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka-a-0.kafka-a.pharos.svc.cluster.local:9093,2@kafka-a-1.kafka-a.pharos.svc.cluster.local:9093,3@kafka-a-2.kafka-a.pharos.svc.cluster.local:9093"
+            - name: KAFKA_LISTENERS
+              value: "INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "INTERNAL:PLAINTEXT,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "INTERNAL"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "2"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              value: "3"
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: "2"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "true"
+            - name: CLUSTER_ID
+              value: "pharos-kraft-cluster-01"
+            - name: KAFKA_SSL_KEYSTORE_LOCATION
+              value: "/etc/kafka/secrets/kafka-keystore.jks"
+            - name: KAFKA_SSL_KEYSTORE_PASSWORD
+              value: "pharos-dev-tls-pass"
+            - name: KAFKA_SSL_KEY_PASSWORD
+              value: "pharos-dev-tls-pass"
+            - name: KAFKA_SSL_TRUSTSTORE_LOCATION
+              value: "/etc/kafka/secrets/kafka-truststore.jks"
+            - name: KAFKA_SSL_TRUSTSTORE_PASSWORD
+              value: "pharos-dev-tls-pass"
+            - name: KAFKA_SSL_CLIENT_AUTH
+              value: "none"
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /var/lib/kafka/data
+            - name: tls
+              mountPath: /etc/kafka/secrets
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--command-config", "/etc/kafka/secrets/client-ssl.properties", "--list"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 40
+            failureThreshold: 15
+          livenessProbe:
+            exec:
+              command: ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--command-config", "/etc/kafka/secrets/client-ssl.properties", "--list"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 40
+            failureThreshold: 6
+      volumes:
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: kafka-keystore.jks
+                path: kafka-keystore.jks
+              - key: kafka-truststore.jks
+                path: kafka-truststore.jks
+              - key: kafka-client-ssl.properties
+                path: client-ssl.properties
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka-b
+  namespace: pharos
+spec:
+  serviceName: kafka-b
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-b
+  template:
+    metadata:
+      labels:
+        app: kafka-b
+    spec:
+      containers:
+        - name: kafka
+          image: apache/kafka:3.8.0
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              export KAFKA_NODE_ID=1
+              export KAFKA_ADVERTISED_LISTENERS="INTERNAL://$(hostname).kafka-b.pharos.svc.cluster.local:19092,EXTERNAL://$(hostname).kafka-b.pharos.svc.cluster.local:9092"
+              exec /__cacert_entrypoint.sh /etc/kafka/docker/run
+          ports:
+            - containerPort: 19092
+              name: internal
+            - containerPort: 9092
+              name: external
+            - containerPort: 9093
+              name: controller
+          env:
+            - name: KAFKA_HEAP_OPTS
+              value: "-Xmx192M -Xms192M"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@kafka-b-0.kafka-b.pharos.svc.cluster.local:9093"
+            - name: KAFKA_LISTENERS
+              value: "INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "INTERNAL:PLAINTEXT,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "INTERNAL"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_DEFAULT_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: "1"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "true"
+            - name: CLUSTER_ID
+              value: "pharos-kraft-cluster-02"
+            - name: KAFKA_SSL_KEYSTORE_LOCATION
+              value: "/etc/kafka/secrets/kafka-keystore.jks"
+            - name: KAFKA_SSL_KEYSTORE_PASSWORD
+              value: "pharos-dev-tls-pass"
+            - name: KAFKA_SSL_KEY_PASSWORD
+              value: "pharos-dev-tls-pass"
+            - name: KAFKA_SSL_TRUSTSTORE_LOCATION
+              value: "/etc/kafka/secrets/kafka-truststore.jks"
+            - name: KAFKA_SSL_TRUSTSTORE_PASSWORD
+              value: "pharos-dev-tls-pass"
+            - name: KAFKA_SSL_CLIENT_AUTH
+              value: "none"
+          volumeMounts:
+            - name: kafka-data
+              mountPath: /var/lib/kafka/data
+            - name: tls
+              mountPath: /etc/kafka/secrets
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--command-config", "/etc/kafka/secrets/client-ssl.properties", "--list"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 40
+            failureThreshold: 15
+          livenessProbe:
+            exec:
+              command: ["/opt/kafka/bin/kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--command-config", "/etc/kafka/secrets/client-ssl.properties", "--list"]
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 40
+            failureThreshold: 6
+      volumes:
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: kafka-keystore.jks
+                path: kafka-keystore.jks
+              - key: kafka-truststore.jks
+                path: kafka-truststore.jks
+              - key: kafka-client-ssl.properties
+                path: client-ssl.properties
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
