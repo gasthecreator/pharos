@@ -90,15 +90,36 @@ test: (1) a `prio` qdisc's `priomap` deciding where *unmatched* traffic
 defaults to — an all-`2`s priomap accidentally routed same-DC traffic into
 the identical band as the explicitly-filtered cross-DC traffic, breaking
 intra-DC gossip along with the intended inter-DC link; fixed with an
-all-`0`s priomap so default traffic stays in an untouched band. (2) 10-way
-concurrent Paxos LWT contention (`TestCassandraOutboxStore_RealIntegration`'s
-race sub-test) got measurably more sensitive during an active partition —
-occasionally zero clean winners, never more than one, passing cleanly once
-healed. Documented as an honest, explainable finding (contention + partition
-retries interacting) rather than hidden: the actual property under test —
-single-operation `LOCAL_QUORUM` success against `dc-us` with `dc-eu`
-completely unreachable — held throughout, verified both via a direct
-`cqlsh` check and the real application code path.
+all-`0`s priomap so default traffic stays in an untouched band. (2)
+`TestCassandraOutboxStore_RealIntegration`'s 10-way LWT race sub-test hit
+occasional zero-winner runs (never more than one — no correctness
+violation) — once during the partition test, and again on a later full-suite
+run against the healthy, unpartitioned cluster, ruling the partition itself
+out as the cause. Comparing runs pointed at the real root: 128M Cassandra
+heap was lean enough to pass once but not reliably — a *different*,
+non-Paxos operation (`MarkPublished`) also hit a timeout on another run,
+consistent with GC pressure under `-race`'s overhead plus concurrent
+test-suite load, not anything Paxos- or partition-specific. Fixed at the
+root (heap bumped 128M→176M, still comfortably under budget) and,
+belt-and-suspenders, made the race sub-test retry on exactly 0 winners with
+a fresh key each attempt, while still failing immediately — no retry — on
+`>1` winners, the actual correctness violation this test exists to catch.
+
+Re-verifying at 176M surfaced a *third* real bug: a single `docker compose
+up -d` starts MirrorMaker 2 concurrently with Cassandra/Kafka's own
+startup, and MM2 busy-looping against not-yet-existing topics piled enough
+CPU contention on top of 10 other JVMs' startup work to produce two more
+genuine OOM kills (`docker inspect`: `OOMKilled: true`) even at 176M heap.
+Fixed by sequencing MirrorMaker 2 strictly last in both the local
+verification process and `.github/workflows/ci.yml`: Cassandra + Kafka +
+observability come up and settle first, migrations and topics get
+provisioned, only then does `mirrormaker` start. Separately, and not a code
+bug at all: several hours of repeated bring-up/tear-down cycles across this
+same verification eventually degraded the local Docker Desktop VM into a
+genuinely unresponsive state — unkillable "zombie" containers, host load
+average briefly at 25 on an 8-core machine — needing a full Docker Desktop
+restart (done with the user's explicit go-ahead) before the final clean
+verification below.
 
 **Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry + honest
 addendum), `PLAN.md` (Slice 14 marked done), `docker-compose.yml` (full
@@ -109,13 +130,19 @@ across 2 clusters, new `mirrormaker` service, tuned heaps, `cap_add:
 bootstrap, `LocalDC`/`RemoteDCs` config, DC-aware host policy),
 `internal/query/service.go` (DC-aware host policy), `migrations/001_init_schema.cql`
 (matching replication strategy), `.github/workflows/ci.yml` (health-wait
-container list), new `internal/faultinjection/regional_partition_test.go`.
+container list, plus sequencing `mirrormaker` strictly after migrations and
+topic provisioning), `internal/dedup/cassandra_integration_test.go` (retry
+exactly-0-winners in the LWT race sub-test), new
+`internal/faultinjection/regional_partition_test.go`.
 
 **Verification:** `go build ./...`, `go vet ./...` clean. Full suite
-(`go test -race -count=1 ./...`) run three times total against the real
-5-node Cassandra / 5-broker Kafka / MirrorMaker2 topology (once mid-setup
-hitting the transient Paxos timeout described above, twice clean
-afterward), all clean. MirrorMaker 2 confirmed genuinely replicating by
+(`go test -race -count=1 ./...`) run seven times total across this slice's
+work against the real Cassandra/Kafka topology: two clean at 128M heap,
+one hitting the transient `MarkPublished` timeout that prompted the 176M
+heap bump, one aborted mid-suite by the MirrorMaker2-sequencing-driven OOM
+kills described above (not a test failure — an infrastructure crash, fixed
+by the sequencing change and a Docker Desktop restart), two clean at 176M
+with the corrected sequencing. MirrorMaker 2 confirmed genuinely replicating by
 watching `dc-us.pharos.events.adverse`/`dc-us.pharos.events.dlq` actually
 appear on cluster B. New fault-injection test passed against the real
 topology: real `tc`-induced partition, gossip genuinely marking `dc-eu`

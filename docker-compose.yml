@@ -15,7 +15,15 @@ services:
   # 192M heap/6+6, and heap alone barely moved the needle further at 128M
   # (Cassandra's real floor here is JVM+off-heap baseline overhead, not the
   # configured heap -- observed ~700-950MB RSS per node at *both* 128M and
-  # 192M heap). dc-eu is the right place to trim, not dc-us: nothing in this
+  # 192M heap). Settled on 176M as the actual value: 128M was lean enough to
+  # fit, but running the full test suite against it surfaced occasional
+  # single-digit-second operation timeouts under concurrent load (most
+  # plausibly GC pauses at that heap size, not a correctness issue -- no
+  # request ever got a *wrong* answer, some just took too long under
+  # `-race`'s own overhead layered on top of everything else running). 176M
+  # gave enough GC headroom to make the suite reliably pass twice in a row
+  # while still leaving comfortable margin under the 8GB ceiling. dc-eu is
+  # the right DC to trim on node *count*, not dc-us: nothing in this
   # project's application logic ever coordinates LOCAL_QUORUM against dc-eu
   # (LocalDC defaults to dc-us everywhere -- see internal/dedup's
   # CassandraConfig docs), so dc-eu's own internal node-failure tolerance
@@ -41,9 +49,9 @@ services:
       CASSANDRA_RACK: "rack1"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
       CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
-      MAX_HEAP_SIZE: "128M"
-      HEAP_NEWSIZE: "32M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+      MAX_HEAP_SIZE: "176M"
+      HEAP_NEWSIZE: "44M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=176M"
     volumes:
       - cassandra-data-1:/var/lib/cassandra
     healthcheck:
@@ -66,9 +74,9 @@ services:
       CASSANDRA_RACK: "rack2"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
       CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
-      MAX_HEAP_SIZE: "128M"
-      HEAP_NEWSIZE: "32M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+      MAX_HEAP_SIZE: "176M"
+      HEAP_NEWSIZE: "44M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=176M"
     volumes:
       - cassandra-data-2:/var/lib/cassandra
     depends_on:
@@ -94,9 +102,9 @@ services:
       CASSANDRA_RACK: "rack3"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
       CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
-      MAX_HEAP_SIZE: "128M"
-      HEAP_NEWSIZE: "32M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+      MAX_HEAP_SIZE: "176M"
+      HEAP_NEWSIZE: "44M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=176M"
     volumes:
       - cassandra-data-3:/var/lib/cassandra
     depends_on:
@@ -122,9 +130,9 @@ services:
       CASSANDRA_RACK: "rack1"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
       CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
-      MAX_HEAP_SIZE: "128M"
-      HEAP_NEWSIZE: "32M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+      MAX_HEAP_SIZE: "176M"
+      HEAP_NEWSIZE: "44M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=176M"
     volumes:
       - cassandra-data-4:/var/lib/cassandra
     depends_on:
@@ -155,9 +163,9 @@ services:
       CASSANDRA_RACK: "rack2"
       CASSANDRA_ENDPOINT_SNITCH: "GossipingPropertyFileSnitch"
       CASSANDRA_SEEDS: "pharos-cassandra-1,pharos-cassandra-4"
-      MAX_HEAP_SIZE: "128M"
-      HEAP_NEWSIZE: "32M"
-      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=128M"
+      MAX_HEAP_SIZE: "176M"
+      HEAP_NEWSIZE: "44M"
+      JVM_EXTRA_OPTS: "-XX:MaxDirectMemorySize=176M"
     volumes:
       - cassandra-data-5:/var/lib/cassandra
     depends_on:

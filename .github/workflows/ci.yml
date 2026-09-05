@@ -48,8 +48,18 @@ jobs:
         with:
           go-version: "1.25"
 
-      - name: Bring up the multi-node stack
-        run: docker compose up -d
+      # Cassandra and Kafka come up first, deliberately *without*
+      # mirrormaker (§2.4, Slice 14: Multi-Region Cassandra + Kafka) --
+      # starting it before any topic exists means it immediately busy-loops
+      # retrying against nonexistent topics, piling CPU contention on top of
+      # 10 other JVMs' own startup work. Confirmed by hand this isn't
+      # hypothetical: that exact sequencing produced two genuine OOM kills
+      # (docker inspect: OOMKilled=true) even with headroom that looked fine
+      # in a calm, already-settled snapshot -- CPU starvation delays GC,
+      # which lets RSS balloon before it can be reclaimed. mirrormaker starts
+      # in its own step below, only after topics genuinely exist.
+      - name: Bring up Cassandra + Kafka (without MirrorMaker 2)
+        run: docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 cassandra-5 kafka-1 kafka-2 kafka-3 kafka-4 kafka-5 prometheus grafana
 
       - name: Wait for Cassandra + Kafka to report healthy
         run: |
@@ -83,6 +93,11 @@ jobs:
 
       - name: Provision Kafka topics
         run: ./scripts/create_topics.sh
+
+      - name: Bring up MirrorMaker 2
+        run: |
+          docker compose up -d mirrormaker
+          sleep 15
 
       - name: go test -race
         run: go test -race -count=1 ./...

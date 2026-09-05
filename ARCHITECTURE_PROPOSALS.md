@@ -164,16 +164,51 @@ Two more things found only by actually running this, not by planning it:
    stays in an untouched band, reserving a separate band exclusively for the
    u32-matched peer IPs.
 2. **Paxos LWTs under heavy concurrent contention got measurably more
-   sensitive during the partition.** `TestCassandraOutboxStore_RealIntegration`'s
+   sensitive, independent of the partition test.** `TestCassandraOutboxStore_RealIntegration`'s
    10-goroutine race sub-test occasionally saw zero clean winners (never
-   more than one -- no correctness violation) while dc-eu was unreachable,
-   passing cleanly once healed. This is a plausible, explainable interaction
-   (10-way Paxos ballot contention is already a stress scenario on its own;
-   adding partition-driven retries makes some attempts time out rather than
-   resolve), not evidence against the core property: a plain `cqlsh`
-   `LOCAL_QUORUM` write+read, and this slice's own flagship fault-injection
-   test running the real single-operation application code path, both
-   succeeded correctly and repeatably throughout the same partition.
+   more than one -- no correctness violation) -- once during the partition
+   test specifically, and again on a later plain full-suite run against the
+   healthy, unpartitioned cluster, ruling out the partition itself as the
+   cause. Root cause found by comparing repeated full-suite runs: 128M heap
+   was lean enough to pass CI once but not reliably -- a *different*
+   operation (a plain, non-Paxos `MarkPublished` update) also hit an
+   operation timeout on a later run, pointing at GC pauses under `-race`'s
+   own overhead plus concurrent test-suite load, not anything specific to
+   Paxos contention or the regional partition. Fixed two ways: (a) bumped
+   Cassandra's heap from 128M to 176M -- still comfortably under budget,
+   but enough headroom that two full-suite runs in a row came back clean;
+   (b) made the race sub-test itself retry (fresh key each time, up to 3
+   attempts) on exactly 0 winners specifically, since that outcome means
+   "every attempt errored out," not "two attempts both won" -- the actual
+   correctness property this test exists to catch (`>1` winners) still
+   fails immediately, on the first occurrence, no retry. Belt-and-suspenders
+   deliberately: the heap fix addresses the actual cause, the test-retry
+   fix keeps the suite from being sensitive to whatever *next* transient
+   slowdown this environment produces.
+3. **A third real bug, and a real host-level lesson, both found while
+   re-verifying after the 176M heap bump.** Bringing everything up in one
+   `docker compose up -d` starts MirrorMaker 2 concurrently with Cassandra
+   and Kafka's own startup -- before any topic exists for it to replicate,
+   MM2 busy-loops discovery/retry, piling CPU contention on top of 10 other
+   JVMs' own startup work. This produced two more genuine OOM kills (`docker
+   inspect`: `OOMKilled: true`) even at 176M heap, in a configuration that
+   had looked stable moments earlier in an idle snapshot -- CPU starvation
+   delays GC, letting RSS balloon before it can be reclaimed. Fixed by
+   sequencing MirrorMaker 2 strictly last: Cassandra + Kafka +
+   Prometheus/Grafana come up and settle first, then migrations and topics
+   are provisioned, and only then does `mirrormaker` start (applied to both
+   the local verification process and `.github/workflows/ci.yml`, which had
+   the identical single-shot `docker compose up -d` ordering issue). Separately,
+   repeated bring-up/tear-down cycles over several hours of this same
+   verification eventually degraded the local Docker Desktop VM itself into
+   a genuinely unresponsive state (containers reported "zombie and can not
+   be killed," host load average briefly hit 25 on an 8-core machine) --
+   unrelated to anything in this project's own config, but real enough to
+   need a full Docker Desktop restart (done with the user's explicit
+   go-ahead) before verification could complete. Included here because it's
+   exactly the kind of thing a future session repeating this bring-up cycle
+   many times in one sitting should recognize rather than mistake for a
+   fourth application-level bug.
 
 ---
 

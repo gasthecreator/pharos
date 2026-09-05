@@ -525,15 +525,41 @@ with no change to their own content or intent.
   actual application code path (`consumer.CassandraCanonicalStore`,
   `LOCAL_QUORUM`) succeeding throughout with dc-eu completely unreachable,
   then healing and confirming the during-partition write reached dc-eu via
-  hinted handoff. One honestly-noted, explained (not hidden) finding along
-  the way: 10-way concurrent Paxos LWT contention
-  (`TestCassandraOutboxStore_RealIntegration`'s race sub-test) got measurably
-  more sensitive during the partition — occasionally zero clean winners,
-  never more than one, passing cleanly once healed — a plausible interaction
-  between pre-existing ballot contention and partition-driven retries, not a
-  correctness violation; the actual property under test (single-operation
-  `LOCAL_QUORUM` success against dc-us) held throughout via both a direct
-  `cqlsh` check and the real application code path.
+  hinted handoff. Also verified the steady-state simulated-latency half of
+  "Simulated WAN conditions" separately from the full-partition case: real
+  `tc netem delay 100ms 20ms` applied surgically between dc-us and dc-eu,
+  `LOCAL_QUORUM` operations against dc-us confirmed unaffected.
+
+  One thing found, investigated, and fixed rather than just narrated: initial
+  heap tuning (128M/node) let the full suite pass, but not reliably —
+  `TestCassandraOutboxStore_RealIntegration`'s 10-way LWT race sub-test hit
+  occasional zero-winner runs (never more than one — no correctness
+  violation) both during the partition test and, on a later run, against the
+  healthy unpartitioned cluster; a *different*, non-Paxos operation
+  (`MarkPublished`) also hit a timeout on another run, pointing at GC
+  pressure under `-race`'s overhead plus concurrent test load at 128M heap,
+  not anything specific to Paxos contention or partitioning. Fixed at the
+  root (bumped heap to 176M — still well under the memory budget) and,
+  belt-and-suspenders, made the race sub-test itself retry on exactly 0
+  winners with a fresh key (still failing immediately, no retry, on the one
+  outcome — `>1` winners — that would be an actual correctness violation).
+
+  Re-verifying at 176M surfaced a *third* real bug, plus a real
+  environmental one: a single `docker compose up -d` starts MirrorMaker 2
+  concurrently with Cassandra/Kafka's own startup, and MM2 busy-looping
+  against not-yet-existing topics piled enough CPU contention on top of 10
+  other JVMs' startup work to produce two more genuine OOM kills even at
+  176M heap. Fixed by sequencing MirrorMaker 2 strictly last — Cassandra +
+  Kafka + observability come up and settle, migrations and topics get
+  provisioned, only then does `mirrormaker` start — applied to both local
+  verification and `.github/workflows/ci.yml`. Separately (and not a code
+  bug at all): several hours of repeated bring-up/tear-down cycles during
+  this same verification eventually degraded the local Docker Desktop VM
+  into a genuinely unresponsive state (unkillable "zombie" containers, host
+  load average briefly at 25 on 8 cores), needing a full Docker Desktop
+  restart — done with the user's explicit go-ahead — before the final clean
+  verification below. With that sequencing fix and a healthy Docker VM, the
+  full suite passed cleanly twice in a row.
 
 This is genuinely months, not weeks, of work sequenced across many
 sessions — nobody should expect this list to close quickly, and no single
