@@ -26,6 +26,12 @@ type CassandraServiceConfig struct {
 	// since "some of this might have aged into cold storage" is the normal
 	// case for those query shapes, not an edge case).
 	ArchiveDir string
+	// LocalDC and RemoteDCs mirror dedup.CassandraConfig's fields (§2.4,
+	// Slice 14: Multi-Region Cassandra + Kafka) -- the query service doesn't
+	// bootstrap the keyspace itself, but still needs DC-aware host selection
+	// for correct LOCAL_QUORUM read routing.
+	LocalDC   string
+	RemoteDCs map[string]int
 }
 
 // DefaultCassandraServiceConfig returns standard connection settings for the Pharos Cassandra cluster.
@@ -37,6 +43,8 @@ func DefaultCassandraServiceConfig() CassandraServiceConfig {
 		Consistency:    gocql.LocalQuorum, // RF=3, LOCAL_QUORUM reads/writes (Slice 7)
 		ConnectTimeout: 10 * time.Second,
 		ArchiveDir:     archive.DefaultConfig().Dir,
+		LocalDC:        "dc-us",
+		RemoteDCs:      map[string]int{"dc-eu": 3},
 	}
 }
 
@@ -59,6 +67,8 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 		Consistency:       cfg.Consistency,
 		ConnectTimeout:    cfg.ConnectTimeout,
 		ReplicationFactor: 3,
+		LocalDC:           cfg.LocalDC,
+		RemoteDCs:         cfg.RemoteDCs,
 	}
 
 	cStore, err := consumer.NewCassandraCanonicalStore(cStoreCfg)
@@ -74,6 +84,11 @@ func NewCassandraService(cfg CassandraServiceConfig) (*CassandraService, error) 
 	cluster.Consistency = cfg.Consistency
 	cluster.Keyspace = cfg.Keyspace
 	cluster.DisableInitialHostLookup = true
+	if cfg.LocalDC != "" {
+		// DC-aware host selection (§2.4, Slice 14) -- see dedup.CassandraConfig's
+		// LocalDC docs for why this matters once a second DC genuinely exists.
+		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
+	}
 
 	session, err := cluster.CreateSession()
 	if err != nil {
