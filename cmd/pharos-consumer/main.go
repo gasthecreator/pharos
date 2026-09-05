@@ -56,8 +56,23 @@ func main() {
 		}
 	}
 
-	// 2. Initialize Watermark Tracker (§2.4)
+	// 2. Initialize Watermark Tracker (§2.4), restoring from a prior
+	// checkpoint if one exists for this consumer group (§2.4, Slice 13) --
+	// must happen before the engine consumes anything, so the strict
+	// monotonic guard's floor is in place before any live event is processed.
 	tracker := consumer.NewWatermarkTracker(*latenessTolerance, *idleTimeout)
+	checkpointCtx, checkpointCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	checkpoint, err := store.LoadWatermarkCheckpoint(checkpointCtx, *kafkaGroup)
+	checkpointCancel()
+	if err != nil {
+		log.Printf("[pharos-consumer] WARNING: failed to load watermark checkpoint: %v (starting with an empty tracker)", err)
+	} else if checkpoint != nil {
+		tracker.Restore(*checkpoint)
+		log.Printf("[pharos-consumer] Watermark tracker restored from checkpoint (group: %s, previous_emitted: %s)",
+			*kafkaGroup, checkpoint.PreviousEmitted.Format(time.RFC3339))
+	} else {
+		log.Printf("[pharos-consumer] No prior watermark checkpoint for group %s (fresh consumer group)", *kafkaGroup)
+	}
 	log.Printf("[pharos-consumer] Watermark tracker initialized (lateness: %s, idle timeout: %s)", *latenessTolerance, *idleTimeout)
 
 	// 3. Initialize Kafka Consumer Engine
@@ -131,6 +146,31 @@ func main() {
 		}
 	}()
 
+	// 6b. Periodic watermark checkpoint (§2.4, Slice 13): bounds the residual
+	// exposure window (how much watermark progress a crash could still lose)
+	// to "whatever advanced since the last successful checkpoint." Tighter
+	// than the status ticker above since this state is now load-bearing
+	// correctness, not just an operational log line.
+	saveWatermarkCheckpoint := func() {
+		saveCtx, saveCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer saveCancel()
+		if err := store.SaveWatermarkCheckpoint(saveCtx, *kafkaGroup, tracker.Snapshot()); err != nil {
+			log.Printf("[pharos-consumer] WARNING: failed to save watermark checkpoint: %v", err)
+		}
+	}
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				saveWatermarkCheckpoint()
+			}
+		}
+	}()
+
 	// 7. Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -138,6 +178,11 @@ func main() {
 	<-sigChan
 	log.Println("[pharos-consumer] Shutting down gracefully...")
 	cancel()
+
+	// Save one last checkpoint on the graceful-shutdown path specifically --
+	// this is the one path where the exposure window is actually avoidable,
+	// since a real crash by definition never reaches here.
+	saveWatermarkCheckpoint()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()

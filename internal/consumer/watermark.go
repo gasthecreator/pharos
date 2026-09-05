@@ -13,6 +13,20 @@ type PartitionWatermarkStat struct {
 	IsActive         bool      `json:"is_active"`
 }
 
+// WatermarkCheckpoint is a persistable snapshot of a WatermarkTracker's state
+// (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 13: Consumer Crash/Restart Watermark
+// Continuity") -- without this, a process restart resets PreviousEmitted to
+// zero, and the strict monotonic guard's own zero-value escape hatch lets the
+// externally observed watermark regress below what was already reported
+// pre-crash. All three fields are restored together, not just
+// PreviousEmitted, since PartitionLastActivity also feeds the active/idle
+// partition classification that computeCandidateWatermarkLocked depends on.
+type WatermarkCheckpoint struct {
+	PreviousEmitted        time.Time
+	PartitionHighWatermark map[int]time.Time
+	PartitionLastActivity  map[int]time.Time
+}
+
 // WatermarkTracker implements event-time watermarking with idle-source detection
 // and monotonic progression guards (§2.4).
 type WatermarkTracker struct {
@@ -211,6 +225,59 @@ func (wt *WatermarkTracker) GetLateArrivalAudits() []LateArrivalAudit {
 	result := make([]LateArrivalAudit, len(wt.lateAudits))
 	copy(result, wt.lateAudits)
 	return result
+}
+
+// Snapshot returns a deep copy of the tracker's persistable state, suitable
+// for saving as a WatermarkCheckpoint (§2.4, Slice 13). All timestamps are
+// truncated to millisecond precision -- Cassandra's timestamp column type is
+// itself only millisecond-precision, so persisting a Go time.Time with finer
+// resolution and reading it back would otherwise silently produce a value
+// microseconds/nanoseconds *earlier* than the original, which is exactly
+// the kind of spurious "regression" the strict monotonic guard exists to
+// catch and would incorrectly flag. Truncating here, at the point state is
+// about to be persisted, makes Snapshot()'s return value exactly what a
+// round trip through the checkpoint store will produce, whether or not
+// persistence actually happens. Safe to call concurrently with ProcessEvent.
+func (wt *WatermarkTracker) Snapshot() WatermarkCheckpoint {
+	wt.mu.RLock()
+	defer wt.mu.RUnlock()
+
+	high := make(map[int]time.Time, len(wt.partitionHighWatermark))
+	for p, t := range wt.partitionHighWatermark {
+		high[p] = t.Truncate(time.Millisecond)
+	}
+	activity := make(map[int]time.Time, len(wt.partitionLastActivity))
+	for p, t := range wt.partitionLastActivity {
+		activity[p] = t.Truncate(time.Millisecond)
+	}
+	return WatermarkCheckpoint{
+		PreviousEmitted:        wt.previousEmitted.Truncate(time.Millisecond),
+		PartitionHighWatermark: high,
+		PartitionLastActivity:  activity,
+	}
+}
+
+// Restore seeds the tracker's state directly from a previously saved
+// checkpoint (§2.4, Slice 13) -- called once at startup, before any live
+// event is processed. This deliberately bypasses advanceWatermarkLocked's
+// guarded path: restoring is initializing prior state, not a new event
+// advancing the watermark, so there is nothing to guard against here. Must
+// only be called before the first ProcessEvent/CurrentWatermark call on a
+// freshly constructed tracker -- calling it afterward would silently
+// overwrite whatever the tracker had already computed from live data.
+func (wt *WatermarkTracker) Restore(cp WatermarkCheckpoint) {
+	wt.mu.Lock()
+	defer wt.mu.Unlock()
+
+	wt.previousEmitted = cp.PreviousEmitted
+	wt.partitionHighWatermark = make(map[int]time.Time, len(cp.PartitionHighWatermark))
+	for p, t := range cp.PartitionHighWatermark {
+		wt.partitionHighWatermark[p] = t
+	}
+	wt.partitionLastActivity = make(map[int]time.Time, len(cp.PartitionLastActivity))
+	for p, t := range cp.PartitionLastActivity {
+		wt.partitionLastActivity[p] = t
+	}
 }
 
 // PartitionStats returns live partition activity stats.

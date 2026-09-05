@@ -128,3 +128,134 @@ func TestWatermarkTracker_CompleteToRevisedLifecycle(t *testing.T) {
 		t.Errorf("unexpected audit entry: %+v", audits[0])
 	}
 }
+
+// TestWatermarkTracker_RestoreFromCheckpointPreventsRegression is the
+// unit-level core of Slice 13 (ARCHITECTURE_PROPOSALS.md "Consumer
+// Crash/Restart Watermark Continuity"): a brand-new tracker (standing in for
+// a freshly restarted process) that Restores a checkpoint saved by a prior
+// tracker must never report a watermark below what that prior tracker had
+// already reported -- even before any new event arrives, and even if the
+// first event replayed after restart has an earlier event_time than the
+// pre-crash high point (exactly what Kafka resuming from the last committed
+// offset can produce).
+func TestWatermarkTracker_RestoreFromCheckpointPreventsRegression(t *testing.T) {
+	baseTime := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	latenessTolerance := 5 * time.Minute
+	idleTimeout := 10 * time.Minute
+
+	// 1. "Before the crash": a tracker processes events and advances well past
+	// baseTime.
+	before := NewWatermarkTracker(latenessTolerance, idleTimeout)
+	_, preCrashWatermark := before.ProcessEvent(0, "SITE-01:1", baseTime.Add(60*time.Minute), baseTime)
+	if preCrashWatermark.IsZero() {
+		t.Fatalf("expected a non-zero watermark before the simulated crash")
+	}
+
+	checkpoint := before.Snapshot()
+
+	// 2. "The crash": a brand-new tracker, exactly what cmd/pharos-consumer
+	// constructs fresh on every process start. Immediately after Restore --
+	// before any new event -- CurrentWatermark must already reflect the
+	// pre-crash floor, not zero.
+	after := NewWatermarkTracker(latenessTolerance, idleTimeout)
+	after.Restore(checkpoint)
+
+	restoredWatermark := after.CurrentWatermark(baseTime.Add(61 * time.Minute))
+	if restoredWatermark.Before(preCrashWatermark) {
+		t.Fatalf("CRITICAL REGRESSION: restored tracker reports watermark %v, below pre-crash watermark %v", restoredWatermark, preCrashWatermark)
+	}
+	if !restoredWatermark.Equal(preCrashWatermark) {
+		t.Fatalf("expected restored watermark to equal pre-crash watermark %v, got %v", preCrashWatermark, restoredWatermark)
+	}
+
+	// 3. "Replay from the last committed Kafka offset": the first message
+	// delivered after restart has an event_time EARLIER than the pre-crash
+	// high point -- entirely plausible, since Kafka resumes from the last
+	// committed offset, not from "wherever the in-memory watermark had
+	// gotten to." The monotonic guard must hold even here.
+	isLate, w := after.ProcessEvent(0, "SITE-01:2", baseTime.Add(30*time.Minute), baseTime.Add(61*time.Minute))
+	if w.Before(preCrashWatermark) {
+		t.Fatalf("CRITICAL REGRESSION: watermark dropped to %v after replaying an earlier-event-time message, below pre-crash floor %v", w, preCrashWatermark)
+	}
+	if !isLate {
+		t.Errorf("expected the earlier-event-time replayed message to be marked isLate=true against the restored floor")
+	}
+}
+
+// TestWatermarkTracker_RestoreOfEmptyCheckpointIsNoOp verifies that
+// restoring a checkpoint from a tracker that never processed any event
+// (the genuinely-fresh-consumer-group case) leaves the new tracker
+// behaving exactly like one that was never restored at all.
+func TestWatermarkTracker_RestoreOfEmptyCheckpointIsNoOp(t *testing.T) {
+	baseTime := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+
+	fresh := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+	emptyCheckpoint := fresh.Snapshot()
+
+	restored := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+	restored.Restore(emptyCheckpoint)
+
+	if wm := restored.CurrentWatermark(baseTime); !wm.IsZero() {
+		t.Fatalf("expected zero watermark after restoring an empty checkpoint, got %v", wm)
+	}
+
+	_, w := restored.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), baseTime)
+	expected := baseTime.Add(10 * time.Minute).Add(-5 * time.Minute)
+	if !w.Equal(expected) {
+		t.Errorf("expected first event after empty restore to advance watermark to %v, got %v", expected, w)
+	}
+}
+
+// TestWatermarkTracker_SnapshotIsIndependentCopy verifies Snapshot returns a
+// deep copy: mutating the tracker after taking a snapshot must not change
+// the already-taken snapshot's maps, since a checkpoint is meant to be saved
+// as-is at a point in time.
+func TestWatermarkTracker_SnapshotIsIndependentCopy(t *testing.T) {
+	baseTime := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	tracker := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+
+	tracker.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), baseTime)
+	snap := tracker.Snapshot()
+	originalHigh := snap.PartitionHighWatermark[0]
+
+	tracker.ProcessEvent(0, "SITE-01:2", baseTime.Add(90*time.Minute), baseTime.Add(time.Minute))
+
+	if !snap.PartitionHighWatermark[0].Equal(originalHigh) {
+		t.Fatalf("expected snapshot's partition high watermark to remain %v after further mutation, got %v", originalHigh, snap.PartitionHighWatermark[0])
+	}
+}
+
+// TestWatermarkTracker_SnapshotTruncatesToMillisecondPrecision guards against
+// a real bug found while writing the Slice 13 fault-injection test: Cassandra's
+// timestamp column is millisecond-precision, so a Go time.Time with finer
+// resolution silently loses precision on a round trip through the checkpoint
+// store, making the restored floor look *earlier* than the true in-memory
+// value -- exactly the shape of "regression" the strict monotonic guard
+// exists to catch, but a spurious one caused by storage precision, not logic.
+// Snapshot must truncate to millisecond precision itself, so its return value
+// already equals whatever a round trip through Cassandra would produce.
+func TestWatermarkTracker_SnapshotTruncatesToMillisecondPrecision(t *testing.T) {
+	baseTime := time.Date(2026, 9, 5, 12, 0, 0, 123456789, time.UTC) // sub-millisecond component: 456789ns
+	tracker := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+
+	tracker.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), baseTime)
+	snap := tracker.Snapshot()
+
+	if got, want := snap.PreviousEmitted.Nanosecond()%int(time.Millisecond), 0; got != want {
+		t.Fatalf("expected PreviousEmitted truncated to millisecond precision (sub-ms remainder 0), got remainder %dns in %v", got, snap.PreviousEmitted)
+	}
+	if got, want := snap.PartitionHighWatermark[0].Nanosecond()%int(time.Millisecond), 0; got != want {
+		t.Fatalf("expected PartitionHighWatermark truncated to millisecond precision, got remainder %dns", got)
+	}
+	if got, want := snap.PartitionLastActivity[0].Nanosecond()%int(time.Millisecond), 0; got != want {
+		t.Fatalf("expected PartitionLastActivity truncated to millisecond precision, got remainder %dns", got)
+	}
+
+	// Restoring the truncated checkpoint must not itself look like a
+	// regression versus the checkpoint's own (already-truncated) floor.
+	restored := NewWatermarkTracker(5*time.Minute, 10*time.Minute)
+	restored.Restore(snap)
+	if wm := restored.CurrentWatermark(baseTime.Add(time.Minute)); wm.Before(snap.PreviousEmitted) {
+		t.Fatalf("restored watermark %v is before the checkpoint's own PreviousEmitted %v", wm, snap.PreviousEmitted)
+	}
+}

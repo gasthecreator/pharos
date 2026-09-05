@@ -15,6 +15,114 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-05] Slice 13: Consumer Crash/Restart Watermark Continuity
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-05).
+
+**What in PLAN.md this touches:** §2.4 (event-time watermarking), Phase 2
+Slice 13.
+
+**What PLAN.md's own wording assumes, and why that assumption doesn't hold
+yet.** Slice 13 is phrased as "prove the watermark cannot regress... the
+same monotonic-guard principle from §2.4, now tested against process death
+specifically" — as if the guarantee already exists and this slice is purely
+a testing exercise. Tracing `WatermarkTracker` (`internal/consumer/watermark.go`)
+before writing that test found this isn't actually true: `previousEmitted`
+(the field the strict monotonic guard in `advanceWatermarkLocked` actually
+compares against) along with `partitionHighWatermark` and
+`partitionLastActivity` are plain in-process fields on a struct that
+`cmd/pharos-consumer/main.go` constructs fresh via `consumer.NewWatermarkTracker`
+on every process start. A real crash and restart — not just a partition
+reawakening within a *live* process, which is what the existing tests
+actually cover — throws all of that away. `previousEmitted` comes back
+zero-valued, so the guard's own escape hatch (`wt.previousEmitted.IsZero()
+|| candidate.After(wt.previousEmitted)`) is trivially satisfied by whatever
+the newly-replayed messages produce, even if that's *earlier* than what was
+already reported pre-crash — which is entirely plausible, since Kafka
+resumes each partition from its last *committed* offset, not from
+"wherever the in-memory watermark had gotten to." The externally observable
+symptom is real, not theoretical: `pharos_consumer_watermark_seconds`
+(`cmd/pharos-consumer/main.go`'s status ticker) would visibly regress on
+Prometheus/Grafana across a restart. Writing a test that merely confirms
+today's actual behavior would either have to assert the regression (turning
+a bug into a "spec") or be quietly satisfied by a test that never exercises
+enough real replay to surface it — neither is honest. This gets fixed as
+part of this slice, not deferred, per the standing instruction to build the
+correct thing rather than the one that's easiest to make green.
+
+**Decision: persist a watermark checkpoint to Cassandra, keyed by consumer
+group, restored explicitly at startup before the engine consumes anything.**
+A new `consumer_watermark_checkpoints` table (single row per `group_id`,
+upserted — this is operational recovery state, not the clinical
+data-of-record `PLAN.md`'s retention framing is about, same distinction
+Slice 11 already drew for `event_outbox`/`pending_outbox`) stores
+`previous_emitted timestamp`, `partition_high_watermark map<int, timestamp>`,
+and `partition_last_activity map<int, timestamp>` — Cassandra's native
+collection column types are a direct fit for the tracker's own in-memory
+shape, no serialization format to invent. `WatermarkTracker` gains
+`Snapshot()` (returns a copy of this state for persisting) and `Restore(cp)`
+(seeds the three fields directly, bypassing the guarded `advanceWatermarkLocked`
+path entirely — this is initialization, not a live event arriving).
+`cmd/pharos-consumer/main.go` loads the checkpoint for its configured
+`--kafka-group` before starting the engine and calls `Restore` if one
+exists; a new periodic goroutine (10s interval, tighter than the existing
+30s status-log ticker since this is now load-bearing correctness state, not
+just an operational log line) calls `Snapshot()` and saves it. Restoring
+all three fields (not just `previous_emitted`) matters for more than just
+the monotonic floor: `computeCandidateWatermarkLocked`'s active/idle
+partition classification depends on `partitionLastActivity`, and a restart
+that dropped only the floor while forgetting per-partition state could
+still compute a *wrong* (if not literally regressed) forward watermark
+immediately after restart.
+
+**Why periodic persistence, not persistence on every message.** Mirrors the
+same reasoning as Slice 12's backup interval: writing the checkpoint on
+every single processed message would mean an extra Cassandra write in the
+hot path of every event, for state that only matters at the (rare) moment
+of a crash. A periodic snapshot bounds the "what could still regress"
+window to whatever advanced in the interval between the last checkpoint and
+the crash — an explicit, bounded exposure, not an eliminated one, exactly
+like Slice 12's disk-backup interval. 10s is deliberately tighter than
+Slice 12's 5-minute default because this state guards a correctness
+property that's externally visible on every scrape, not just a
+disaster-recovery snapshot consulted rarely.
+
+**Why not derive the watermark from Cassandra's own canonical tables
+instead of a dedicated checkpoint table** (e.g. `MAX(event_time)` per
+partition from `canonical_events`): rejected. There's no efficient query
+for that — `canonical_events` is keyed by `idempotency_key`, and the
+partition-clustered tables are keyed by `study_id`/`site_id`, not by Kafka
+partition, so answering "what was the high-watermark per *Kafka partition*"
+would mean a full-table scan or `ALLOW FILTERING`, both already established
+anti-patterns in this project (Slice 11 rejected the same shape of idea for
+its own archive index). A dedicated small checkpoint table is the same
+choice this project already made for `known_studies`/`known_sites` (Slice
+11) and `pending_outbox` before that: purpose-built tracking state instead
+of querying the data-of-record tables for something they're not shaped to
+answer efficiently.
+
+**The residual exposure window, stated plainly:** a crash within the 10s
+window after the last successful checkpoint can still lose up to that
+window's worth of watermark progress — the restored floor will be whatever
+was last checkpointed, not the true pre-crash instant. This is bounded, not
+eliminated, exactly like Slice 12's disk-backup window; tightening the
+interval trades more Cassandra write volume for a smaller window.
+
+**Impact if approved:**
+- `internal/consumer/canonical_store.go`: `CanonicalStore` interface gains
+  `SaveWatermarkCheckpoint`/`LoadWatermarkCheckpoint`; new
+  `consumer_watermark_checkpoints` table in `EnsureSchema`; implementations
+  on both `CassandraCanonicalStore` and `MemoryCanonicalStore`.
+- `internal/consumer/watermark.go`: new `WatermarkCheckpoint` type,
+  `Snapshot()`/`Restore()` methods on `WatermarkTracker`.
+- `cmd/pharos-consumer/main.go`: load-and-restore at startup, periodic
+  checkpoint-save goroutine, save-on-graceful-shutdown too (minimizes the
+  exposure window on the one path where it's actually avoidable).
+- No wire-format or Kafka changes — this is purely consumer-side recovery
+  state.
+
+---
+
 #### [2026-09-05] Slice 12: Edge Collector Durability Hardening
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-05).

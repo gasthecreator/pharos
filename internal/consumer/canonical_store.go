@@ -15,6 +15,8 @@ type CanonicalStore interface {
 	GetEvent(ctx context.Context, idempotencyKey string) (*CanonicalRecord, error)
 	GetEventsByStudy(ctx context.Context, studyID string, startTime, endTime time.Time) ([]*CanonicalRecord, error)
 	GetEventsBySite(ctx context.Context, siteID string, minSeq int64) ([]*CanonicalRecord, error)
+	SaveWatermarkCheckpoint(ctx context.Context, groupID string, cp WatermarkCheckpoint) error
+	LoadWatermarkCheckpoint(ctx context.Context, groupID string) (*WatermarkCheckpoint, error)
 	EnsureSchema() error
 	Close() error
 }
@@ -155,6 +157,13 @@ func (s *CassandraCanonicalStore) EnsureSchema() error {
 		`CREATE TABLE IF NOT EXISTS pharos.known_studies (
 			study_id text,
 			PRIMARY KEY (study_id)
+		);`,
+		`CREATE TABLE IF NOT EXISTS pharos.consumer_watermark_checkpoints (
+			group_id text,
+			previous_emitted timestamp,
+			partition_high_watermark map<int, timestamp>,
+			partition_last_activity map<int, timestamp>,
+			PRIMARY KEY (group_id)
 		);`,
 	}
 
@@ -440,6 +449,55 @@ func (s *CassandraCanonicalStore) DeleteArchivedEvent(ctx context.Context, r *Ca
 	return nil
 }
 
+// SaveWatermarkCheckpoint upserts the single checkpoint row for groupID
+// (§2.4, Slice 13) -- Cassandra's native map<int, timestamp> column type is a
+// direct fit for the tracker's own in-memory per-partition state, no
+// serialization format to invent. Empty (but non-nil) maps are written as
+// empty CQL maps, which is fine: a brand-new tracker with no partitions seen
+// yet checkpoints to "nothing to restore," exactly matching reality.
+func (s *CassandraCanonicalStore) SaveWatermarkCheckpoint(ctx context.Context, groupID string, cp WatermarkCheckpoint) error {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	const query = `
+		INSERT INTO pharos.consumer_watermark_checkpoints (
+			group_id, previous_emitted, partition_high_watermark, partition_last_activity
+		) VALUES (?, ?, ?, ?);
+	`
+	if err := session.Query(query, groupID, cp.PreviousEmitted, cp.PartitionHighWatermark, cp.PartitionLastActivity).
+		WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("failed to save watermark checkpoint for group %s: %w", groupID, err)
+	}
+	return nil
+}
+
+// LoadWatermarkCheckpoint returns the last saved checkpoint for groupID, or
+// (nil, nil) if this consumer group has never checkpointed -- a genuinely
+// fresh consumer group, which is not an error condition (§2.4, Slice 13).
+func (s *CassandraCanonicalStore) LoadWatermarkCheckpoint(ctx context.Context, groupID string) (*WatermarkCheckpoint, error) {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	const query = `
+		SELECT previous_emitted, partition_high_watermark, partition_last_activity
+		FROM pharos.consumer_watermark_checkpoints
+		WHERE group_id = ?;
+	`
+	var cp WatermarkCheckpoint
+	err := session.Query(query, groupID).WithContext(ctx).Scan(
+		&cp.PreviousEmitted, &cp.PartitionHighWatermark, &cp.PartitionLastActivity,
+	)
+	if err == gocql.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to load watermark checkpoint for group %s: %w", groupID, err)
+	}
+	return &cp, nil
+}
+
 // Close closes the underlying Cassandra session.
 func (s *CassandraCanonicalStore) Close() error {
 	s.mu.Lock()
@@ -453,19 +511,21 @@ func (s *CassandraCanonicalStore) Close() error {
 
 // MemoryCanonicalStore provides an in-memory implementation of CanonicalStore for fast unit testing.
 type MemoryCanonicalStore struct {
-	mu        sync.RWMutex
-	byKey     map[string]*CanonicalRecord
-	byStudy   map[string][]*CanonicalRecord
-	bySite    map[string][]*CanonicalRecord
-	saveHook  func(r *CanonicalRecord) error
-	saveCalls int
+	mu          sync.RWMutex
+	byKey       map[string]*CanonicalRecord
+	byStudy     map[string][]*CanonicalRecord
+	bySite      map[string][]*CanonicalRecord
+	checkpoints map[string]WatermarkCheckpoint
+	saveHook    func(r *CanonicalRecord) error
+	saveCalls   int
 }
 
 func NewMemoryCanonicalStore() *MemoryCanonicalStore {
 	return &MemoryCanonicalStore{
-		byKey:   make(map[string]*CanonicalRecord),
-		byStudy: make(map[string][]*CanonicalRecord),
-		bySite:  make(map[string][]*CanonicalRecord),
+		byKey:       make(map[string]*CanonicalRecord),
+		byStudy:     make(map[string][]*CanonicalRecord),
+		bySite:      make(map[string][]*CanonicalRecord),
+		checkpoints: make(map[string]WatermarkCheckpoint),
 	}
 }
 
@@ -559,6 +619,49 @@ func (m *MemoryCanonicalStore) GetEventsBySite(ctx context.Context, siteID strin
 		}
 	}
 	return results, nil
+}
+
+func (m *MemoryCanonicalStore) SaveWatermarkCheckpoint(ctx context.Context, groupID string, cp WatermarkCheckpoint) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	high := make(map[int]time.Time, len(cp.PartitionHighWatermark))
+	for p, t := range cp.PartitionHighWatermark {
+		high[p] = t
+	}
+	activity := make(map[int]time.Time, len(cp.PartitionLastActivity))
+	for p, t := range cp.PartitionLastActivity {
+		activity[p] = t
+	}
+	m.checkpoints[groupID] = WatermarkCheckpoint{
+		PreviousEmitted:        cp.PreviousEmitted,
+		PartitionHighWatermark: high,
+		PartitionLastActivity:  activity,
+	}
+	return nil
+}
+
+func (m *MemoryCanonicalStore) LoadWatermarkCheckpoint(ctx context.Context, groupID string) (*WatermarkCheckpoint, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	cp, ok := m.checkpoints[groupID]
+	if !ok {
+		return nil, nil
+	}
+	high := make(map[int]time.Time, len(cp.PartitionHighWatermark))
+	for p, t := range cp.PartitionHighWatermark {
+		high[p] = t
+	}
+	activity := make(map[int]time.Time, len(cp.PartitionLastActivity))
+	for p, t := range cp.PartitionLastActivity {
+		activity[p] = t
+	}
+	return &WatermarkCheckpoint{
+		PreviousEmitted:        cp.PreviousEmitted,
+		PartitionHighWatermark: high,
+		PartitionLastActivity:  activity,
+	}, nil
 }
 
 func (m *MemoryCanonicalStore) EnsureSchema() error {
