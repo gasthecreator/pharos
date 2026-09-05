@@ -44,3 +44,8 @@ data/
 *.log
 /tmp/
 /certs/
+
+# Slice 16 load-test site keys (generated fresh per run by
+# scripts/loadtest_setup.sh; live plaintext API keys, never committed)
+/loadtest/sites.json
+/loadtest/results/
