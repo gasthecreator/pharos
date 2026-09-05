@@ -60,7 +60,7 @@ type CassandraOutboxStore struct {
 // Multi-Region Cassandra + Kafka). NetworkTopologyStrategy is used even for a
 // single-DC deployment (RemoteDCs empty) rather than SimpleStrategy, so
 // adding a second DC later never requires an ALTER KEYSPACE on an already
-//-provisioned keyspace.
+// -provisioned keyspace.
 func networkTopologyReplicationMap(localDC string, localRF int, remoteDCs map[string]int) string {
 	parts := []string{fmt.Sprintf("'%s': %d", localDC, localRF)}
 	for dc, rf := range remoteDCs {
