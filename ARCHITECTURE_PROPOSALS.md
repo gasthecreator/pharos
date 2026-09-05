@@ -15,6 +15,120 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-05] Slice 15: Auth & TLS
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-05).
+
+**What in PLAN.md this touches:** §2.1, §2.2, §2.4, §5, Phase 2 Slice 15.
+PLAN.md flags this slice specifically as needing real review before
+building ("this is exactly the kind of decision that shouldn't get made
+unattended overnight") -- the review mechanism this project has used for
+every slice since Slice 8 is exactly this file: a proposal written and
+weighed before implementation, approved here rather than left for a live
+conversation that the user's standing instruction for this session
+explicitly won't happen. Held to the same bar as every other open-design
+slice this session (11, 13, 14): real alternatives named, real tradeoffs
+weighed, decision recorded before a line of code changes.
+
+**Edge → Central Ingestion: per-site API keys, not mTLS.** Both give the
+same practical guarantee here (a request is provably from a specific,
+authorized site), but the operational shape is different. mTLS means
+issuing, distributing, and eventually rotating/revoking a client
+certificate *per site* -- a real PKI lifecycle -- for a deployment model
+this project's own language already describes as "a resource-constrained
+trial site," not a fleet with dedicated IT running certificate management.
+A per-site API key is a single opaque secret an edge deployment is
+configured with once; rotation is "issue a new one, retire the old one,"
+no certificate tooling required. This isn't a security downgrade as long
+as the key travels over TLS (below) -- the key secures *identity*, TLS
+secures the *channel*, and conflating the two is what makes mTLS feel like
+it's doing double duty it doesn't actually need to here. mTLS remains the
+right call in a deployment model with real per-site infrastructure teams;
+it isn't the right call for this project's stated one.
+
+**Key handling:** stored server-side as a SHA-256 hash, never plaintext
+(the token itself is a random 256-bit value with no human-memorable
+structure to protect against -- unlike a password, it doesn't need a
+per-key salt to defeat precomputation; a fixed-cost hash of a
+high-entropy secret is exactly what services like Stripe and GitHub do for
+their own API tokens). A new `pharos-cli site create-key <site-id>`
+subcommand generates the key, stores only its hash, and prints the
+plaintext exactly once -- the same "copy this now, it's gone" UX those
+services use, because the alternative (storing it reversibly, so it can be
+shown again) is a real liability for no operational benefit; a lost key is
+solved by rotating, not by retrieving. New `site_api_keys` Cassandra table
+(`site_id text PRIMARY KEY, key_hash text, created_at timestamp, revoked
+boolean`), read once per request by new `internal/auth` middleware that
+resolves the authenticated site from `X-API-Key` and rejects any request
+whose optional `X-Site-ID`/envelope-embedded site doesn't match it --
+closing the actual gap this slice exists to close: today, anything can
+claim to be any site just by setting a header.
+
+**TLS: this project's own CA, not a real one.** No cloud spend and no real
+domain means no path to a publicly-trusted certificate anyway, and none is
+needed for traffic that never leaves Docker-simulated infrastructure this
+project itself controls end to end. A single self-signed root CA (`scripts/
+generate_certs.sh`, openssl-based, matching this project's existing
+shell-script conventions) issues every certificate used everywhere:
+Central Ingestion's HTTP listener, Cassandra's client + inter-node
+listeners, Kafka's client + inter-broker listeners. Edge and every Go
+service trust that one CA file rather than doing no verification at all
+(today's actual state) or trying to stand up a real ACME-style flow that
+would serve no one outside this project's own Docker network.
+
+**Cassandra and Kafka both terminate real TLS, not just the HTTP edge.**
+It would be inconsistent to encrypt the edge→ingestion hop while leaving
+every other hop -- Central Ingestion/consumer/query to Cassandra, the
+Kafka client traffic, and inter-node/inter-broker traffic across the two
+simulated regions from Slice 14 -- in plaintext. PLAN.md's own Slice 15
+wording asks for exactly this ("TLS termination approach for
+Cassandra/Kafka inter-node and client traffic, now across two simulated
+regions"), and a partial answer wouldn't actually close the "any process
+that can reach the port" gap for the ports it left open. One shared
+keystore (signed by the project CA) across all 5 Cassandra nodes and one
+across all 5 Kafka brokers, rather than a uniquely-issued identity cert
+per node: this is a private cluster of trusted, project-owned nodes, not a
+zero-trust mesh of independently-operated ones, so the marginal security
+value of per-node identity doesn't justify roughly 5x the certificate
+bookkeeping for no property this project's own threat model (external,
+untrusted access) actually needs.
+
+**Alternatives considered and rejected:**
+- **mTLS for edge→ingestion**, covered above -- rejected on operational
+  grounds for this deployment model, not security ones.
+- **JWT session tokens instead of a static API key**: rejected as
+  unnecessary complexity -- a JWT's main advantage (short-lived, so a leak
+  self-heals) matters most for interactive user sessions; a site's
+  edge-to-ingestion traffic is a long-running service-to-service
+  relationship where a rotatable static key with an explicit revoke path
+  is simpler and just as controllable.
+- **Per-node Cassandra/Kafka identity certificates**: rejected above.
+- **A real ACME/Let's-Encrypt-style CA**: not applicable -- nothing here
+  has a publicly resolvable domain, and doing so would add real operational
+  weight (renewal automation, rate limits) for traffic that's entirely
+  internal to this project's own simulated infrastructure.
+
+**Impact if approved:**
+- `scripts/generate_certs.sh`: new, generates the project CA plus
+  Cassandra/Kafka/Central-Ingestion certs and keystores.
+- New `internal/auth` package: API key hashing/verification, HTTP
+  middleware.
+- `internal/dedup` (or a new small store): `site_api_keys` table and
+  accessors.
+- `cmd/pharos-cli`: new `site create-key`/`site revoke-key` subcommands.
+- `cmd/pharos-ingestion`, `cmd/pharos-edge`: TLS server/client wiring,
+  API-key middleware and header.
+- `internal/dedup`, `internal/consumer`, `internal/query`: gocql
+  `SslOpts`/TLS config.
+- `internal/kafka`: kafka-go TLS config for producer and reader.
+- `docker-compose.yml`: Cassandra `client_encryption_options`/
+  `server_encryption_options`, Kafka `SSL://` listeners, mounted
+  certs/keystores.
+- Wire format unaffected -- this slice is transport security and identity,
+  not data model.
+
+---
+
 #### [2026-09-05] Slice 14: Multi-Region Cassandra + Kafka (Simulated)
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-05).
