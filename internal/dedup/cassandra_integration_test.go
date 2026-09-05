@@ -156,4 +156,50 @@ func TestCassandraOutboxStore_RealIntegration(t *testing.T) {
 	if savedDLQ.Status != StatusPublished || savedDLQ.KafkaTopic != "pharos.events.dlq" {
 		t.Errorf("unexpected saved DLQ record: %+v", savedDLQ)
 	}
+
+	// 8. DLQ Replay (§2.3, Slice 10) against the real cluster -- exercises
+	// both EnsureSchema's replayed_at migration (this keyspace didn't have
+	// the column until this test's own connection ran EnsureSchema moments
+	// ago) and MarkDLQReplayed's CAS precondition, not just the in-memory
+	// store's equivalent already covered elsewhere.
+	if err := store.MarkDLQReplayed(ctx, dlqKey); err != nil {
+		t.Fatalf("MarkDLQReplayed failed against real Cassandra: %v", err)
+	}
+	replayedDLQ, err := store.GetDLQRecord(ctx, dlqKey)
+	if err != nil {
+		t.Fatalf("GetDLQRecord after replay failed: %v", err)
+	}
+	if replayedDLQ.Status != StatusReplayed {
+		t.Errorf("expected status REPLAYED after MarkDLQReplayed, got %s", replayedDLQ.Status)
+	}
+	if replayedDLQ.ReplayedAt.IsZero() {
+		t.Errorf("expected ReplayedAt to be set after MarkDLQReplayed")
+	}
+	// The original rejection reason must still be there -- replay never
+	// mutates or deletes the audit trail, only status/replayed_at change.
+	if replayedDLQ.RejectionReason != dlqRec.RejectionReason {
+		t.Errorf("expected original rejection reason preserved, got %q", replayedDLQ.RejectionReason)
+	}
+
+	// Replaying a second time must fail -- the CAS precondition requires
+	// status = 'PUBLISHED', and it's now REPLAYED.
+	if err := store.MarkDLQReplayed(ctx, dlqKey); err == nil {
+		t.Errorf("expected a second MarkDLQReplayed call to fail (already REPLAYED), got nil error")
+	}
+
+	// dead_letter_events_by_site must reflect the same replay (the dual-write
+	// pattern established for MarkDLQPublished in Slice 5).
+	// Note: rejected_at as actually stored is InsertDLQClaim's own internal
+	// timestamp, not the caller's dlqRec.RejectedAt field -- savedDLQ (read
+	// back via GetDLQRecord above) has the real persisted value.
+	var siteStatus string
+	if scanErr := store.session.Query(
+		`SELECT status FROM dead_letter_events_by_site WHERE site_id = ? AND rejected_at = ? AND idempotency_key = ?;`,
+		"SITE-CASS-DLQ", savedDLQ.RejectedAt, dlqKey,
+	).WithContext(ctx).Scan(&siteStatus); scanErr != nil {
+		t.Fatalf("failed to query dead_letter_events_by_site after replay: %v", scanErr)
+	}
+	if siteStatus != string(StatusReplayed) {
+		t.Errorf("expected dead_letter_events_by_site status REPLAYED, got %s", siteStatus)
+	}
 }

@@ -307,6 +307,28 @@ with no change to their own content or intent.
   audit trail, matching the "never silently mutate a reported result"
   principle §2.4 already established for late-arriving data.
 
+  **Done 2026-09-04.** `HandleEvents`'s per-event logic extracted into
+  `processOneEvent` (verified behavior-identical against the full existing
+  suite before building on top of it) so `HandleDLQReplay` reuses the exact
+  same validate/claim/publish path, not a second copy. Two real gaps found
+  and fixed along the way, unrelated to the feature itself but blocking it
+  correctly: `EnsureSchema()`'s `CREATE TABLE IF NOT EXISTS` never adds
+  columns to an already-existing table, so `replayed_at` needed the same
+  idempotent-migration pattern already used for SQLite in Slice 8, now
+  mirrored via `system_schema.columns`; and `pharos-cli`'s
+  `--hosts`/`--port`/`--keyspace` flags were silently non-functional since
+  nothing ever called `Parse()` on the `flag.FlagSet` registering them —
+  fixed while wiring up the new `--central-url` flag. Verified live against
+  the real running binaries, not just unit tests: submitted a genuinely
+  invalid event, confirmed replay of the unchanged payload still fails
+  identically, corrected the stored payload directly in Cassandra to
+  simulate "the issue was fixed," and confirmed replay then accepts and
+  publishes to the main topic while the original DLQ record shows
+  `REPLAYED` with its original rejection reason preserved. Full reasoning
+  in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet`,
+  `go build`, `gofmt`, `golangci-lint` (0 issues) all clean; full suite
+  passed twice against the real multi-node cluster.
+
 - **Slice 11 — Data retention & lifecycle.** `event_outbox`, the canonical
   tables, and the DLQ all grow forever today, with no tiering or archival
   plan — a real gap made a little ironic by this project's own 21 CFR Part

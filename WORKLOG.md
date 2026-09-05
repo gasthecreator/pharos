@@ -40,6 +40,81 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-04] Claude Code: Slice 10 — DLQ replay & reprocessing
+
+**Author:** Claude Code
+
+**What:** New `POST /api/v1/dlq/{key}/replay` endpoint on Central Ingestion,
+`pharos-cli dlq replay <key>` / `dlq replay --all --site X`, and a new
+`StatusReplayed` DLQ status. Extracted `HandleEvents`'s per-event logic
+into a reusable `processOneEvent` method so replay and normal ingestion
+share one implementation.
+
+**Why:** Per `PLAN.md`'s Slice 10 — the DLQ was fully inspectable but had
+no path back into the pipeline; once whatever caused a rejection was
+fixed, a rejected event just stayed rejected forever.
+
+**How:** Refactored `HandleEvents`'s ~220-line per-event loop body into
+`processOneEvent` first, as its own isolated step, and ran the entire
+existing ingestion + fault-injection suite before writing a single line of
+new replay logic — confirming zero behavior change from the extraction
+alone before building on top of it. `HandleDLQReplay` fetches the DLQ
+record, requires it to be `PUBLISHED` (409 otherwise), calls
+`processOneEvent` on its stored payload, and on success calls
+`MarkDLQReplayed` (CAS-guarded `IF status = 'PUBLISHED'`, mirroring
+`MarkDLQPublished`'s own pattern) — never deleting or overwriting the
+original rejection reason.
+
+Found and fixed two real bugs unrelated to the feature itself, both
+blocking it correctly rather than being introduced by it:
+1. `CassandraOutboxStore.EnsureSchema()`'s `CREATE TABLE IF NOT EXISTS`
+   is a no-op against tables that already exist, so the new
+   `replayed_at` column would never have reached an already-bootstrapped
+   keyspace automatically. Fixed with the same idempotent-migration
+   pattern Slice 8 used for SQLite, mirrored via `system_schema.columns`.
+2. `cmd/pharos-cli`'s `--hosts`/`--port`/`--keyspace` flags were silently
+   non-functional in every prior slice — registered on a `flag.FlagSet`
+   that nothing ever called `.Parse()` on. Found while wiring up the new
+   `--central-url` flag; fixed by generalizing the existing manual
+   `--json`/`--memory` arg-scanning loop to handle all global flags in
+   any position, rather than switching to stdlib `flag.Parse()`'s
+   stricter ordering rules, which would have silently regressed
+   `--json`/`--memory`'s already-working any-position behavior.
+
+Verified live against the real running binaries, not just unit/integration
+tests: built all four binaries, started `pharos-ingestion` for real,
+submitted a genuinely invalid event via `curl`, confirmed
+`pharos-cli dlq replay` against the unchanged payload fails identically
+to the original rejection, then directly corrected the stored payload in
+Cassandra via `cqlsh` (simulating "the issue was fixed" without needing
+two different validation-rule configurations in a live test) and confirmed
+replay now accepts, publishes to `pharos.events.adverse` (not the DLQ
+topic again), and the original DLQ record shows `REPLAYED` with its
+original rejection reason still intact.
+
+**Files/modules touched:** `ARCHITECTURE_PROPOSALS.md` (new entry),
+`PLAN.md` (Slice 10 marked done), `internal/dedup/store.go`,
+`internal/dedup/cassandra_store.go`, `internal/dedup/memory_store.go`,
+`internal/query/types.go`, `internal/query/service.go`,
+`internal/ingestion/handler.go`, `cmd/pharos-cli/main.go`,
+`migrations/004_dlq_replay.cql`.
+
+**Tests added/updated:** `internal/ingestion/dlq_replay_test.go` (5 new
+tests: success + original-record-marked-replayed, still-invalid leaves
+record untouched, not-found, not-yet-published is 409, replaying twice is
+409 on the second attempt). Extended
+`TestCassandraOutboxStore_RealIntegration` to exercise `MarkDLQReplayed`
+against the real cluster (the in-memory store's version was already
+covered, but the Cassandra-specific CQL and the `EnsureSchema` migration
+fix hadn't been). Full suite passed twice against the real multi-node
+cluster; every existing test in `internal/ingestion` and
+`internal/faultinjection` re-verified passing unchanged immediately after
+the `processOneEvent` extraction, before any new code was added.
+
+**Follow-ups / left open:** None for Slice 10 itself.
+
+---
+
 ## [2026-09-04] Claude Code: Slice 9 — wire-format schema versioning
 
 **Author:** Claude Code
