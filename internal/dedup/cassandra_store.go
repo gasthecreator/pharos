@@ -154,7 +154,45 @@ func (s *CassandraOutboxStore) EnsureSchema() error {
 			return err
 		}
 	}
+
+	// Migration for keyspaces that predate replayed_at (§2.3, Slice 10): the
+	// CREATE TABLE IF NOT EXISTS statements above are a no-op against
+	// already-existing tables, so an already-bootstrapped deployment needs
+	// an explicit ALTER TABLE. Checked against system_schema.columns first
+	// since ALTER TABLE ADD has no portable "if not exists" across Cassandra
+	// versions — this keeps EnsureSchema safe to call on every startup,
+	// matching the "bootstrapped automatically, no manual migration step"
+	// guarantee this project makes everywhere else.
+	for _, table := range []string{"dead_letter_events", "dead_letter_events_by_site"} {
+		hasColumn, err := s.hasColumn(table, "replayed_at")
+		if err != nil {
+			return fmt.Errorf("failed to inspect %s schema: %w", table, err)
+		}
+		if !hasColumn {
+			if err := s.session.Query(fmt.Sprintf(`ALTER TABLE %s ADD replayed_at timestamp;`, table)).Exec(); err != nil {
+				return fmt.Errorf("failed to add replayed_at to %s: %w", table, err)
+			}
+		}
+	}
+
 	return nil
+}
+
+// hasColumn reports whether the named column already exists on the named
+// table in this store's keyspace, so schema migrations can be applied
+// idempotently across restarts without erroring on an already-migrated
+// keyspace (mirrors the equivalent SQLite-side check in
+// internal/edge/sqlite_store.go, added for the same reason in Slice 8).
+func (s *CassandraOutboxStore) hasColumn(table, column string) (bool, error) {
+	var count int
+	err := s.session.Query(
+		`SELECT COUNT(*) FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ? AND column_name = ?;`,
+		s.cfg.Keyspace, table, column,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func currentBucket(t time.Time) string {
@@ -446,6 +484,47 @@ func (s *CassandraOutboxStore) MarkDLQPublished(ctx context.Context, idempotency
 	return nil
 }
 
+// MarkDLQReplayed transitions a DLQ record from PUBLISHED to REPLAYED (§2.3,
+// Slice 10). The CAS precondition (IF status = 'PUBLISHED') guarantees a
+// still-in-flight or already-replayed record can't be replayed a second time
+// -- mirroring MarkDLQPublished's own CAS guard, not a new pattern.
+func (s *CassandraOutboxStore) MarkDLQReplayed(ctx context.Context, idempotencyKey string) error {
+	now := time.Now().UTC()
+	query := `
+		UPDATE dead_letter_events
+		SET status = 'REPLAYED', replayed_at = ?
+		WHERE idempotency_key = ?
+		IF status = 'PUBLISHED';
+	`
+	markMap := make(map[string]interface{})
+	applied, err := s.session.Query(query, now, idempotencyKey).
+		WithContext(ctx).SerialConsistency(s.cfg.SerialConsistency).MapScanCAS(markMap)
+	if err != nil {
+		return fmt.Errorf("failed to mark DLQ record replayed: %w", err)
+	}
+	if !applied {
+		return fmt.Errorf("cannot mark %s replayed: not in PUBLISHED status", idempotencyKey)
+	}
+
+	// Update dead_letter_events_by_site (best-effort, mirrors MarkDLQPublished)
+	var siteID string
+	var rejectedAt time.Time
+	_ = s.session.Query(
+		`SELECT site_id, rejected_at FROM dead_letter_events WHERE idempotency_key = ?;`,
+		idempotencyKey,
+	).WithContext(ctx).Scan(&siteID, &rejectedAt)
+
+	if siteID != "" && !rejectedAt.IsZero() {
+		_ = s.session.Query(`
+			UPDATE dead_letter_events_by_site
+			SET status = 'REPLAYED', replayed_at = ?
+			WHERE site_id = ? AND rejected_at = ? AND idempotency_key = ?;
+		`, now, siteID, rejectedAt, idempotencyKey).WithContext(ctx).Exec()
+	}
+
+	return nil
+}
+
 // FetchStaleClaims returns records with expired leases for sweeper reclamation.
 func (s *CassandraOutboxStore) FetchStaleClaims(ctx context.Context, leaseTimeout time.Duration, limit int) ([]OutboxRecord, []DLQRecord, error) {
 	now := time.Now().UTC()
@@ -522,18 +601,18 @@ func (s *CassandraOutboxStore) GetOutboxRecord(ctx context.Context, idempotencyK
 // GetDLQRecord reads a dead-letter record by idempotency key.
 func (s *CassandraOutboxStore) GetDLQRecord(ctx context.Context, idempotencyKey string) (*DLQRecord, error) {
 	var status, siteID, payloadStr, reason, valErrors string
-	var claimedAt, rejectedAt, publishedAt time.Time
+	var claimedAt, rejectedAt, publishedAt, replayedAt time.Time
 	var topic string
 	var partition int
 	var offset int64
 
 	query := `
 		SELECT site_id, payload, rejection_reason, validation_errors, rejected_at, status,
-		       claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset
+		       claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset, replayed_at
 		FROM dead_letter_events WHERE idempotency_key = ?;
 	`
 	err := s.session.Query(query, idempotencyKey).WithContext(ctx).
-		Scan(&siteID, &payloadStr, &reason, &valErrors, &rejectedAt, &status, &claimedAt, &publishedAt, &topic, &partition, &offset)
+		Scan(&siteID, &payloadStr, &reason, &valErrors, &rejectedAt, &status, &claimedAt, &publishedAt, &topic, &partition, &offset, &replayedAt)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return nil, ErrRecordNotFound
@@ -554,6 +633,7 @@ func (s *CassandraOutboxStore) GetDLQRecord(ctx context.Context, idempotencyKey 
 		KafkaTopic:       topic,
 		KafkaPartition:   partition,
 		KafkaOffset:      offset,
+		ReplayedAt:       replayedAt,
 	}, nil
 }
 

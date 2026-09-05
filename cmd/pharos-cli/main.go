@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -29,12 +31,17 @@ DLQ Inspection Commands:
   dlq list [--site <site_id>] [--limit <n>]                 List rejected events in dead-letter store
   dlq get  <idempotency_key>                                Inspect rejection details for a specific event
 
+DLQ Replay Commands (§2.3, Slice 10 -- requires Central Ingestion, not --memory):
+  dlq replay <idempotency_key>                              Resubmit one rejected event's stored payload
+  dlq replay --all --site <site_id>                         Resubmit every PUBLISHED rejected event for a site
+
 Flags:
-  --hosts       Comma-separated Cassandra hosts (default: 127.0.0.1)
-  --port        Cassandra port (default: 9042)
-  --keyspace    Cassandra keyspace (default: pharos)
-  --json        Output results in JSON format (default: false)
-  --memory      Run with in-memory sample store for offline demo (default: false)
+  --hosts        Comma-separated Cassandra hosts (default: 127.0.0.1)
+  --port         Cassandra port (default: 9042)
+  --keyspace     Cassandra keyspace (default: pharos)
+  --central-url  Central Ingestion base URL, for dlq replay only (default: http://localhost:8091)
+  --json         Output results in JSON format (default: false)
+  --memory       Run with in-memory sample store for offline demo (default: false)
 
 Examples:
   pharos-cli query study STUDY-001 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z
@@ -42,6 +49,8 @@ Examples:
   pharos-cli query event SITE-US-01:1
   pharos-cli dlq list --site SITE-US-01
   pharos-cli dlq get SITE-US-01:99
+  pharos-cli dlq replay SITE-US-01:99
+  pharos-cli dlq replay --all --site SITE-US-01
 `)
 }
 
@@ -53,34 +62,87 @@ func main() {
 
 	// Parse global flags before subcommands
 	var (
-		hostsFlag    string
-		portFlag     int
-		keyspaceFlag string
-		jsonOutput   bool
-		useMemory    bool
+		hostsFlag      string
+		portFlag       int
+		keyspaceFlag   string
+		centralURLFlag string
+		jsonOutput     bool
+		useMemory      bool
 	)
 
-	// Custom flag set for global options
-	globalFlags := flag.NewFlagSet("pharos-cli", flag.ContinueOnError)
-	globalFlags.StringVar(&hostsFlag, "hosts", "127.0.0.1", "Cassandra hosts")
-	globalFlags.IntVar(&portFlag, "port", 9042, "Cassandra port")
-	globalFlags.StringVar(&keyspaceFlag, "keyspace", "pharos", "Cassandra keyspace")
-	globalFlags.BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	globalFlags.BoolVar(&useMemory, "memory", false, "Use in-memory sample store")
+	// Defaults, overridden below by whatever's actually present on the
+	// command line -- these were previously registered via a flag.FlagSet
+	// that nothing ever called Parse() on, so --hosts/--port/--keyspace
+	// silently never took effect regardless of position. Fixed here rather
+	// than perpetuated into the new --central-url flag: global flags can
+	// appear anywhere in argv (matching --json/--memory's existing,
+	// already-working behavior), not just before the command.
+	hostsFlag = "127.0.0.1"
+	portFlag = 9042
+	keyspaceFlag = "pharos"
+	centralURLFlag = "http://localhost:8091"
 
-	// Filter out global flags from args
+	valueFlag := func(arg, name string) (string, bool) {
+		if arg == "--"+name || arg == "-"+name {
+			return "", true // caller consumes the next argv token as the value
+		}
+		if strings.HasPrefix(arg, "--"+name+"=") {
+			return strings.TrimPrefix(arg, "--"+name+"="), true
+		}
+		return "", false
+	}
+
 	var remainingArgs []string
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
-		if strings.HasPrefix(arg, "-") {
-			if strings.HasPrefix(arg, "--json") || arg == "-json" {
-				jsonOutput = true
-				continue
+		if !strings.HasPrefix(arg, "-") {
+			remainingArgs = append(remainingArgs, arg)
+			continue
+		}
+		if arg == "--json" || arg == "-json" {
+			jsonOutput = true
+			continue
+		}
+		if arg == "--memory" || arg == "-memory" {
+			useMemory = true
+			continue
+		}
+		consumed := false
+		for _, f := range []struct {
+			name string
+			dest *string
+		}{
+			{"hosts", &hostsFlag},
+			{"keyspace", &keyspaceFlag},
+			{"central-url", &centralURLFlag},
+		} {
+			if val, matched := valueFlag(arg, f.name); matched {
+				consumed = true
+				if val != "" {
+					*f.dest = val
+				} else if i+1 < len(os.Args) {
+					i++
+					*f.dest = os.Args[i]
+				}
+				break
 			}
-			if strings.HasPrefix(arg, "--memory") || arg == "-memory" {
-				useMemory = true
-				continue
+		}
+		if consumed {
+			continue
+		}
+		if val, matched := valueFlag(arg, "port"); matched {
+			raw := val
+			if raw == "" && i+1 < len(os.Args) {
+				i++
+				raw = os.Args[i]
 			}
+			if n, err := strconv.Atoi(raw); err == nil {
+				portFlag = n
+			} else {
+				fmt.Fprintf(os.Stderr, "invalid --port value %q: %v\n", raw, err)
+				os.Exit(1)
+			}
+			continue
 		}
 		remainingArgs = append(remainingArgs, arg)
 	}
@@ -118,7 +180,7 @@ func main() {
 	case "query":
 		handleQuery(ctx, svc, remainingArgs[1:], jsonOutput)
 	case "dlq":
-		handleDLQ(ctx, svc, remainingArgs[1:], jsonOutput)
+		handleDLQ(ctx, svc, remainingArgs[1:], jsonOutput, centralURLFlag)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
@@ -234,7 +296,7 @@ func handleQuery(ctx context.Context, svc query.Service, args []string, jsonOutp
 	}
 }
 
-func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput bool) {
+func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput bool, centralURL string) {
 	if len(args) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -295,11 +357,122 @@ func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput
 
 		printDLQRecordDetail(rec)
 
+	case "replay":
+		replayFlags := flag.NewFlagSet("dlq replay", flag.ExitOnError)
+		all := replayFlags.Bool("all", false, "Replay every PUBLISHED rejected event for --site")
+		siteID := replayFlags.String("site", "", "Trial site ID (required with --all)")
+		limit := replayFlags.Int("limit", 500, "Max records to consider with --all")
+		replayFlags.Parse(args[1:])
+
+		if *all {
+			if *siteID == "" {
+				fmt.Fprintf(os.Stderr, "Usage: pharos-cli dlq replay --all --site <site_id>\n")
+				os.Exit(1)
+			}
+			records, err := svc.ListDLQEventsBySite(ctx, *siteID, *limit)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "DLQ query failed: %v\n", err)
+				os.Exit(1)
+			}
+			var replayed, skipped, failed int
+			for _, rec := range records {
+				if rec.Status != "PUBLISHED" {
+					skipped++
+					continue
+				}
+				result, statusCode, err := replayDLQRecord(centralURL, rec.IdempotencyKey)
+				if err != nil {
+					fmt.Printf("%s: ERROR (%v)\n", rec.IdempotencyKey, err)
+					failed++
+					continue
+				}
+				if statusCode == 200 {
+					fmt.Printf("%s: REPLAYED\n", rec.IdempotencyKey)
+					replayed++
+				} else {
+					fmt.Printf("%s: still rejected (HTTP %d): %s\n", rec.IdempotencyKey, statusCode, result.Error)
+					failed++
+				}
+			}
+			fmt.Printf("\nTotal: %d replayed, %d still rejected, %d skipped (not PUBLISHED)\n", replayed, failed, skipped)
+			return
+		}
+
+		if len(replayFlags.Args()) < 1 {
+			fmt.Fprintf(os.Stderr, "Usage: pharos-cli dlq replay <idempotency_key>\n")
+			os.Exit(1)
+		}
+		idKey := replayFlags.Args()[0]
+
+		result, statusCode, err := replayDLQRecord(centralURL, idKey)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Replay request failed: %v\n", err)
+			os.Exit(1)
+		}
+
+		if jsonOutput {
+			out, _ := json.MarshalIndent(result, "", "  ")
+			fmt.Println(string(out))
+			if statusCode != 200 {
+				os.Exit(1)
+			}
+			return
+		}
+
+		switch statusCode {
+		case 200:
+			fmt.Printf("REPLAYED: %s is now %s\n", idKey, result.Status)
+		case 404:
+			fmt.Fprintf(os.Stderr, "No DLQ record found for %s\n", idKey)
+			os.Exit(1)
+		case 409:
+			fmt.Fprintf(os.Stderr, "Cannot replay %s: %s\n", idKey, result.Error)
+			os.Exit(1)
+		default:
+			fmt.Fprintf(os.Stderr, "%s still rejected (HTTP %d): %s\n", idKey, statusCode, result.Error)
+			os.Exit(1)
+		}
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown dlq subcommand: %s\n", subcommand)
 		printUsage()
 		os.Exit(1)
 	}
+}
+
+// dlqReplayResponse mirrors the JSON shape internal/ingestion.Handler.HandleDLQReplay
+// returns -- kept as its own type here rather than importing internal/ingestion,
+// matching this codebase's existing pattern of per-package view types (query.DLQRecord
+// is already a separate type from dedup.DLQRecord for the same reason).
+type dlqReplayResponse struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	Status         string `json:"status"`
+	Error          string `json:"error"`
+}
+
+// replayDLQRecord POSTs to Central Ingestion's DLQ replay endpoint (§2.3,
+// Slice 10) and returns the parsed response body alongside the raw HTTP
+// status code, since the caller needs to distinguish 200/404/409/422/503
+// rather than just success-or-not.
+func replayDLQRecord(centralURL, idempotencyKey string) (*dlqReplayResponse, int, error) {
+	url := strings.TrimRight(centralURL, "/") + "/api/v1/dlq/" + idempotencyKey + "/replay"
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("could not reach Central Ingestion at %s: %w (hint: pass --central-url, default http://localhost:8091)", centralURL, err)
+	}
+	defer resp.Body.Close()
+
+	var result dlqReplayResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, resp.StatusCode, fmt.Errorf("failed to decode replay response: %w", err)
+	}
+	return &result, resp.StatusCode, nil
 }
 
 func printCanonicalRecordsTable(title string, records []*consumer.CanonicalRecord) {

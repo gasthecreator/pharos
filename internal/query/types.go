@@ -21,6 +21,7 @@ type DLQRecord struct {
 	KafkaTopic       string    `json:"kafka_topic,omitempty"`
 	KafkaPartition   int       `json:"kafka_partition,omitempty"`
 	KafkaOffset      int64     `json:"kafka_offset,omitempty"`
+	ReplayedAt       time.Time `json:"replayed_at,omitempty"` // Set only when Status == "REPLAYED" (§2.3, Slice 10)
 }
 
 // Service defines the query and DLQ inspection interface for Pharos.

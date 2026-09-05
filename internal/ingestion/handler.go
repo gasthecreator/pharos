@@ -1,6 +1,7 @@
 package ingestion
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -100,6 +101,7 @@ func (h *Handler) lockKey(key string) func() {
 // RegisterRoutes sets up HTTP routes on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/events", h.HandleEvents)
+	mux.HandleFunc("POST /api/v1/dlq/{key}/replay", h.HandleDLQReplay)
 	mux.HandleFunc("/healthz", h.HandleHealth)
 }
 
@@ -120,6 +122,230 @@ type statusRecordingWriter struct {
 func (w *statusRecordingWriter) WriteHeader(code int) {
 	w.statusCode = code
 	w.ResponseWriter.WriteHeader(code)
+}
+
+// eventOutcome classifies how processOneEvent resolved a single event, for the
+// caller (HandleEvents's batch loop, or the DLQ replay handler, §2.3 Slice 10)
+// to aggregate however it needs to.
+type eventOutcome string
+
+const (
+	outcomeAccepted eventOutcome = "accepted"
+	outcomeRejected eventOutcome = "rejected"
+	outcomeFailed   eventOutcome = "failed"
+)
+
+// eventProcessResult is what processOneEvent returns for a single event.
+type eventProcessResult struct {
+	Result  EventResult
+	Outcome eventOutcome
+}
+
+// processOneEvent runs one event through validation, dedup/outbox claim (or
+// DLQ claim on rejection), and Kafka publish — the exact same path whether the
+// event arrived in a normal batch (HandleEvents) or is being resubmitted via
+// DLQ replay (§2.3, Slice 10). Extracted from HandleEvents's per-event loop
+// with no behavior change: every branch below is identical to before the
+// extraction, just returning an outcome instead of mutating loop-local
+// counters and using `continue`.
+func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, siteID string) eventProcessResult {
+	var ev model.AdverseEvent
+	unmarshalErr := json.Unmarshal(raw, &ev)
+
+	// Extract idempotency key
+	keyStr := ""
+	if unmarshalErr == nil {
+		if key, keyErr := ev.GetIdempotencyKey(); keyErr == nil {
+			keyStr = key.String()
+		}
+	} else {
+		// Try partial extraction from identifier field for malformed payloads
+		var partial struct {
+			Identifier []model.Identifier `json:"identifier"`
+		}
+		if err := json.Unmarshal(raw, &partial); err == nil {
+			for _, ident := range partial.Identifier {
+				if ident.System == model.IdempotencyKeySystem {
+					keyStr = ident.Value
+					break
+				}
+			}
+		}
+	}
+
+	if unmarshalErr != nil {
+		metrics.ValidationFailuresTotal.Inc()
+		errMsg := "malformed event payload: " + unmarshalErr.Error()
+		result := EventResult{
+			IdempotencyKey: keyStr,
+			Status:         StatusRejected,
+			Error:          errMsg,
+		}
+		outcome := outcomeRejected
+
+		if h.outboxStore != nil && keyStr != "" {
+			unlock := h.lockKey(keyStr)
+			dlqRec := dedup.DLQRecord{
+				IdempotencyKey:   keyStr,
+				SiteID:           siteID,
+				Payload:          raw, // Raw wire JSON bytes preserved (§2.3)
+				RejectionReason:  "malformed JSON payload",
+				ValidationErrors: unmarshalErr.Error(),
+				RejectedAt:       time.Now().UTC(),
+			}
+			claim, err := h.outboxStore.InsertDLQClaim(ctx, dlqRec, h.leaseTimeout)
+			if err != nil {
+				unlock()
+				return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
+					IdempotencyKey: keyStr,
+					Status:         StatusFailed,
+					Error:          "dlq outbox storage error: " + err.Error(),
+				}}
+			}
+			if claim.Acquired {
+				if h.producer != nil {
+					publishStart := time.Now()
+					meta, pErr := h.producer.Publish(ctx, kafka.DLQTopic, []byte(siteID), raw, map[string]string{
+						"idempotency_key":  keyStr,
+						"site_id":          siteID,
+						"rejection_reason": "malformed JSON payload",
+					})
+					metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
+					if pErr != nil {
+						unlock()
+						return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
+							IdempotencyKey: keyStr,
+							Status:         StatusFailed,
+							Error:          "dlq kafka publish error: " + pErr.Error(),
+						}}
+					}
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, meta.Topic, meta.Partition, meta.Offset)
+				} else {
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, kafka.DLQTopic, 0, 0)
+				}
+				atomic.AddUint64(&h.dlqCount, 1)
+				metrics.DLQWritesTotal.Inc()
+			}
+			unlock()
+		}
+		return eventProcessResult{Result: result, Outcome: outcome}
+	}
+
+	valErr := ev.Validate()
+	if valErr != nil {
+		metrics.ValidationFailuresTotal.Inc()
+		result := EventResult{
+			IdempotencyKey: keyStr,
+			Status:         StatusRejected,
+			Error:          valErr.Error(),
+		}
+		outcome := outcomeRejected
+
+		if h.outboxStore != nil && keyStr != "" {
+			unlock := h.lockKey(keyStr)
+			dlqRec := dedup.DLQRecord{
+				IdempotencyKey:   keyStr,
+				SiteID:           siteID,
+				Payload:          raw, // Raw wire JSON bytes preserved (§2.3)
+				RejectionReason:  valErr.Error(),
+				ValidationErrors: valErr.Error(),
+				RejectedAt:       time.Now().UTC(),
+			}
+			claim, err := h.outboxStore.InsertDLQClaim(ctx, dlqRec, h.leaseTimeout)
+			if err != nil {
+				unlock()
+				return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
+					IdempotencyKey: keyStr,
+					Status:         StatusFailed,
+					Error:          "dlq outbox storage error: " + err.Error(),
+				}}
+			}
+			if claim.Acquired {
+				if h.producer != nil {
+					publishStart := time.Now()
+					meta, pErr := h.producer.Publish(ctx, kafka.DLQTopic, []byte(siteID), raw, map[string]string{
+						"idempotency_key":  keyStr,
+						"site_id":          siteID,
+						"rejection_reason": valErr.Error(),
+					})
+					metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
+					if pErr != nil {
+						unlock()
+						return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
+							IdempotencyKey: keyStr,
+							Status:         StatusFailed,
+							Error:          "dlq kafka publish error: " + pErr.Error(),
+						}}
+					}
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, meta.Topic, meta.Partition, meta.Offset)
+				} else {
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, kafka.DLQTopic, 0, 0)
+				}
+				atomic.AddUint64(&h.dlqCount, 1)
+				metrics.DLQWritesTotal.Inc()
+			}
+			unlock()
+		}
+		return eventProcessResult{Result: result, Outcome: outcome}
+	}
+
+	// Accept Path (§2.2)
+	if h.outboxStore != nil && keyStr != "" {
+		unlock := h.lockKey(keyStr)
+		outboxRec := dedup.OutboxRecord{
+			IdempotencyKey: keyStr,
+			SiteID:         siteID,
+			Payload:        raw, // Raw wire JSON bytes preserved (§2.2)
+		}
+		if key, parseErr := model.ParseIdempotencyKey(keyStr); parseErr == nil {
+			outboxRec.LocalSeq = key.LocalSeq
+		}
+
+		claim, err := h.outboxStore.InsertClaim(ctx, outboxRec, h.leaseTimeout)
+		if err != nil {
+			unlock()
+			return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
+				IdempotencyKey: keyStr,
+				Status:         StatusFailed,
+				Error:          "outbox storage error: " + err.Error(),
+			}}
+		}
+
+		if claim.Acquired {
+			metrics.DedupOutcomesTotal.WithLabelValues("new_claim").Inc()
+			if h.producer != nil {
+				publishStart := time.Now()
+				meta, pErr := h.producer.Publish(ctx, kafka.MainTopic, []byte(siteID), raw, map[string]string{
+					"idempotency_key": keyStr,
+					"site_id":         siteID,
+				})
+				metrics.OutboxPublishDuration.WithLabelValues(kafka.MainTopic).Observe(time.Since(publishStart).Seconds())
+				if pErr != nil {
+					unlock()
+					return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
+						IdempotencyKey: keyStr,
+						Status:         StatusFailed,
+						Error:          "kafka publish error: " + pErr.Error(),
+					}}
+				}
+				_ = h.outboxStore.MarkPublished(ctx, keyStr, meta.Topic, meta.Partition, meta.Offset)
+			} else {
+				_ = h.outboxStore.MarkPublished(ctx, keyStr, kafka.MainTopic, 0, 0)
+			}
+		} else {
+			// Duplicate or concurrent in-flight
+			if claim.Status == dedup.StatusPublished {
+				atomic.AddUint64(&h.dedupHits, 1)
+				metrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
+			}
+		}
+		unlock()
+	}
+
+	return eventProcessResult{Outcome: outcomeAccepted, Result: EventResult{
+		IdempotencyKey: keyStr,
+		Status:         StatusAccepted,
+	}}
 }
 
 // HandleEvents processes batch ingestion requests with per-site rate limiting and FHIR validation.
@@ -235,218 +461,15 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	failedCount := 0
 
 	for i, raw := range rawEvents {
-		var ev model.AdverseEvent
-		unmarshalErr := json.Unmarshal(raw, &ev)
-
-		// Extract idempotency key
-		keyStr := ""
-		if unmarshalErr == nil {
-			if key, keyErr := ev.GetIdempotencyKey(); keyErr == nil {
-				keyStr = key.String()
-			}
-		} else {
-			// Try partial extraction from identifier field for malformed payloads
-			var partial struct {
-				Identifier []model.Identifier `json:"identifier"`
-			}
-			if err := json.Unmarshal(raw, &partial); err == nil {
-				for _, ident := range partial.Identifier {
-					if ident.System == model.IdempotencyKeySystem {
-						keyStr = ident.Value
-						break
-					}
-				}
-			}
-		}
-
-		if unmarshalErr != nil {
-			rejectedCount++
-			metrics.ValidationFailuresTotal.Inc()
-			errMsg := "malformed event payload: " + unmarshalErr.Error()
-			results[i] = EventResult{
-				IdempotencyKey: keyStr,
-				Status:         StatusRejected,
-				Error:          errMsg,
-			}
-
-			if h.outboxStore != nil && keyStr != "" {
-				unlock := h.lockKey(keyStr)
-				dlqRec := dedup.DLQRecord{
-					IdempotencyKey:   keyStr,
-					SiteID:           siteID,
-					Payload:          raw, // Raw wire JSON bytes preserved (§2.3)
-					RejectionReason:  "malformed JSON payload",
-					ValidationErrors: unmarshalErr.Error(),
-					RejectedAt:       time.Now().UTC(),
-				}
-				claim, err := h.outboxStore.InsertDLQClaim(r.Context(), dlqRec, h.leaseTimeout)
-				if err != nil {
-					unlock()
-					rejectedCount-- // Reclassified from rejected to failed
-					failedCount++
-					results[i] = EventResult{
-						IdempotencyKey: keyStr,
-						Status:         StatusFailed,
-						Error:          "dlq outbox storage error: " + err.Error(),
-					}
-					continue
-				}
-				if claim.Acquired {
-					if h.producer != nil {
-						publishStart := time.Now()
-						meta, pErr := h.producer.Publish(r.Context(), kafka.DLQTopic, []byte(siteID), raw, map[string]string{
-							"idempotency_key":  keyStr,
-							"site_id":          siteID,
-							"rejection_reason": "malformed JSON payload",
-						})
-						metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
-						if pErr != nil {
-							unlock()
-							rejectedCount-- // Reclassified from rejected to failed
-							failedCount++
-							results[i] = EventResult{
-								IdempotencyKey: keyStr,
-								Status:         StatusFailed,
-								Error:          "dlq kafka publish error: " + pErr.Error(),
-							}
-							continue
-						}
-						_ = h.outboxStore.MarkDLQPublished(r.Context(), keyStr, meta.Topic, meta.Partition, meta.Offset)
-					} else {
-						_ = h.outboxStore.MarkDLQPublished(r.Context(), keyStr, kafka.DLQTopic, 0, 0)
-					}
-					atomic.AddUint64(&h.dlqCount, 1)
-					metrics.DLQWritesTotal.Inc()
-				}
-				unlock()
-			}
-			continue
-		}
-
-		valErr := ev.Validate()
-		if valErr != nil {
-			rejectedCount++
-			metrics.ValidationFailuresTotal.Inc()
-			results[i] = EventResult{
-				IdempotencyKey: keyStr,
-				Status:         StatusRejected,
-				Error:          valErr.Error(),
-			}
-
-			if h.outboxStore != nil && keyStr != "" {
-				unlock := h.lockKey(keyStr)
-				dlqRec := dedup.DLQRecord{
-					IdempotencyKey:   keyStr,
-					SiteID:           siteID,
-					Payload:          raw, // Raw wire JSON bytes preserved (§2.3)
-					RejectionReason:  valErr.Error(),
-					ValidationErrors: valErr.Error(),
-					RejectedAt:       time.Now().UTC(),
-				}
-				claim, err := h.outboxStore.InsertDLQClaim(r.Context(), dlqRec, h.leaseTimeout)
-				if err != nil {
-					unlock()
-					rejectedCount-- // Reclassified from rejected to failed
-					failedCount++
-					results[i] = EventResult{
-						IdempotencyKey: keyStr,
-						Status:         StatusFailed,
-						Error:          "dlq outbox storage error: " + err.Error(),
-					}
-					continue
-				}
-				if claim.Acquired {
-					if h.producer != nil {
-						publishStart := time.Now()
-						meta, pErr := h.producer.Publish(r.Context(), kafka.DLQTopic, []byte(siteID), raw, map[string]string{
-							"idempotency_key":  keyStr,
-							"site_id":          siteID,
-							"rejection_reason": valErr.Error(),
-						})
-						metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
-						if pErr != nil {
-							unlock()
-							rejectedCount-- // Reclassified from rejected to failed
-							failedCount++
-							results[i] = EventResult{
-								IdempotencyKey: keyStr,
-								Status:         StatusFailed,
-								Error:          "dlq kafka publish error: " + pErr.Error(),
-							}
-							continue
-						}
-						_ = h.outboxStore.MarkDLQPublished(r.Context(), keyStr, meta.Topic, meta.Partition, meta.Offset)
-					} else {
-						_ = h.outboxStore.MarkDLQPublished(r.Context(), keyStr, kafka.DLQTopic, 0, 0)
-					}
-					atomic.AddUint64(&h.dlqCount, 1)
-					metrics.DLQWritesTotal.Inc()
-				}
-				unlock()
-			}
-		} else {
-			// Accept Path (§2.2)
-			if h.outboxStore != nil && keyStr != "" {
-				unlock := h.lockKey(keyStr)
-				outboxRec := dedup.OutboxRecord{
-					IdempotencyKey: keyStr,
-					SiteID:         siteID,
-					Payload:        raw, // Raw wire JSON bytes preserved (§2.2)
-				}
-				if key, parseErr := model.ParseIdempotencyKey(keyStr); parseErr == nil {
-					outboxRec.LocalSeq = key.LocalSeq
-				}
-
-				claim, err := h.outboxStore.InsertClaim(r.Context(), outboxRec, h.leaseTimeout)
-				if err != nil {
-					unlock()
-					failedCount++
-					results[i] = EventResult{
-						IdempotencyKey: keyStr,
-						Status:         StatusFailed,
-						Error:          "outbox storage error: " + err.Error(),
-					}
-					continue
-				}
-
-				if claim.Acquired {
-					metrics.DedupOutcomesTotal.WithLabelValues("new_claim").Inc()
-					if h.producer != nil {
-						publishStart := time.Now()
-						meta, pErr := h.producer.Publish(r.Context(), kafka.MainTopic, []byte(siteID), raw, map[string]string{
-							"idempotency_key": keyStr,
-							"site_id":         siteID,
-						})
-						metrics.OutboxPublishDuration.WithLabelValues(kafka.MainTopic).Observe(time.Since(publishStart).Seconds())
-						if pErr != nil {
-							unlock()
-							failedCount++
-							results[i] = EventResult{
-								IdempotencyKey: keyStr,
-								Status:         StatusFailed,
-								Error:          "kafka publish error: " + pErr.Error(),
-							}
-							continue
-						}
-						_ = h.outboxStore.MarkPublished(r.Context(), keyStr, meta.Topic, meta.Partition, meta.Offset)
-					} else {
-						_ = h.outboxStore.MarkPublished(r.Context(), keyStr, kafka.MainTopic, 0, 0)
-					}
-				} else {
-					// Duplicate or concurrent in-flight
-					if claim.Status == dedup.StatusPublished {
-						atomic.AddUint64(&h.dedupHits, 1)
-						metrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
-					}
-				}
-				unlock()
-			}
-
+		outcome := h.processOneEvent(r.Context(), raw, siteID)
+		results[i] = outcome.Result
+		switch outcome.Outcome {
+		case outcomeAccepted:
 			acceptedCount++
-			results[i] = EventResult{
-				IdempotencyKey: keyStr,
-				Status:         StatusAccepted,
-			}
+		case outcomeRejected:
+			rejectedCount++
+		case outcomeFailed:
+			failedCount++
 		}
 	}
 
@@ -488,6 +511,75 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// HandleDLQReplay resubmits a DLQ'd record's stored raw payload through the
+// exact same validation/claim/publish path processOneEvent already uses for a
+// fresh submission (§2.3, Slice 10) — not a special trust-it-now backdoor. On
+// success, marks the original DLQ record REPLAYED (never deleted — the
+// original rejection stays part of the audit trail). If it still fails
+// validation, the DLQ record is left untouched and stays rejected with
+// whatever reason this attempt produced: processOneEvent's InsertDLQClaim
+// call no-ops against an already-PUBLISHED record (see
+// CassandraOutboxStore.InsertDLQClaim's IF NOT EXISTS + status check), so a
+// failed replay attempt can't corrupt or duplicate the original entry.
+func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("key")
+	if key == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "missing idempotency key in path"})
+		return
+	}
+	if h.outboxStore == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "outbox store not configured"})
+		return
+	}
+
+	rec, err := h.outboxStore.GetDLQRecord(r.Context(), key)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "dlq record not found: " + err.Error()})
+		return
+	}
+	if rec.Status != dedup.StatusPublished {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": fmt.Sprintf("cannot replay %s: record status is %s, expected PUBLISHED", key, rec.Status),
+		})
+		return
+	}
+
+	outcome := h.processOneEvent(r.Context(), rec.Payload, rec.SiteID)
+
+	w.Header().Set("Content-Type", "application/json")
+	switch outcome.Outcome {
+	case outcomeAccepted:
+		if markErr := h.outboxStore.MarkDLQReplayed(r.Context(), key); markErr != nil {
+			// The event WAS genuinely accepted and published to Kafka -- this
+			// only failed to flag the *original* DLQ record. A bookkeeping
+			// gap, not a data-loss one, but surfaced clearly rather than
+			// silently swallowed.
+			w.WriteHeader(http.StatusMultiStatus)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"result":  outcome.Result,
+				"warning": "replay succeeded but failed to mark the original DLQ record replayed: " + markErr.Error(),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(outcome.Result)
+	case outcomeFailed:
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(outcome.Result)
+	default: // outcomeRejected: still invalid, original DLQ record untouched
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_ = json.NewEncoder(w).Encode(outcome.Result)
+	}
 }
 
 // Stats returns the ingestion handler counters.

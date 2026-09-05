@@ -2,6 +2,7 @@ package dedup
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -184,6 +185,29 @@ func (s *MemoryOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey
 	rec.KafkaOffset = offset
 
 	delete(s.pendingDLQ, idempotencyKey)
+	return nil
+}
+
+// MarkDLQReplayed transitions a DLQ record from PUBLISHED to REPLAYED (§2.3,
+// Slice 10), mirroring CassandraOutboxStore.MarkDLQReplayed's precondition.
+func (s *MemoryOutboxStore) MarkDLQReplayed(ctx context.Context, idempotencyKey string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return ErrStoreClosed
+	}
+
+	rec, found := s.dlqEvents[idempotencyKey]
+	if !found {
+		return ErrRecordNotFound
+	}
+	if rec.Status != StatusPublished {
+		return fmt.Errorf("cannot mark %s replayed: not in PUBLISHED status", idempotencyKey)
+	}
+
+	rec.Status = StatusReplayed
+	rec.ReplayedAt = time.Now().UTC()
 	return nil
 }
 

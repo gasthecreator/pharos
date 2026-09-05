@@ -132,12 +132,12 @@ func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey strin
 	}
 
 	query := `SELECT idempotency_key, site_id, payload, rejection_reason, validation_errors,
-	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset
+	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset, replayed_at
 	          FROM pharos.dead_letter_events
 	          WHERE idempotency_key = ? LIMIT 1`
 
 	var rec DLQRecord
-	var claimedAt, publishedAt *time.Time
+	var claimedAt, publishedAt, replayedAt *time.Time
 	var kafkaPartition *int
 	var kafkaOffset *int64
 
@@ -155,6 +155,7 @@ func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey strin
 		&rec.KafkaTopic,
 		&kafkaPartition,
 		&kafkaOffset,
+		&replayedAt,
 	) {
 		if err := iter.Close(); err != nil {
 			return nil, fmt.Errorf("failed to query dead_letter_events: %w", err)
@@ -177,6 +178,9 @@ func (s *CassandraService) GetDLQEvent(ctx context.Context, idempotencyKey strin
 	if kafkaOffset != nil {
 		rec.KafkaOffset = *kafkaOffset
 	}
+	if replayedAt != nil {
+		rec.ReplayedAt = *replayedAt
+	}
 
 	return &rec, nil
 }
@@ -195,7 +199,7 @@ func (s *CassandraService) ListDLQEventsBySite(ctx context.Context, siteID strin
 	}
 
 	query := `SELECT idempotency_key, site_id, payload, rejection_reason, validation_errors,
-	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset
+	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset, replayed_at
 	          FROM pharos.dead_letter_events_by_site
 	          WHERE site_id = ? LIMIT ?`
 
@@ -216,7 +220,7 @@ func (s *CassandraService) ListAllDLQEvents(ctx context.Context, limit int) ([]*
 	}
 
 	query := `SELECT idempotency_key, site_id, payload, rejection_reason, validation_errors,
-	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset
+	                 rejected_at, status, claimed_at, published_at, kafka_topic, kafka_partition, kafka_offset, replayed_at
 	          FROM pharos.dead_letter_events
 	          LIMIT ?`
 
@@ -229,11 +233,11 @@ func scanDLQRecords(iter *gocql.Iter) ([]*DLQRecord, error) {
 
 	var idKey, siteID, payload, reason, valErrors, status, topic string
 	var rejAt time.Time
-	var claimedAt, publishedAt *time.Time
+	var claimedAt, publishedAt, replayedAt *time.Time
 	var part *int
 	var off *int64
 
-	for iter.Scan(&idKey, &siteID, &payload, &reason, &valErrors, &rejAt, &status, &claimedAt, &publishedAt, &topic, &part, &off) {
+	for iter.Scan(&idKey, &siteID, &payload, &reason, &valErrors, &rejAt, &status, &claimedAt, &publishedAt, &topic, &part, &off, &replayedAt) {
 		r := &DLQRecord{
 			IdempotencyKey:   idKey,
 			SiteID:           siteID,
@@ -255,6 +259,9 @@ func scanDLQRecords(iter *gocql.Iter) ([]*DLQRecord, error) {
 		}
 		if off != nil {
 			r.KafkaOffset = *off
+		}
+		if replayedAt != nil {
+			r.ReplayedAt = *replayedAt
 		}
 		records = append(records, r)
 	}

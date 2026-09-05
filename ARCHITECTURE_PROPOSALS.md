@@ -15,6 +15,110 @@ Only after an entry is marked `Resolved: Approved` should it be implemented.
 
 ---
 
+#### [2026-09-04] Slice 10: DLQ Replay & Reprocessing
+
+**Status:** Resolved: Approved (Claude Code, 2026-09-04).
+
+**What in PLAN.md this touches:** §2.3 (DLQ), Phase 2 Slice 10.
+
+**What I'm proposing:** a new Central Ingestion endpoint,
+`POST /api/v1/dlq/{key}/replay`, that fetches a DLQ record's stored raw
+payload and resubmits it through `processOneEvent` — the exact same
+validate → claim → publish function `HandleEvents` already uses for a
+fresh submission, extracted into its own method specifically so both
+callers share one implementation rather than two copies of
+fault-injection-tested logic drifting apart over time. `pharos-cli dlq
+replay <key>` (and `--all --site X`) is a thin HTTP client against this
+endpoint — it does not read or write Cassandra directly for the mutation
+itself, only for `--all`'s listing step (via the already-read-only
+`query.Service`).
+
+**Why server-side, not CLI-driven Cassandra writes:** every outbox/DLQ
+mutation in this project has been Central Ingestion's job since Slice 2 —
+`pharos-cli` has only ever been a read path. Having the CLI flip a DLQ
+record's status directly would be the first exception to that boundary.
+Routing replay through an HTTP endpoint keeps it intact: Central Ingestion
+still owns every write, the CLI is still purely a client of it.
+
+**On success:** `MarkDLQReplayed` (`StatusReplayed`, DLQ-only — never a
+valid `event_outbox` status) transitions the *original* record from
+PUBLISHED to REPLAYED via the same CAS-guarded UPDATE pattern
+`MarkDLQPublished` already established, so a still-in-flight or
+already-replayed record can't be replayed a second time. The row is never
+deleted or overwritten beyond status/`replayed_at` — `rejection_reason`
+and the original stored payload* stay exactly as they were, keeping the
+rejection part of the audit trail rather than erasing it.
+
+*Caveat found during live verification, not by design: replay always
+resubmits *whatever is currently stored* in `payload`. If a payload is
+corrected out-of-band before replay (the only way replay can ever
+actually succeed, short of a validation rule itself changing), the stored
+`payload` column reflects the corrected version afterward, while
+`rejection_reason` still describes the *original* failure — this is
+correct and intentional (the reason a payload was rejected is a fact
+about that submission, not something replay should rewrite), but worth
+being explicit about for anyone reading a replayed record later.
+
+**On failure:** the DLQ record is left completely untouched.
+`processOneEvent`'s `InsertDLQClaim` call against an already-existing
+PUBLISHED key is a no-op by construction (`IF NOT EXISTS` fails, and the
+existing-status branch returns `Acquired: false` for anything that isn't
+a fresh, unclaimed key) — so a failed replay attempt structurally cannot
+corrupt or duplicate the original entry, without needing special-case
+logic for "this is a replay, don't touch the DLQ." Verified live, not
+just in unit tests: same-payload replay of a genuinely-still-invalid
+event returned the identical rejection reason and left the record
+untouched.
+
+**A real migration gap found and fixed while implementing this:**
+`CassandraOutboxStore.EnsureSchema()` uses `CREATE TABLE IF NOT EXISTS`,
+which is a no-op against the already-existing `dead_letter_events` /
+`dead_letter_events_by_site` tables — meaning the new `replayed_at`
+column would never have been added to an already-bootstrapped keyspace
+automatically, breaking this project's "bootstrapped automatically, no
+manual migration step" guarantee. Fixed with the same idempotent
+column-check pattern already used for SQLite in Slice 8
+(`internal/edge/sqlite_store.go`'s `hasColumn`), now mirrored on the
+Cassandra side via `system_schema.columns` — checked and added on every
+`EnsureSchema()` call, safe to run on every startup.
+
+**A second, unrelated bug found while wiring up `pharos-cli`'s new
+`--central-url` flag:** `globalFlags.Parse()` was never actually called
+anywhere in `cmd/pharos-cli/main.go` — `--hosts`/`--port`/`--keyspace`
+were registered on a `flag.FlagSet` but silently never took effect
+regardless of position, since a separate manual loop (handling only
+`--json`/`--memory`) was the actual parsing mechanism in use. Fixed by
+generalizing that manual loop to handle all global flags in any
+position — preserving the existing (already-working) behavior that
+`--json`/`--memory` can appear anywhere in argv, rather than narrowing to
+stdlib `flag.Parse()`'s stricter "flags must precede positional args"
+rule, which would have been a behavior regression.
+
+**Alternatives considered:** having `pharos-cli` itself fetch the raw
+payload via `query.Service` and POST it to `/api/v1/events` directly (the
+existing batch endpoint), rather than adding a dedicated replay endpoint.
+Rejected: that path has no way to also mark the *original* DLQ record
+REPLAYED without a second, separate write the CLI would have to perform
+directly against Cassandra — reintroducing exactly the write-boundary
+violation the chosen design avoids.
+
+**Impact if approved:**
+- `internal/dedup`: `StatusReplayed`, `DLQRecord.ReplayedAt`,
+  `OutboxStore.MarkDLQReplayed` (Cassandra + in-memory), `EnsureSchema`
+  migration fix, `GetDLQRecord`/DLQ SELECT queries extended.
+- `internal/query`: `DLQRecord.ReplayedAt` plumbed through all three DLQ
+  query paths.
+- `internal/ingestion`: `HandleEvents`'s per-event loop extracted into
+  `processOneEvent` (verified behavior-identical against the full existing
+  test suite before anything new was added on top), new
+  `POST /api/v1/dlq/{key}/replay` route and handler.
+- `cmd/pharos-cli`: new `dlq replay` subcommand, new `--central-url` flag,
+  and the `--hosts`/`--port`/`--keyspace` parsing fix above.
+- New migration `migrations/004_dlq_replay.cql` (documentation of the
+  schema state; the actual bootstrap is `EnsureSchema`'s migration check).
+
+---
+
 #### [2026-09-04] Slice 9: Wire-Format Schema Versioning
 
 **Status:** Resolved: Approved (Claude Code, 2026-09-04).

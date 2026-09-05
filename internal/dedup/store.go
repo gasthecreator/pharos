@@ -21,6 +21,14 @@ type OutboxStatus string
 const (
 	StatusPublishing OutboxStatus = "PUBLISHING"
 	StatusPublished  OutboxStatus = "PUBLISHED"
+	// StatusReplayed is DLQ-record-only (§2.3, Slice 10): set on a
+	// dead_letter_events row, never on event_outbox, once that rejected
+	// event has been successfully resubmitted and accepted. The original
+	// row is never deleted or overwritten beyond this status/timestamp —
+	// the rejection stays part of the audit trail, matching the "never
+	// silently mutate a reported result" principle §2.4 established for
+	// late-arriving data.
+	StatusReplayed OutboxStatus = "REPLAYED"
 )
 
 // OutboxRecord represents an accepted event durably recorded in Cassandra pharos.event_outbox.
@@ -52,6 +60,7 @@ type DLQRecord struct {
 	KafkaTopic       string       `json:"kafka_topic,omitempty"`
 	KafkaPartition   int          `json:"kafka_partition,omitempty"`
 	KafkaOffset      int64        `json:"kafka_offset,omitempty"`
+	ReplayedAt       time.Time    `json:"replayed_at,omitempty"` // Set only when Status == StatusReplayed (§2.3, Slice 10)
 }
 
 // ClaimResult describes the outcome of an atomic outbox claim attempt.
@@ -79,6 +88,13 @@ type OutboxStore interface {
 
 	// MarkDLQPublished finalizes the DLQ record to status='PUBLISHED' with Kafka broker metadata.
 	MarkDLQPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error
+
+	// MarkDLQReplayed transitions a DLQ record from PUBLISHED to REPLAYED
+	// (§2.3, Slice 10) once its stored payload has been successfully
+	// resubmitted and accepted. Requires the record to already be PUBLISHED
+	// — a still-in-flight or already-replayed record cannot be replayed
+	// again. The row is never deleted; only its status/timestamp change.
+	MarkDLQReplayed(ctx context.Context, idempotencyKey string) error
 
 	// FetchStaleClaims returns records with expired leases for background sweeper reclamation.
 	FetchStaleClaims(ctx context.Context, leaseTimeout time.Duration, limit int) ([]OutboxRecord, []DLQRecord, error)
