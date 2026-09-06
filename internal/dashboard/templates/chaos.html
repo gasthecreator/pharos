@@ -1,0 +1,124 @@
+{{define "title"}}Pharos — Chaos Control Panel{{end}}
+{{define "content"}}
+<h1>Chaos Control Panel</h1>
+<p class="subtitle">Real actions against the real running cluster (§2.4, Slice 23), next to a live Correctness Ledger
+proving the pipeline stays correct while it's being hurt.</p>
+
+{{if not .Enabled}}
+<div class="result-err">
+  Chaos actions are <strong>disabled</strong>. Restart <code>pharos-dashboard</code> with <code>--enable-chaos</code>
+  to use them. This is intentional (§2.4, Slice 23's own safety guard): these actions mutate real infrastructure and
+  must never be reachable just because the dashboard happens to be running.
+</div>
+{{end}}
+
+{{if .Result}}
+  {{if .ResultError}}<div class="result-err">{{.Result}}</div>{{else}}<div class="result-ok">{{.Result}}</div>{{end}}
+{{end}}
+
+<div class="panel">
+  <h2 style="margin-top:0">Correctness Ledger</h2>
+  {{if .LedgerFailed}}
+    <p class="empty">Neither Central Ingestion nor pharos-consumer's /metrics endpoints were reachable.</p>
+  {{else if .Ledger}}
+    <table>
+      <tr><th>Ingestion requests total</th><td>{{printf "%.0f" .Ledger.RequestsTotal}}</td></tr>
+      <tr><th>New claims (first-time accepted)</th><td>{{printf "%.0f" .Ledger.NewClaims}}</td></tr>
+      <tr><th>Duplicate hits (correctly suppressed)</th><td>{{printf "%.0f" .Ledger.DuplicateHits}}</td></tr>
+      <tr><th>DLQ writes</th><td>{{printf "%.0f" .Ledger.DLQWrites}}</td></tr>
+      <tr><th>Consumer events consumed</th><td>{{printf "%.0f" .Ledger.ConsumedTotal}}</td></tr>
+      <tr><th>Late arrivals (audited)</th><td>{{printf "%.0f" .Ledger.LateArrivals}}</td></tr>
+      <tr><th>Consumer errors</th><td>{{printf "%.0f" .Ledger.ConsumerErrors}}</td></tr>
+      <tr><th>Kafka consumer lag</th><td>{{printf "%.0f" .Ledger.KafkaLag}}</td></tr>
+      <tr><th>Current watermark</th><td>
+        {{if .Ledger.HasWatermark}}{{.Ledger.WatermarkTime.Format "2006-01-02T15:04:05Z07:00"}} ({{.Ledger.WatermarkAge}} ago){{else}}not yet established{{end}}
+      </td></tr>
+      <tr><th>Ingestion /metrics reachable?</th><td>{{if .Ledger.IngestionReachable}}yes{{else}}no ({{.Ledger.IngestionError}}){{end}}</td></tr>
+      <tr><th>Consumer /metrics reachable?</th><td>{{if .Ledger.ConsumerReachable}}yes{{else}}no ({{.Ledger.ConsumerError}}){{end}}</td></tr>
+    </table>
+  {{end}}
+  <p class="muted">Read live from Central Ingestion's and pharos-consumer's real <code>/metrics</code> endpoints
+  (Slice 6) — reload this page to refresh.</p>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <h2 style="margin-top:0">Kill / Restart a Cassandra Node</h2>
+    <form method="POST" action="/chaos/cassandra">
+      <label>Container</label>
+      <select name="container">
+        {{range .CassandraContainers}}<option value="{{.}}">{{.}}</option>{{end}}
+      </select>
+      <label>Action</label>
+      <select name="action">
+        <option value="stop">stop</option>
+        <option value="restart">restart</option>
+        <option value="start">start</option>
+      </select>
+      <button type="submit" class="danger" {{if not .Enabled}}disabled{{end}}>Run</button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0">Partition dc-us / dc-eu</h2>
+    <p class="muted">Real <code>tc netem</code> 100% packet loss between every dc-us and dc-eu Cassandra container
+    (the same mechanism <code>internal/faultinjection</code>'s own tests use). Auto-heals after 60s if not healed
+    manually first.</p>
+    <form method="POST" action="/chaos/region/partition" class="inline-form">
+      <button type="submit" class="danger" {{if not .Enabled}}disabled{{end}}>Partition</button>
+    </form>
+    <form method="POST" action="/chaos/region/heal" class="inline-form">
+      <button type="submit" {{if not .Enabled}}disabled{{end}}>Heal now</button>
+    </form>
+  </div>
+</div>
+
+<div class="row">
+  <div class="panel">
+    <h2 style="margin-top:0">Partition a Site's Edge</h2>
+    <p class="muted">Requires that site's <code>pharos-edge</code> to be running with its own <code>--enable-chaos</code>
+    flag. Its store-and-forward queue (§2.1) keeps buffering locally while partitioned.</p>
+    <form method="POST" action="/chaos/edge/partition">
+      <label>Edge admin base URL</label>
+      <input type="text" name="edge_admin_url" value="{{.EdgeAdminURL}}" placeholder="http://localhost:8080" required>
+      <button type="submit" class="danger" {{if not .Enabled}}disabled{{end}}>Partition Site</button>
+    </form>
+    <form method="POST" action="/chaos/edge/heal">
+      <label>Edge admin base URL</label>
+      <input type="text" name="edge_admin_url" value="{{.EdgeAdminURL}}" placeholder="http://localhost:8080" required>
+      <button type="submit" {{if not .Enabled}}disabled{{end}}>Heal Site</button>
+    </form>
+  </div>
+
+  <div class="panel">
+    <h2 style="margin-top:0">Inject a Duplicate Delivery</h2>
+    <p class="muted">Submits the identical event twice in a row through the real pipeline — the correct outcome is
+    both calls returning HTTP 200 with exactly one Kafka publish, not a rejection or a double-write.</p>
+    <form method="POST" action="/chaos/duplicate">
+      <label>Site ID</label>
+      <input type="text" name="site_id" value="{{.SiteID}}" required>
+      <label>API Key</label>
+      <input type="password" name="api_key" required>
+      <label>Event JSON</label>
+      <textarea name="payload" required>{{.Payload}}</textarea>
+      <button type="submit" class="danger" {{if not .Enabled}}disabled{{end}}>Submit Twice</button>
+    </form>
+  </div>
+</div>
+
+<div class="panel">
+  <h2 style="margin-top:0">Skew a Site's Clock</h2>
+  <p class="muted">Submits one real event whose clinical event time is offset from now by the given amount —
+  a negative skew (e.g. <code>-2h30m</code>) simulates a site whose clock runs behind, exercising the real
+  late-arrival/watermark path live.</p>
+  <form method="POST" action="/chaos/skew">
+    <label>Site ID</label>
+    <input type="text" name="site_id" value="{{.SiteID}}" required>
+    <label>API Key</label>
+    <input type="password" name="api_key" required>
+    <label>Skew (Go duration, e.g. -2h30m or 90m)</label>
+    <input type="text" name="skew" value="{{.SkewInput}}" placeholder="-2h30m" required>
+    <button type="submit" class="danger" {{if not .Enabled}}disabled{{end}}>Submit Skewed Event</button>
+  </form>
+</div>
+{{end}}

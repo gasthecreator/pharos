@@ -121,7 +121,24 @@ jobs:
       # -race detector's own overhead plus N packages' worth of simultaneous
       # connections/LWT races is real added load this already-tight topology
       # doesn't have headroom for, confirmed by a clean pass once serialized.
-      - name: go test -race
+      #
+      # internal/chaos is excluded here and run as its own separate step
+      # below, deliberately: go test ./... executes packages in alphabetical
+      # order, which put internal/chaos's disruptive tests (stop/restart a
+      # real Cassandra node, apply and heal a real dc-us/dc-eu network
+      # partition, §2.4 Slice 23) immediately before internal/consumer's --
+      # and even with real readiness checks added to internal/chaos
+      # (gossip/schema agreement, a genuine Kafka metadata probe) rather
+      # than a fixed sleep, internal/consumer's own real end-to-end test
+      # still intermittently hit spurious Cassandra/Kafka timeouts against
+      # this project's tightly resource-constrained (~6.3GB) dev topology
+      # immediately afterward. Rather than continuing to chase an ever more
+      # precise readiness signal for a fundamentally shared-host resource
+      # contention problem, running internal/chaos's disruptive tests in
+      # their own step -- with nothing sensitive scheduled immediately after
+      # them -- removes the ordering hazard entirely instead of merely
+      # narrowing its probability.
+      - name: go test -race (excluding internal/chaos)
         # RAPID_CHECKS raises pgregory.net/rapid's default 100 generated
         # sequences per property test (§2.4, Slice 22: property-based &
         # deterministic simulation testing) to 5000 -- these tests are pure
@@ -129,7 +146,11 @@ jobs:
         # exploration is genuinely free relative to this workflow's actual
         # bottleneck (the real-infra integration tests), not a tradeoff
         # against this already-tight topology's headroom.
-        run: RAPID_CHECKS=5000 go test -race -count=1 -p 1 ./...
+        run: |
+          RAPID_CHECKS=5000 go test -race -count=1 -p 1 $(go list ./... | grep -v '/internal/chaos$')
+
+      - name: go test -race (internal/chaos, run last -- see above)
+        run: go test -race -count=1 ./internal/chaos/...
 
       - name: Show container logs on failure
         if: failure()

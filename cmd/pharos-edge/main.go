@@ -27,6 +27,7 @@ func main() {
 	backupInterval := flag.Duration("backup-interval", 5*time.Minute, "Interval between periodic SQLite backups")
 	apiKey := flag.String("api-key", "", "This site's API key for Central Ingestion (§2.1, §2.2, Slice 15); required unless Central Ingestion runs with --enable-auth=false")
 	caCert := flag.String("ca-cert", "", "CA certificate file for verifying Central Ingestion's TLS certificate (§2.1, Slice 15); required if --central-url is https://")
+	enableChaos := flag.Bool("enable-chaos", false, "Expose /admin/chaos/* routes letting the Slice 23 Chaos Control Panel simulate a network partition on this site's forwarder (§2.4, Slice 23); off by default -- anyone who can reach this port could otherwise cut this site off from Central Ingestion")
 	flag.Parse()
 
 	log.Printf("[pharos-edge] Initializing edge collector for site: %s (db: %s)", *siteID, *dbPath)
@@ -79,9 +80,16 @@ func main() {
 			Timeout:   fwdCfg.RequestTimeout,
 			Transport: &http.Transport{TLSClientConfig: tlsCfg},
 		}
+	} else {
+		httpClient = &http.Client{Timeout: fwdCfg.RequestTimeout}
 	}
 
-	forwarder := edge.NewForwarder(store, httpClient, fwdCfg)
+	// Always wrap in a ChaosClient (§2.4, Slice 23) -- defaults to
+	// pass-through (SetPartitioned defaults false), zero behavior change
+	// unless --enable-chaos is also set and the dashboard's chaos panel
+	// actually toggles it via /admin/chaos/partition.
+	chaosClient := edge.NewChaosClient(httpClient)
+	forwarder := edge.NewForwarder(store, chaosClient, fwdCfg)
 	go func() {
 		log.Printf("[pharos-edge] Forwarder worker active -> streaming to %s", *centralURL)
 		if err := forwarder.Run(ctx); err != nil && err != context.Canceled {
@@ -141,6 +149,10 @@ func main() {
 	mux := http.NewServeMux()
 	edgeServer.RegisterRoutes(mux)
 	mux.Handle("/metrics", metrics.Handler())
+	if *enableChaos {
+		edge.RegisterChaosAdminRoutes(mux, chaosClient)
+		log.Printf("[pharos-edge] WARNING: --enable-chaos is set -- /admin/chaos/* can simulate a network partition on this site's forwarder. Only enable this on a local/demo instance.")
+	}
 
 	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%d", *port),
