@@ -884,6 +884,77 @@ verified against real infrastructure the same way every earlier slice was.
   `pharos-consumer` instances, verifying Kafka consumer-group rebalancing
   actually works correctly with this project's watermark tracking.
 
+  **Done 2026-09-05/06.** New `internal/ratelimit.RedisLimiter` implements
+  the existing `RateLimiter` interface from Slice 2 — no new interface,
+  exactly PLAN.md's own "swap in ... don't build a new one" instruction —
+  as a distributed token bucket, the identical algorithm
+  `TokenBucketLimiter` already used, moved into one atomic Redis Lua
+  script (`EVAL`) so concurrent instances' check-and-decrement can't race
+  at the network level the way separate GET/SET calls would. New `redis`
+  service in `docker-compose.yml` (no auth/TLS -- never leaves the private
+  Docker network, same reasoning Cassandra/Kafka's *internal* listeners
+  already use). New `nginx` service (`nginx/nginx.conf`) load-balancing
+  2+ `pharos-ingestion` instances via TCP-level passthrough (the `stream`
+  module), not TLS-terminating HTTP proxying — ingestion already
+  terminates its own TLS per Slice 15, and passthrough keeps the
+  handshake genuinely end-to-end without nginx needing a copy of the
+  project's private key. New `--redis-addr` flag on `pharos-ingestion`
+  (opt-in; empty still uses the in-process limiter, correct only for
+  exactly one instance, with an explicit startup warning saying so).
+
+  **Verified live, not assumed**: 2 real `pharos-ingestion` instances
+  behind real nginx (confirmed alternating via nginx's own stream access
+  log, not just "it returned 200"), 10 rapid requests for one site
+  round-robined across both — exactly 5 accepted and 5 throttled with 429,
+  matching the configured burst capacity precisely. This is the
+  determinative proof: a per-process bucket (the pre-Slice-19 default)
+  would have allowed roughly 10 (5 per instance's own independent state),
+  not 5 shared across both.
+
+  **A real, genuine bug found and fixed on the consumer side, before it
+  was ever run** -- reasoned through by considering what 2 consumer
+  instances sharing one Kafka group actually implies, not discovered by
+  chasing a failure: `SaveWatermarkCheckpoint` did a plain overwriting
+  `INSERT` keyed by `group_id` alone. Each instance's own
+  `WatermarkTracker` only ever observes the partitions Kafka assigned to
+  *it* -- with 2+ instances in the same group (required for rebalancing
+  to split partitions between them at all), whichever instance saved last
+  would silently replace the *other* instance's partitions in
+  `partition_high_watermark`/`partition_last_activity` with nothing, and
+  could regress `previous_emitted` below a value another, further-ahead
+  instance had already reported externally -- undoing Slice 13's own
+  monotonic-regression guarantee the moment a second instance joined the
+  group. Fixed with CQL's native map addition (`col + {...}`, merging
+  only the specific partition keys an instance actually has data for,
+  leaving every other instance's keys untouched) and a read-then-max-
+  then-write advance for `previous_emitted` (a Paxos/LWT conditional
+  update was tried first and genuinely timed out under this cluster's
+  real load after hours of testing -- "Operation timed out - received
+  only 1 responses" -- simplified to a plain compare-and-set, which is
+  the right amount of rigor for what's already a periodic, eventually-
+  consistent crash-recovery snapshot, not a per-message consistency
+  mechanism). New tests prove the merge against both `MemoryCanonicalStore`
+  and real Cassandra: two simulated instances checkpointing disjoint
+  partitions end up with *all* partitions in the merged result, and an
+  instance with a smaller local view can never regress a larger value
+  another instance already persisted.
+
+  **Verified live end to end**: 2 real `pharos-consumer` instances in one
+  Kafka group, real traffic across 6 sites/3 partitions — Kafka's own
+  rebalance protocol split ownership between them (confirmed via each
+  instance's own distinct, stabilized consumed-message count, not
+  assumed), and the shared checkpoint row in
+  `pharos.consumer_watermark_checkpoints` genuinely contained all 3
+  partitions' data merged from both instances. Then one instance was
+  killed outright: `kafka-consumer-groups.sh --describe` confirmed the
+  survivor took over *all three* partitions with zero lag
+  (CURRENT-OFFSET == LOG-END-OFFSET on every one), and its own watermark
+  advanced forward (not reset or regressed) after inheriting the dead
+  instance's further-progressed partitions.
+
+  Full suite (`go test -race -count=1 -p 1 ./...`) passed cleanly twice
+  in a row against the live multi-instance topology.
+
 - **Slice 20 — Compliance / access-audit logging** *(was Slice 13)*. Who
   queried what, building on the existing `LateArrivalAudit` pattern from
   §2.4 rather than inventing a second audit mechanism — and, once Slice 10
