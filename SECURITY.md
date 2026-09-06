@@ -1,11 +1,11 @@
 # Security Policy
 
-Pharos is a portfolio project demonstrating distributed-systems engineering
-patterns using a clinical-trial-adverse-event payload shape. **It is not a
-production system, is not deployed anywhere with real data, and should not
-be used to handle real patient or clinical trial information.** All example
-data in this repo (patient references, adverse event codes, study
-identifiers) is synthetic.
+Pharos is a distributed adverse-event ingestion product built on real
+distributed-systems engineering patterns, using a clinical-trial-adverse-event
+payload shape. **It has not yet been operated in production with real data,
+and should not currently be used to handle real patient or clinical trial
+information.** All example data in this repo (patient references, adverse
+event codes, study identifiers) is synthetic.
 
 ## What's actually in place
 
@@ -37,13 +37,18 @@ As of this writing:
   Slice 21 addendum for how this closed the asymmetry an earlier pass here
   had left open.
 
+See [`docs/security-threat-model.md`](docs/security-threat-model.md) for a
+per-component breakdown of what each service can read/write, its trust
+boundaries, and these gaps restated in those terms.
+
 ## Known, deliberate gaps
 
 This is tracked explicitly, not hidden. As of this writing there is:
 - No secrets-management system (Vault, KMS, or similar) — API key hashes
   live in a Cassandra table, and TLS private keys live as plain files under
-  `certs/`/`deploy/k8s/certs/` (gitignored). Adequate for a local/portfolio
-  deployment, not for a real secret-rotation or least-privilege-access story.
+  `certs/`/`deploy/k8s/certs/` (gitignored). Adequate for this project's
+  current single-tenant deployment model, not for a real secret-rotation or
+  least-privilege-access story.
 - The edge collector's own local HTTP capture endpoint is deliberately
   unauthenticated and plaintext (§2.1: scoped to the trusted site network,
   not a connection that leaves it) — everything that does leave the site
@@ -73,7 +78,7 @@ personal or clinical data.
 
 ## Reporting a vulnerability
 
-This is a solo-maintained portfolio repository. If you find a genuine
+This is a solo-maintained repository. If you find a genuine
 security issue in the code itself (not the already-documented gaps above —
 those are known and tracked in `PLAN.md`), please open a GitHub issue or
 reach out to the maintainer directly rather than a public disclosure, so

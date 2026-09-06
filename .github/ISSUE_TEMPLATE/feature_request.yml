@@ -1,0 +1,45 @@
+name: Feature request
+description: Suggest a new capability or an improvement to existing behavior
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem you're trying to solve. If this changes architecture or a data model, it likely belongs in `ARCHITECTURE_PROPOSALS.md` first — see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What gap or pain point does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How should it work? Link to a draft `ARCHITECTURE_PROPOSALS.md` entry if you have one.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you thought about and why you rejected them.
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Likely scope
+      options:
+        - Edge collector
+        - Central ingestion (auth, rate limiting, validation, outbox)
+        - Consumer (dedup, ordering, watermark)
+        - Dashboard / CLI
+        - Deployment (Docker Compose / Kubernetes)
+        - CI / tooling / docs
+        - Other
+    validations:
+      required: true

@@ -1,0 +1,88 @@
+# Builds every service's image, publishes it to GHCR, and signs it
+# keylessly with cosign (Sigstore) -- closes
+# docs/security-threat-model.md's "no image signing or provenance
+# verification" gap. Also attaches an SBOM and SLSA provenance attestation
+# via docker/build-push-action's own built-in support, so provenance is
+# covered too, not just the signature.
+#
+# workflow_dispatch exists specifically so this can be exercised and
+# verified on demand (this project has no tagged release yet) -- the tag
+# trigger is what a real release would use. Manual runs publish to
+# ghcr.io/<owner>/pharos-<service>:<short-sha>; tag pushes additionally
+# publish :<tag> and :latest.
+name: Publish images
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # required for cosign's keyless OIDC signing
+    name: Build, push, and sign
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [ingestion, consumer, edge, cli, dashboard]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          # Docker image references require a lowercase repository name --
+          # github.repository_owner may not be lowercase for every owner,
+          # so lowercase it defensively rather than assuming.
+          IMAGE="${REGISTRY}/${OWNER,,}/pharos-${SERVICE}"
+          TAGS="${IMAGE}:$(git rev-parse --short HEAD)"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            REF_TAG="${GITHUB_REF#refs/tags/}"
+            TAGS="${TAGS},${IMAGE}:${REF_TAG},${IMAGE}:latest"
+          fi
+          echo "tags=${TAGS}" >>"${GITHUB_OUTPUT}"
+          echo "image=${IMAGE}" >>"${GITHUB_OUTPUT}"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+          OWNER: ${{ github.repository_owner }}
+          SERVICE: ${{ matrix.service }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.${{ matrix.service }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          provenance: true
+          sbom: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign the published image (keyless)
+        run: |
+          cosign sign --yes "${IMAGE}@${DIGEST}"
+        env:
+          IMAGE: ${{ steps.tags.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest }}

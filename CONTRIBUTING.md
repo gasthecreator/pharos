@@ -1,6 +1,6 @@
 # Contributing
 
-This is a portfolio project with a single maintainer, but it's built with the
+This is a solo-maintained product, but it's built with the
 same discipline as a real engineering team — this file documents that
 discipline so it's legible to anyone reading the repo, not just followed
 implicitly.

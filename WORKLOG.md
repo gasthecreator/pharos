@@ -40,6 +40,143 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Product-hardening patterns adopted from cascade-operator
+
+**Author:** Claude Code
+
+**What:** Reviewed the sibling `cascade-operator` repo (~/cascade-operator,
+also solo-maintained, further along on its own "make this look like a real
+product" pass) for anything genuinely applicable here, and brought over
+what pharos was actually missing:
+
+1. **`CODE_OF_CONDUCT.md`** — standard Contributor Covenant v2.1, unmodified
+   text, same enforcement contact pharos's own `SECURITY.md` already uses.
+2. **`CODEOWNERS`** — single-maintainer default (`* @gasthecreator`).
+3. **`.github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml`** — adapted
+   from cascade's own templates, reworded for pharos's actual services and
+   docs (`ARCHITECTURE_PROPOSALS.md` instead of `PROPOSALS.md`, pharos's
+   service names instead of Istio/CascadePolicy references).
+4. **`.github/workflows/govulncheck.yml`** and **`codeql.yml`** — the same
+   two security-signal CI jobs cascade-operator runs on every push, matched
+   to pharos's own existing `ci.yml` style (`actions/checkout@v4`,
+   `actions/setup-go@v5` with `go-version: "1.25"`, not SHA-pinned actions
+   like cascade's newer workflows use — kept consistent with this repo's
+   own existing CI style rather than introducing a second convention).
+   `govulncheck` run locally against the current tree first: zero
+   vulnerabilities found.
+5. **`.github/workflows/publish-image.yml`** — builds, publishes to GHCR,
+   and keylessly signs (cosign + GitHub Actions OIDC, no private key
+   material) every one of pharos's 5 existing service images
+   (`deploy/docker/Dockerfile.{ingestion,consumer,edge,cli,dashboard}`),
+   via a matrix build rather than cascade's single-image version (pharos
+   ships 5 separate binaries, cascade ships one). Attaches SBOM + SLSA
+   provenance via `docker/build-push-action`'s own inputs. Triggered by a
+   `v*` tag push or manually via `workflow_dispatch` (this project has no
+   tagged release yet, same as cascade's own reasoning for including that
+   trigger).
+6. **`docs/security-threat-model.md`** (new) — a per-component
+   read/write/inbound-surface table and trust-boundary writeup in the same
+   factual, "state what was checked" style as cascade's own threat-model
+   doc, written from this project's actual current code (confirmed via
+   grep that `deploy/k8s/` has zero `ServiceAccount`/`Role`/`ClusterRole`/
+   `NetworkPolicy` manifests — ever pod runs under its namespace's default
+   `ServiceAccount` with no restriction — and that `/chaos`'s only real
+   gate is the `--enable-chaos` flag, not any in-app authentication, both
+   confirmed by reading `internal/dashboard/chaos.go` and
+   `cmd/pharos-dashboard/main.go` directly). Linked from `SECURITY.md`.
+7. **`docs/benchmark-results.md`** (new) — Slice 16's already-verified real
+   load-test numbers (p95 ~101ms, burst-isolation confirmation, the
+   Cassandra outbox LWT insert identified as the actual bottleneck)
+   extracted from `PLAN.md`/`WORKLOG.md` into their own dedicated,
+   citable doc, mirroring cascade's own `docs/benchmark-results.md` —
+   no new numbers generated, this is a reorganization of already-real,
+   already-verified data for discoverability.
+
+**Why:** Direct ask: look through cascade-operator for anything unique
+worth applying to pharos now that pharos is being presented and sold as a
+product, not just described as one.
+
+**How:** Compared both repos' root and `.github/` directory listings
+side-by-side first to find what cascade-operator has that pharos doesn't
+(pharos already had `dependabot.yml`, a PR template, and `.golangci.yml` —
+those weren't gaps). `AGENTS.md` and `CHANGELOG.md`'s Kubebuilder-specific
+scaffolding sections were deliberately NOT ported — pharos isn't a
+Kubebuilder project, so most of `AGENTS.md` doesn't apply, and a real
+`CHANGELOG.md` for pharos is its own item (below). Verified each adopted
+file against pharos's actual current code rather than copying cascade's
+content verbatim where it named cascade-specific things (Istio,
+CascadePolicy, PROPOSALS.md).
+
+**Files/modules touched:** `CODE_OF_CONDUCT.md`, `CODEOWNERS` (new),
+`.github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml` (new),
+`.github/workflows/{govulncheck,codeql,publish-image}.yml` (new),
+`docs/security-threat-model.md` (new), `docs/benchmark-results.md` (new),
+`SECURITY.md` (linked the new threat-model doc), `README.md` (added the
+new docs to the Repo layout listing).
+
+**Tests added/updated:** None (docs/CI config) — `govulncheck ./...` run
+locally against the current tree as a smoke test for the new CI job
+(clean, zero vulnerabilities); all new YAML validated with
+`yaml.safe_load`.
+
+**Follow-ups / left open:** The new `publish-image.yml` and `codeql.yml`
+workflows have not yet been exercised in real GitHub Actions (no push/tag
+yet) — cascade-operator's own worklog for the equivalent workflow found a
+real bug (`github.repository`'s mixed case breaking a lowercase-only
+Docker tag) only on the first actual run, so the same class of surprise is
+possible here despite local YAML validation passing. Also unadopted,
+deliberately: cascade's SHA-pinned action versions (a stronger
+supply-chain practice than pharos's own `ci.yml` currently uses) — pinning
+pharos's entire CI to SHAs would be a separate, repo-wide hardening pass,
+not something to do half-applied to only the new workflows.
+
+## [2026-09-06] Claude Code: Repositioning — product, not portfolio piece
+
+**Author:** Claude Code
+
+**What:** Removed "portfolio project" / "not a commercial product" /
+"competitive SWE recruiting" framing from every currently-living doc
+(`PLAN.md`'s Goal section and Slice 21 entries, `README.md`'s intro and
+"What's here vs. what's next" section, `CONTRIBUTING.md`'s opening line,
+`SECURITY.md`'s intro/known-gaps/reporting sections) and replaced it with
+product framing: Pharos solves one specific, hard piece of the
+pharmacovigilance-ingestion problem well, rather than being a portfolio
+demonstration piece. The real, verified origin (a documented interview
+question from Eli Lilly's Bio-IT / Clinical engineering team) is kept as
+provenance — it's genuine evidence the problem is real, not recruiting
+framing — but "recruiting audience," "recruiter/interviewer," and "not a
+commercial product" language is gone. "Portfolio-ready" (Phase 1's own
+name) became "demo-ready" throughout, keeping the same honest distinction
+from Phase 2's real production-hardening bar.
+
+**Why:** Gideon is now presenting and selling this as a product, not
+describing it as a portfolio/recruiting artifact.
+
+**How:** Grepped the whole repo for "portfolio"/"recruit"/"interviewer"
+first to scope every occurrence, then read each one in its surrounding
+paragraph before rewording (not a blind find/replace) so the honest
+scope caveats already in place (not yet operated in production at scale,
+doesn't compete with full pharmacovigilance suites, solo-maintained) stayed
+intact — the goal was changing the framing, not overclaiming maturity that
+doesn't exist. Deliberately left `WORKLOG.md`'s own historical entries and
+`ARCHITECTURE_PROPOSALS.md`'s dated proposal entries untouched: those are
+dated records of what was actually decided and why at the time (this
+file's own header: "if it's not logged here, it didn't happen"), and
+rewriting them would falsify that record rather than correct stale framing
+in a living doc. Also grepped `.go`/`.sh`/`.html`/`.yaml` for the same
+terms to confirm nothing user-facing (CLI banners, dashboard templates,
+demo script output) carried it — nothing did.
+
+**Files/modules touched:** `PLAN.md`, `README.md`, `CONTRIBUTING.md`,
+`SECURITY.md`.
+
+**Tests added/updated:** None (documentation only).
+
+**Follow-ups / left open:** None — `WORKLOG.md` and
+`ARCHITECTURE_PROPOSALS.md` intentionally still contain historical
+"portfolio"/"recruiting" language in their dated entries; that's correct,
+not a miss.
+
 ## [2026-09-06] Claude Code: Third-pass re-audit — confirmed clean after dashboard audit logging, found and fixed 3 more small drifts
 
 **Author:** Claude Code
