@@ -40,6 +40,108 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Slice 22 — Property-based & deterministic simulation testing
+
+**Author:** Claude Code
+
+**What:** New `internal/clock` package (`Clock` interface, `Real`/`Simulated`
+implementations), wired into `dedup.MemoryOutboxStore` and
+`consumer.Engine` via new `SetClock` setters. Stage A: two
+`pgregory.net/rapid` property test files
+(`internal/dedup/outbox_property_test.go`,
+`internal/consumer/watermark_property_test.go`) generating random operation
+sequences against the claim/lease outbox and the watermark tracker. Found
+and fixed two real, previously-undiscovered bugs (see How). Stage B: new
+`internal/simulation` package -- an in-memory, seed-controlled Kafka broker
+plus a harness wiring the REAL `ingestion.Handler`/`Sweeper`/
+`consumer.Engine` together against it, driving 500 random seeds and proving
+exact-seed reproducibility.
+
+**Why:** Per PLAN.md's Slice 22 -- every fault-injection test up to this
+point is a hand-picked scenario; this generalizes into automated
+exploration across many more interleavings than a human would think to
+write down by hand, in the two stages PLAN.md scopes (cheap property tests
+first, the more ambitious deterministic simulation second).
+
+**How:** Stage A found real bugs on its very first generated sequence in
+both new test files' first bug-hunting run. (1) `MarkPublished`/
+`MarkDLQPublished` had no fencing against a claim already superseded by a
+steal -- `MemoryOutboxStore`'s checked nothing beyond key existence, and
+`CassandraOutboxStore`'s CAS conditioned only on status, discarding whether
+the CAS actually applied. A stale claimant (its lease legitimately expired
+and stolen, the exact scenario the sweeper exists to handle) could still
+finalize late and silently overwrite the real claimant's Kafka lineage --
+and if its own publish was still genuinely in flight past the 30s lease
+(this session's own repeated real degraded-infra episodes make that not
+purely theoretical), a genuine duplicate publish. Fixed with an
+`expectedClaimedAt` fencing parameter on both methods, a real Cassandra CAS
+now conditioning on `claimed_at` too, and a new `dedup.ErrClaimSuperseded`
+sentinel for callers. (2) A `REPLAYED` DLQ record was still steal-able:
+`InsertClaim`/`InsertDLQClaim`'s steal branch checked `== StatusPublished`
+instead of `!= StatusPublishing`, so a terminal REPLAYED record (a client
+retrying a stale cached submission after the original was already fixed
+and replayed) could have its `claimed_at` silently mutated and incorrectly
+report `Acquired: true`. Real Cassandra's own CAS was already correct
+(`IF status = 'PUBLISHING'`); only the in-memory store -- used by every
+fast test and, now, the property tests themselves -- had the gap. Fixed
+and pinned with both the property test and a dedicated hand-written
+regression test. The watermark property test found no bugs after 5000
+generated sequences, a genuine confirmation that code held up.
+
+Stage B's `internal/simulation.Broker` implements `kafka.Producer` directly
+(partitioned, FIFO-per-partition with randomized-but-order-preserving
+delivery delay); its `SimulatedReader` implements `consumer.MessageReader`
+with `FetchMessage` never advancing past an uncommitted offset -- exactly
+mirroring real kafka-go's manual-commit semantics, so "redelivery after a
+simulated crash" falls out for free rather than needing a separate
+mechanism. The harness drives the REAL `ingestion.Handler` (via
+`HandleEvents` through `httptest`, not a shortcut into unexported
+internals), REAL `Sweeper`, and REAL `consumer.Engine`, sharing one seeded
+`*rand.Rand` and one `clock.Simulated` -- no pipeline logic reimplemented.
+Deliberately scoped to ingest→outbox→publish→consume→canonical-write, not
+edge's HTTP/SQLite leg (already covered by real-infra fault injection,
+different problem). 500 seeds proved exactly-once-to-the-broker,
+watermark-never-regresses, and end-to-end canonical delivery; a dedicated
+determinism test proved the same seed run twice produces a bit-for-bit
+identical fingerprint (accepted order, publish counts, final watermark,
+canonical save count) -- the actual FoundationDB-style claim this stage
+exists to make. CI raises rapid's default 100 checks/test to 5000 via
+`RAPID_CHECKS` (free: pure in-memory Go, no real infra).
+
+**Files/modules touched:** new `internal/clock/{clock,clock_test}.go`; new
+`internal/dedup/outbox_property_test.go`; new
+`internal/consumer/watermark_property_test.go`; new
+`internal/simulation/{broker,harness,simulation_test}.go`;
+`internal/dedup/store.go` (`ErrClaimSuperseded`, `MarkPublished`/
+`MarkDLQPublished` signature fencing), `internal/dedup/memory_store.go`
+(`SetClock`, fencing, REPLAYED-stealable fix), `internal/dedup/cassandra_store.go`
+(CAS fencing), `internal/dedup/store_test.go` (updated call sites + 2 new
+regression tests), `internal/dedup/cassandra_integration_test.go` (updated
+call sites + 1 new real-Cassandra fencing test); `internal/ingestion/handler.go`,
+`internal/ingestion/sweeper.go` (fencing call-site updates);
+`internal/ingestion/auth_test.go`, `internal/ingestion/dlq_replay_test.go`,
+`internal/query/archive_integration_test.go` (updated call sites);
+`internal/consumer/watermark.go` (`RegisterWindow` now takes `now`),
+`internal/consumer/engine.go` (`SetClock`); `internal/consumer/watermark_test.go`,
+`internal/consumer/engine_test.go` (updated call sites); `go.mod`/`go.sum`
+(`pgregory.net/rapid`); `.github/workflows/ci.yml` (`RAPID_CHECKS=5000`);
+`PLAN.md` (Slice 22 marked done).
+
+**Tests added/updated:** `TestOutboxProperty_ExactlyOnceAndNoDoubleClaim`,
+`TestOutboxProperty_DLQExactlyOnceAndFencing`,
+`TestWatermarkProperty_MonotonicAndAuditDedup`;
+`TestMemoryOutboxStore_MarkPublishedFencedAfterSteal`,
+`TestCassandraOutboxStore_MarkPublishedFencedAfterSteal` (real Cassandra),
+`TestMemoryOutboxStore_InsertDLQClaim_ReplayedIsNotStealable`;
+`TestSimulation_ExactlyOnceAndMonotonicWatermarkAcrossManySeeds`,
+`TestSimulation_SameSeedIsDeterministic`; `internal/clock`'s own unit
+tests.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope; Stage B's numSeeds (500) can be raised freely if a future
+investigation wants deeper exploration -- noted in PLAN.md as a one-line
+change, not a scaling limit.
+
 ## [2026-09-06] Claude Code: Slice 21 — Web dashboard
 
 **Author:** Claude Code

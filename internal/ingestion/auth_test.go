@@ -154,7 +154,7 @@ func TestHandleDLQReplay_OnlyOwningSiteMayReplay(t *testing.T) {
 	if err != nil || !claim.Acquired {
 		t.Fatalf("failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
 	}
-	if err := outbox.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 0); err != nil {
+	if err := outbox.MarkDLQPublished(ctx, dlqKey, claim.ClaimedAt, "pharos.events.dlq", 0, 0); err != nil {
 		t.Fatalf("failed to mark seeded DLQ record published: %v", err)
 	}
 
@@ -195,7 +195,7 @@ func TestHandleDLQReplay_RecordsAccessAuditOnSuccess(t *testing.T) {
 	if err != nil || !claim.Acquired {
 		t.Fatalf("failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
 	}
-	if err := outbox.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 0); err != nil {
+	if err := outbox.MarkDLQPublished(ctx, dlqKey, claim.ClaimedAt, "pharos.events.dlq", 0, 0); err != nil {
 		t.Fatalf("failed to mark seeded DLQ record published: %v", err)
 	}
 
@@ -252,7 +252,7 @@ func TestHandleDLQReplay_RecordsAccessAuditOnForbidden(t *testing.T) {
 	if err != nil || !claim.Acquired {
 		t.Fatalf("failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
 	}
-	if err := outbox.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 0); err != nil {
+	if err := outbox.MarkDLQPublished(ctx, dlqKey, claim.ClaimedAt, "pharos.events.dlq", 0, 0); err != nil {
 		t.Fatalf("failed to mark seeded DLQ record published: %v", err)
 	}
 

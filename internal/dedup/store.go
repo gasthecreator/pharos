@@ -9,6 +9,15 @@ import (
 var (
 	ErrRecordNotFound = errors.New("outbox record not found")
 	ErrStoreClosed    = errors.New("dedup outbox store is closed")
+	// ErrClaimSuperseded is returned by MarkPublished/MarkDLQPublished when
+	// the claim being finalized is no longer the current one for its
+	// idempotency key -- its lease expired and was legitimately stolen by
+	// another claimant before this call arrived (§2.4, Slice 22). Not a
+	// hard failure: whatever event this call was finalizing was still
+	// genuinely published to Kafka: this only means the finalize lost the
+	// race to record that fact, so a peer's record of it (or its own
+	// still-authoritative claim) stays intact instead of being overwritten.
+	ErrClaimSuperseded = errors.New("outbox claim was superseded before it could be finalized")
 )
 
 // DefaultLeaseTimeout is the maximum duration an in-flight worker may hold a PUBLISHING claim (default: 30s).
@@ -80,14 +89,22 @@ type OutboxStore interface {
 	// - If status == 'PUBLISHING' with expired lease: attempts atomic LWT CAS steal. If won, returns Acquired=true.
 	InsertClaim(ctx context.Context, rec OutboxRecord, leaseTimeout time.Duration) (ClaimResult, error)
 
-	// MarkPublished finalizes the outbox record to status='PUBLISHED' with Kafka broker metadata.
-	MarkPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error
+	// MarkPublished finalizes the outbox record to status='PUBLISHED' with
+	// Kafka broker metadata, fenced by expectedClaimedAt (the ClaimedAt
+	// InsertClaim returned for this claim, §2.4 Slice 22) -- only applies
+	// if the record's claimed_at still matches, i.e. nobody has stolen this
+	// claim since. Returns ErrClaimSuperseded otherwise (see that error's
+	// docs); callers should not treat that as their own request failing,
+	// since the underlying event was still genuinely published.
+	MarkPublished(ctx context.Context, idempotencyKey string, expectedClaimedAt time.Time, topic string, partition int, offset int64) error
 
 	// InsertDLQClaim executes a symmetric atomic LWT claim on pharos.dead_letter_events.
 	InsertDLQClaim(ctx context.Context, rec DLQRecord, leaseTimeout time.Duration) (ClaimResult, error)
 
-	// MarkDLQPublished finalizes the DLQ record to status='PUBLISHED' with Kafka broker metadata.
-	MarkDLQPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error
+	// MarkDLQPublished finalizes the DLQ record to status='PUBLISHED' with
+	// Kafka broker metadata, fenced by expectedClaimedAt exactly like
+	// MarkPublished (§2.4, Slice 22).
+	MarkDLQPublished(ctx context.Context, idempotencyKey string, expectedClaimedAt time.Time, topic string, partition int, offset int64) error
 
 	// MarkDLQReplayed transitions a DLQ record from PUBLISHED to REPLAYED
 	// (§2.3, Slice 10) once its stored payload has been successfully

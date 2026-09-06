@@ -2,6 +2,7 @@ package dedup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -66,7 +67,7 @@ func TestCassandraOutboxStore_RealIntegration(t *testing.T) {
 	}
 
 	// 3. Mark published with Kafka coordinates
-	err = store.MarkPublished(ctx, idKey, "pharos.events.adverse", 0, 42)
+	err = store.MarkPublished(ctx, idKey, claim1.ClaimedAt, "pharos.events.adverse", 0, 42)
 	if err != nil {
 		t.Fatalf("MarkPublished failed: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestCassandraOutboxStore_RealIntegration(t *testing.T) {
 		t.Fatalf("InsertDLQClaim failed: err=%v, claim=%+v", err, dlqClaim)
 	}
 
-	err = store.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 99)
+	err = store.MarkDLQPublished(ctx, dlqKey, dlqClaim.ClaimedAt, "pharos.events.dlq", 0, 99)
 	if err != nil {
 		t.Fatalf("MarkDLQPublished failed: %v", err)
 	}
@@ -233,5 +234,74 @@ func TestCassandraOutboxStore_RealIntegration(t *testing.T) {
 	}
 	if siteStatus != string(StatusReplayed) {
 		t.Errorf("expected dead_letter_events_by_site status REPLAYED, got %s", siteStatus)
+	}
+}
+
+// TestCassandraOutboxStore_MarkPublishedFencedAfterSteal proves the §2.4,
+// Slice 22 fencing fix against real Cassandra LWT: a claimant whose lease
+// genuinely expired and was stolen by another claimant can no longer
+// finalize with its own stale claimed_at, and the real event_outbox row
+// ends up with whichever claimant's finalize actually won. Before this
+// fix, the CAS only checked `IF status = 'PUBLISHING'`, not claimed_at, and
+// its applied result was discarded entirely -- the stale claimant's
+// finalize would have silently succeeded and overwritten the real Kafka
+// lineage.
+func TestCassandraOutboxStore_MarkPublishedFencedAfterSteal(t *testing.T) {
+	if !isPortOpen("127.0.0.1", 9042) {
+		t.Fatalf("Cassandra port 9042 is not open on 127.0.0.1")
+	}
+	cfg := DefaultCassandraConfig()
+	cfg.ConnectTimeout = 15 * time.Second
+	store, err := NewCassandraOutboxStore(cfg)
+	if err != nil {
+		t.Fatalf("could not connect to Cassandra cluster: %v", err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	idKey := fmt.Sprintf("SITE-FENCE-CASS:%d", time.Now().UnixNano())
+	rec := OutboxRecord{
+		IdempotencyKey: idKey,
+		SiteID:         "SITE-FENCE-CASS",
+		LocalSeq:       1,
+		Payload:        []byte(`{"resourceType":"AdverseEvent"}`),
+	}
+	shortLease := 200 * time.Millisecond
+
+	claim1, err := store.InsertClaim(ctx, rec, shortLease)
+	if err != nil || !claim1.Acquired {
+		t.Fatalf("1st InsertClaim failed: err=%v acquired=%v", err, claim1.Acquired)
+	}
+
+	time.Sleep(shortLease + 300*time.Millisecond)
+
+	claim2, err := store.InsertClaim(ctx, rec, shortLease)
+	if err != nil || !claim2.Acquired {
+		t.Fatalf("steal InsertClaim failed: err=%v acquired=%v", err, claim2.Acquired)
+	}
+	if claim2.ClaimedAt.Equal(claim1.ClaimedAt) {
+		t.Fatalf("test setup: expected the steal to produce a new claimed_at")
+	}
+
+	// The stale claimant's own (late) finalize must be fenced off.
+	err = store.MarkPublished(ctx, idKey, claim1.ClaimedAt, "stale.topic", 9, 999)
+	if !errors.Is(err, ErrClaimSuperseded) {
+		t.Fatalf("expected ErrClaimSuperseded for the stale claimant's finalize, got %v", err)
+	}
+
+	// The legitimate current claimant can still finalize normally.
+	if err := store.MarkPublished(ctx, idKey, claim2.ClaimedAt, "real.topic", 0, 42); err != nil {
+		t.Fatalf("expected the current claimant's MarkPublished to succeed, got %v", err)
+	}
+
+	saved, err := store.GetOutboxRecord(ctx, idKey)
+	if err != nil {
+		t.Fatalf("GetOutboxRecord failed: %v", err)
+	}
+	if saved.Status != StatusPublished {
+		t.Fatalf("expected status PUBLISHED, got %s", saved.Status)
+	}
+	if saved.KafkaTopic != "real.topic" || saved.KafkaOffset != 42 {
+		t.Fatalf("CRITICAL: expected the legitimate claimant's Kafka lineage (real.topic/42) to win, got %s/%d -- fencing did not prevent bookkeeping corruption in real Cassandra", saved.KafkaTopic, saved.KafkaOffset)
 	}
 }

@@ -271,7 +271,7 @@ func TestConsumerEngine_LateArrivalAuditDeduplicatedOnRedelivery(t *testing.T) {
 		ID:    windowID,
 		Start: baseTime,
 		End:   baseTime.Add(1 * time.Hour), // [12:00, 13:00)
-	})
+	}, baseTime)
 
 	// 1. Advance watermark past 13:00 to complete the window
 	tracker.ProcessEvent(0, "INIT-1", baseTime.Add(70*time.Minute), baseTime.Add(10*time.Minute))

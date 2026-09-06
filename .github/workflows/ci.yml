@@ -122,7 +122,14 @@ jobs:
       # connections/LWT races is real added load this already-tight topology
       # doesn't have headroom for, confirmed by a clean pass once serialized.
       - name: go test -race
-        run: go test -race -count=1 -p 1 ./...
+        # RAPID_CHECKS raises pgregory.net/rapid's default 100 generated
+        # sequences per property test (§2.4, Slice 22: property-based &
+        # deterministic simulation testing) to 5000 -- these tests are pure
+        # in-memory Go with no real Cassandra/Kafka calls, so the added
+        # exploration is genuinely free relative to this workflow's actual
+        # bottleneck (the real-infra integration tests), not a tradeoff
+        # against this already-tight topology's headroom.
+        run: RAPID_CHECKS=5000 go test -race -count=1 -p 1 ./...
 
       - name: Show container logs on failure
         if: failure()

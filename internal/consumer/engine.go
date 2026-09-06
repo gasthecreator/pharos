@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/clock"
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/metrics"
 	"github.com/gasthecreator/pharos/internal/model"
@@ -73,10 +74,13 @@ type Engine struct {
 	store   CanonicalStore
 	tracker *WatermarkTracker
 	cfg     EngineConfig
+	clock   clock.Clock
 	stats   EngineStats
 }
 
-// NewEngine creates a new Consumer Engine.
+// NewEngine creates a new Consumer Engine, using the real wall clock by
+// default -- see SetClock to substitute a controllable one for
+// deterministic simulation testing (§2.4, Slice 22).
 func NewEngine(reader MessageReader, store CanonicalStore, tracker *WatermarkTracker, cfg EngineConfig) *Engine {
 	if tracker == nil {
 		tracker = NewWatermarkTracker(cfg.LatenessTolerance, cfg.IdleTimeout)
@@ -86,7 +90,20 @@ func NewEngine(reader MessageReader, store CanonicalStore, tracker *WatermarkTra
 		store:   store,
 		tracker: tracker,
 		cfg:     cfg,
+		clock:   clock.Real{},
 	}
+}
+
+// SetClock substitutes the clock Step uses for "now" (both the watermark
+// tracker's arrival time and each record's ConsumedAt), so a deterministic
+// simulation harness can drive the entire pipeline -- ingestion through
+// consumption -- from one shared, seed-controlled clock instead of real
+// wall-clock time (§2.4, Slice 22). Never call this on an engine already
+// consuming live traffic; mirrors this project's other post-construction
+// setter pattern (e.g. Handler.SetKeyStore) used for optional/test-only
+// wiring.
+func (e *Engine) SetClock(c clock.Clock) {
+	e.clock = c
 }
 
 // NewKafkaReader builds a standard segmentio/kafka-go reader configured for consumer group processing.
@@ -180,10 +197,10 @@ func (e *Engine) Step(ctx context.Context) error {
 	recordedTime := event.RecordedTimeUTC()
 	ingestionTime := msg.Time.UTC()
 	if ingestionTime.IsZero() {
-		ingestionTime = time.Now().UTC()
+		ingestionTime = e.clock.Now()
 	}
 
-	now := time.Now().UTC()
+	now := e.clock.Now()
 
 	// 3. Process event through watermark tracker
 	isLate, _ := e.tracker.ProcessEvent(msg.Partition, keyStr, eventTime, now)

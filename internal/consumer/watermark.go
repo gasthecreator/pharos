@@ -184,8 +184,14 @@ func (wt *WatermarkTracker) advanceWatermarkLocked(now time.Time) time.Time {
 	return wt.previousEmitted
 }
 
-// RegisterWindow adds a new analytical window to track.
-func (wt *WatermarkTracker) RegisterWindow(w Window) {
+// RegisterWindow adds a new analytical window to track. now is the caller's
+// current time (§2.4, Slice 22: property-based & deterministic simulation
+// testing) -- WatermarkTracker's every other time-dependent method already
+// takes an explicit now rather than calling time.Now() itself, so a
+// property/simulation test can drive it with a controllable clock; this
+// was the one remaining method still reaching for the real wall clock
+// directly.
+func (wt *WatermarkTracker) RegisterWindow(w Window, now time.Time) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 
@@ -193,7 +199,7 @@ func (wt *WatermarkTracker) RegisterWindow(w Window) {
 	var closedAt time.Time
 	if !wt.previousEmitted.IsZero() && !wt.previousEmitted.Before(w.End) {
 		status = WindowStatusComplete
-		closedAt = time.Now().UTC()
+		closedAt = now
 	}
 
 	wt.windows[w.ID] = &Window{

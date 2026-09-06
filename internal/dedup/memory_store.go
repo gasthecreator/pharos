@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/gasthecreator/pharos/internal/clock"
 )
 
 // MemoryOutboxStore provides an in-memory, thread-safe implementation of OutboxStore
 // accurately simulating Cassandra LWT Paxos consensus and lease CAS semantics for unit testing.
 type MemoryOutboxStore struct {
 	mu          sync.Mutex
+	clock       clock.Clock
 	events      map[string]*OutboxRecord
 	dlqEvents   map[string]*DLQRecord
 	pendingKeys map[string]time.Time
@@ -18,14 +21,29 @@ type MemoryOutboxStore struct {
 	closed      bool
 }
 
-// NewMemoryOutboxStore constructs a new MemoryOutboxStore.
+// NewMemoryOutboxStore constructs a new MemoryOutboxStore, using the real
+// wall clock by default -- see SetClock to substitute a controllable one
+// for property/simulation testing (§2.4, Slice 22).
 func NewMemoryOutboxStore() *MemoryOutboxStore {
 	return &MemoryOutboxStore{
+		clock:       clock.Real{},
 		events:      make(map[string]*OutboxRecord),
 		dlqEvents:   make(map[string]*DLQRecord),
 		pendingKeys: make(map[string]time.Time),
 		pendingDLQ:  make(map[string]time.Time),
 	}
+}
+
+// SetClock substitutes the clock this store uses for lease timing, so tests
+// can advance simulated time without real sleeping (§2.4, Slice 22:
+// property-based & deterministic simulation testing). Never call this on a
+// store already handling live traffic -- it's for tests and simulation
+// harnesses only, mirroring this project's other post-construction setter
+// pattern (e.g. Handler.SetKeyStore) used for optional/test-only wiring.
+func (s *MemoryOutboxStore) SetClock(c clock.Clock) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.clock = c
 }
 
 // InsertClaim simulates Cassandra LWT `INSERT ... IF NOT EXISTS` with status='PUBLISHING'.
@@ -37,7 +55,7 @@ func (s *MemoryOutboxStore) InsertClaim(ctx context.Context, rec OutboxRecord, l
 		return ClaimResult{}, ErrStoreClosed
 	}
 
-	now := time.Now().UTC()
+	now := s.clock.Now()
 	existing, found := s.events[rec.IdempotencyKey]
 
 	if !found {
@@ -58,11 +76,23 @@ func (s *MemoryOutboxStore) InsertClaim(ctx context.Context, rec OutboxRecord, l
 	}
 
 	// Key already exists (LWT applied == false)
-	if existing.Status == StatusPublished {
-		// Sub-case 2a: already published -> no-op
+	//
+	// Sub-case 2a: not currently PUBLISHING (already PUBLISHED, or -- for
+	// symmetry with InsertDLQClaim's REPLAYED terminal state, even though
+	// event_outbox itself never actually reaches a third status today --
+	// any other terminal status) -> no-op, never a steal candidate. Real
+	// Cassandra's own CAS steal query conditions on `IF status =
+	// 'PUBLISHING'` (see CassandraOutboxStore.InsertClaim), so checking
+	// only `== StatusPublished` here (rather than `!= StatusPublishing`)
+	// was a genuine divergence from what this store's own doc comment
+	// claims to simulate -- caught by a Slice 22 property test finding
+	// that a REPLAYED DLQ record's claimed_at could be silently mutated
+	// and Acquired incorrectly reported true by InsertDLQClaim (see that
+	// method's identical fix).
+	if existing.Status != StatusPublishing {
 		return ClaimResult{
 			Acquired:       false,
-			Status:         StatusPublished,
+			Status:         existing.Status,
 			ClaimedAt:      existing.ClaimedAt,
 			ExistingRecord: copyOutboxRecord(existing),
 		}, nil
@@ -88,8 +118,20 @@ func (s *MemoryOutboxStore) InsertClaim(ctx context.Context, rec OutboxRecord, l
 	}, nil
 }
 
-// MarkPublished finalizes record to status='PUBLISHED'.
-func (s *MemoryOutboxStore) MarkPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error {
+// MarkPublished finalizes record to status='PUBLISHED', but only if
+// expectedClaimedAt still matches the record's current claimed_at (§2.4,
+// Slice 22) -- a fencing check mirroring the LWT CAS Cassandra already uses
+// for the claim/steal itself (InsertClaim), extended here to the finalize
+// step too. Without this, a claimant whose lease was legitimately stolen
+// (it was presumed dead after DefaultLeaseTimeout) could still finalize
+// its own late, stale publish and silently overwrite whichever claimant's
+// finalize actually should have won -- corrupting the record's Kafka
+// lineage bookkeeping. Returns ErrClaimSuperseded, not a hard failure: from
+// the stale caller's own point of view, its event genuinely was published
+// (a real Kafka message exists for this idempotency key, whether from this
+// call or a peer's), so callers should generally treat this as an outcome
+// to note, not as their own submission failing.
+func (s *MemoryOutboxStore) MarkPublished(ctx context.Context, idempotencyKey string, expectedClaimedAt time.Time, topic string, partition int, offset int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -101,9 +143,12 @@ func (s *MemoryOutboxStore) MarkPublished(ctx context.Context, idempotencyKey st
 	if !found {
 		return ErrRecordNotFound
 	}
+	if rec.Status != StatusPublishing || !rec.ClaimedAt.Equal(expectedClaimedAt) {
+		return ErrClaimSuperseded
+	}
 
 	rec.Status = StatusPublished
-	rec.PublishedAt = time.Now().UTC()
+	rec.PublishedAt = s.clock.Now()
 	rec.KafkaTopic = topic
 	rec.KafkaPartition = partition
 	rec.KafkaOffset = offset
@@ -121,7 +166,7 @@ func (s *MemoryOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord, l
 		return ClaimResult{}, ErrStoreClosed
 	}
 
-	now := time.Now().UTC()
+	now := s.clock.Now()
 	existing, found := s.dlqEvents[rec.IdempotencyKey]
 
 	if !found {
@@ -140,10 +185,18 @@ func (s *MemoryOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord, l
 		}, nil
 	}
 
-	if existing.Status == StatusPublished {
+	// Not currently PUBLISHING (PUBLISHED, or REPLAYED -- a real,
+	// previously-undiscovered gap this exact check closes: a REPLAYED
+	// record, e.g. from a client retrying a stale cached submission long
+	// after its original rejection was already fixed and replayed, must
+	// never be treated as an abandoned in-flight claim eligible for
+	// stealing. Real Cassandra's own CAS already only steals `IF status =
+	// 'PUBLISHING'`; this mirrors that instead of only checking
+	// `== StatusPublished` the way this branch previously did.
+	if existing.Status != StatusPublishing {
 		return ClaimResult{
 			Acquired:  false,
-			Status:    StatusPublished,
+			Status:    existing.Status,
 			ClaimedAt: existing.ClaimedAt,
 		}, nil
 	}
@@ -164,8 +217,10 @@ func (s *MemoryOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord, l
 	}, nil
 }
 
-// MarkDLQPublished finalizes DLQ record to status='PUBLISHED'.
-func (s *MemoryOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error {
+// MarkDLQPublished finalizes DLQ record to status='PUBLISHED', fenced by
+// expectedClaimedAt exactly like MarkPublished (§2.4, Slice 22) -- see that
+// method's docs for the full rationale.
+func (s *MemoryOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey string, expectedClaimedAt time.Time, topic string, partition int, offset int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -177,9 +232,12 @@ func (s *MemoryOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey
 	if !found {
 		return ErrRecordNotFound
 	}
+	if rec.Status != StatusPublishing || !rec.ClaimedAt.Equal(expectedClaimedAt) {
+		return ErrClaimSuperseded
+	}
 
 	rec.Status = StatusPublished
-	rec.PublishedAt = time.Now().UTC()
+	rec.PublishedAt = s.clock.Now()
 	rec.KafkaTopic = topic
 	rec.KafkaPartition = partition
 	rec.KafkaOffset = offset
@@ -207,7 +265,7 @@ func (s *MemoryOutboxStore) MarkDLQReplayed(ctx context.Context, idempotencyKey 
 	}
 
 	rec.Status = StatusReplayed
-	rec.ReplayedAt = time.Now().UTC()
+	rec.ReplayedAt = s.clock.Now()
 	return nil
 }
 
@@ -220,7 +278,7 @@ func (s *MemoryOutboxStore) FetchStaleClaims(ctx context.Context, leaseTimeout t
 		return nil, nil, ErrStoreClosed
 	}
 
-	now := time.Now().UTC()
+	now := s.clock.Now()
 	var staleOutbox []OutboxRecord
 	var staleDLQ []DLQRecord
 

@@ -282,9 +282,9 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 							Error:          "dlq kafka publish error: " + pErr.Error(),
 						}}
 					}
-					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, meta.Topic, meta.Partition, meta.Offset)
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, claim.ClaimedAt, meta.Topic, meta.Partition, meta.Offset)
 				} else {
-					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, kafka.DLQTopic, 0, 0)
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, claim.ClaimedAt, kafka.DLQTopic, 0, 0)
 				}
 				atomic.AddUint64(&h.dlqCount, 1)
 				metrics.DLQWritesTotal.Inc()
@@ -340,9 +340,9 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 							Error:          "dlq kafka publish error: " + pErr.Error(),
 						}}
 					}
-					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, meta.Topic, meta.Partition, meta.Offset)
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, claim.ClaimedAt, meta.Topic, meta.Partition, meta.Offset)
 				} else {
-					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, kafka.DLQTopic, 0, 0)
+					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, claim.ClaimedAt, kafka.DLQTopic, 0, 0)
 				}
 				atomic.AddUint64(&h.dlqCount, 1)
 				metrics.DLQWritesTotal.Inc()
@@ -391,9 +391,9 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 						Error:          "kafka publish error: " + pErr.Error(),
 					}}
 				}
-				_ = h.outboxStore.MarkPublished(ctx, keyStr, meta.Topic, meta.Partition, meta.Offset)
+				_ = h.outboxStore.MarkPublished(ctx, keyStr, claim.ClaimedAt, meta.Topic, meta.Partition, meta.Offset)
 			} else {
-				_ = h.outboxStore.MarkPublished(ctx, keyStr, kafka.MainTopic, 0, 0)
+				_ = h.outboxStore.MarkPublished(ctx, keyStr, claim.ClaimedAt, kafka.MainTopic, 0, 0)
 			}
 		} else {
 			// Duplicate or concurrent in-flight

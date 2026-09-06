@@ -53,7 +53,7 @@ func TestHandler_DLQReplaySucceedsAndMarksOriginalRecordReplayed(t *testing.T) {
 	if err != nil || !claim.Acquired {
 		t.Fatalf("test setup: failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
 	}
-	if err := store.MarkDLQPublished(ctx, idKey, kafka.DLQTopic, 0, 0); err != nil {
+	if err := store.MarkDLQPublished(ctx, idKey, claim.ClaimedAt, kafka.DLQTopic, 0, 0); err != nil {
 		t.Fatalf("test setup: failed to mark DLQ record published: %v", err)
 	}
 
@@ -233,7 +233,7 @@ func TestHandler_DLQReplayTwiceIsConflictOnSecondAttempt(t *testing.T) {
 	if err != nil || !claim.Acquired {
 		t.Fatalf("test setup: failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
 	}
-	if err := store.MarkDLQPublished(ctx, idKey, kafka.DLQTopic, 0, 0); err != nil {
+	if err := store.MarkDLQPublished(ctx, idKey, claim.ClaimedAt, kafka.DLQTopic, 0, 0); err != nil {
 		t.Fatalf("test setup: failed to mark DLQ record published: %v", err)
 	}
 

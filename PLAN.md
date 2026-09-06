@@ -1237,6 +1237,132 @@ checks target the final wire contract rather than a moving target.
 per §6 — Stage A is well-scoped enough that Gemini could reasonably take
 it instead, if bandwidth suggests splitting the two stages across builders.
 
+**Done 2026-09-06.** *(Built by Claude Code directly, superseding the
+Stage-A-could-go-to-Gemini note — this session's standing instruction to
+complete every remaining scoped slice itself.)*
+
+**New `internal/clock` package**: a `Clock` interface (`Now() time.Time`)
+with `Real` (production, wraps `time.Now().UTC()`) and `Simulated`
+(manually-advanced, safe for concurrent use) implementations. Wired into
+`dedup.MemoryOutboxStore` (new `SetClock`, all 6 internal `time.Now()`
+call sites replaced) and `consumer.Engine` (new `SetClock`), both defaulting
+to `Real` — zero behavior change for every existing caller. Also fixed
+`WatermarkTracker.RegisterWindow`'s one remaining direct `time.Now()` call
+by adding an explicit `now` parameter (no production callers existed; only
+2 test call sites needed updating).
+
+**Stage A — `pgregory.net/rapid`** (chosen over stdlib `testing/quick`/native
+fuzzing: neither had any precedent in this codebase, and rapid's `t.Repeat`
+state-machine-style API is a direct fit for "generate random sequences of
+operations"). Two property test files:
+`internal/dedup/outbox_property_test.go` (claim/steal/publish/stale-finalize
+against a `Simulated`-clocked `MemoryOutboxStore`, mirrored for the DLQ
+path including `MarkDLQReplayed`'s precondition) and
+`internal/consumer/watermark_property_test.go` (window registration, event
+processing with event times spanning late/on-time/future, watermark
+queries). CI raises rapid's default 100 generated sequences per test to
+5000 via `RAPID_CHECKS` (pure in-memory Go, genuinely free relative to this
+workflow's real Cassandra/Kafka integration tests).
+
+**Two real, previously-undiscovered bugs found — on the very first
+generated sequence, in both cases:**
+
+1. **No fencing on `MarkPublished`/`MarkDLQPublished`.** Neither method
+   checked that the claim being finalized was still the *current* one for
+   its key: `MemoryOutboxStore`'s had no check beyond "does this key
+   exist," and `CassandraOutboxStore`'s CAS conditioned only on
+   `status = 'PUBLISHING'`, discarding whether the CAS actually applied at
+   all. A claimant whose lease genuinely expired and was legitimately
+   stolen by another claimant (the exact scenario `FetchStaleClaims`/the
+   sweeper exist to detect) could still finalize late with its own stale
+   data, silently overwriting the real claimant's Kafka lineage bookkeeping
+   — and, if the stale claimant's own publish attempt was *also* still
+   genuinely in flight (a real Kafka write taking longer than the 30s
+   lease under real degraded conditions, which this exact multi-hour
+   session hit more than once), a genuine duplicate publish. Fixed: both
+   methods now take an `expectedClaimedAt time.Time` (the value `InsertClaim`
+   returned for this specific claim) and only finalize if the record's
+   current `claimed_at` still matches — Cassandra's CAS now conditions on
+   `IF status = 'PUBLISHING' AND claimed_at = ?`, and checks whether it
+   actually applied. Non-matching finalizes return a new
+   `dedup.ErrClaimSuperseded`, not a hard failure (the underlying event was
+   still genuinely published by *someone*). Threaded through all 3
+   production call sites (`internal/ingestion/handler.go`) and the
+   sweeper's 2. New tests prove it against both stores, including a real
+   Cassandra LWT integration test.
+2. **A terminal `REPLAYED` DLQ record was still steal-able.**
+   `InsertClaim`/`InsertDLQClaim`'s steal branch checked only
+   `existing.Status == StatusPublished` before treating an existing record
+   as an abandoned in-flight claim — meaning a `REPLAYED` record (reached
+   via `MarkDLQReplayed`, e.g. a client retrying a stale cached submission
+   long after the original rejection was already fixed and replayed) fell
+   through to the steal branch too, silently mutating its `claimed_at` and
+   incorrectly reporting `Acquired: true` for a row that's supposed to be
+   immutable once terminal. Real Cassandra's own CAS already correctly
+   conditioned on `IF status = 'PUBLISHING'` and was unaffected; only the
+   in-memory store (used by every fast test and, now, every property test)
+   had the gap, despite its own doc comment claiming to "accurately
+   simulate" Cassandra's CAS semantics. Fixed by checking
+   `existing.Status != StatusPublishing` instead of `== StatusPublished`.
+   Pinned with a dedicated hand-written regression test in addition to the
+   property test that found it.
+
+The watermark property test found no bugs after 5000 generated sequences —
+a genuine, useful negative result: `ProcessEvent`/`CurrentWatermark`'s
+monotonic guard and `appendLateAuditIfNotExistsLocked`'s dedup both held up
+robustly across far more interleavings than any hand-written test
+constructs.
+
+**Stage B — deterministic simulation.** New `internal/simulation` package:
+a `Broker` (in-memory, partitioned, FIFO-per-partition with a
+randomized-but-order-preserving delivery delay) implementing
+`kafka.Producer` directly, plus a `SimulatedReader` implementing
+`consumer.MessageReader` whose `FetchMessage` never advances past an
+uncommitted offset — exactly mirroring real kafka-go's manual-commit
+semantics, so "redelivery after a simulated crash" emerges for free from
+correctly modeling that invariant rather than needing a separate mechanism.
+A `Harness` wires the REAL `ingestion.Handler` (submissions driven through
+the actual `HandleEvents` HTTP entry point via `httptest`, not a shortcut
+call into unexported internals), the REAL `ingestion.Sweeper`, and the REAL
+`consumer.Engine` together against this broker plus the already-existing
+`MemoryOutboxStore`/`MemoryCanonicalStore`, all sharing one seeded
+`*rand.Rand` and one `clock.Simulated` — no pipeline logic reimplemented,
+only I/O boundaries swapped, exactly as scoped. Scoped to the
+ingest→outbox→publish→consume→canonical-write path specifically (not
+edge's HTTP/SQLite leg, which already has its own real-infra fault-injection
+coverage, Slice 12/14, and whose local-durability correctness is a
+different problem than this slice's target invariants) — a deliberate,
+documented scope decision, not a silent shortfall against "the entire
+path" language in this slice's original framing.
+
+`TestSimulation_ExactlyOnceAndMonotonicWatermarkAcrossManySeeds` drives 500
+seeds, each a random interleaving of event submission (including
+deliberate resubmission of already-accepted keys — the "retries" scenario),
+broker delivery delay, consumer fetch/commit steps, and sweeper reclamation
+passes, checking after each seed: every idempotency key that ever received
+HTTP 200 was published to the (simulated) broker's own committed log
+*exactly* once (verified from the broker's own record, independent of the
+outbox's own bookkeeping — the specific property Stage A's two bug fixes
+above exist to guarantee), the watermark never regressed at any point
+observed live during the run, and every accepted key eventually reached the
+canonical store. `TestSimulation_SameSeedIsDeterministic` proves the actual
+FoundationDB-style claim this stage exists to make: running the identical
+seed twice, independently, produces a bit-for-bit identical fingerprint
+(accepted order, publish counts, final watermark, canonical store save
+count) — if this ever failed, it would mean some part of the harness was
+silently reaching for real wall-clock time or another non-deterministic
+source instead of the shared seeded `Rng`/`Clock`, undermining every other
+test's own reproducibility.
+
+500 seeds × 150 ticks run in under 10 seconds with `-race` -- nowhere near
+PLAN.md's aspirational 100,000, but the actual bottleneck at that count
+would be re-running this same harness more times, not a fundamental
+scaling limit; raising `numSeeds` is a one-line change if a future
+investigation wants deeper exploration.
+
+Full suite (`go test -race -count=1 -p 1 ./...`, `RAPID_CHECKS=5000`)
+passed cleanly twice in a row.
+
 ### Slice 23 — Chaos Control Panel (extends Slice 21's dashboard)
 
 Scoped 2026-08-31. Today, "this system survives a network partition" is a
