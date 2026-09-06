@@ -2,7 +2,7 @@
 
 A distributed adverse-event ingestion pipeline for clinical trials — built to answer one real interview question honestly: *"design a system to track adverse drug events reported from clinical trials across multiple countries and time zones."*
 
-This is grounded in a verified real interview question from Eli Lilly's Bio-IT / Clinical engineering team. It's a portfolio project, not a commercial product, and it deliberately doesn't compete with real pharmacovigilance platforms (Oracle Argus, ArisGlobal, Veeva Vault Safety). The point is distributed-systems engineering depth — partition tolerance, exactly-once processing, and correct multi-timezone ordering — demonstrated with a pharma-relevant payload, not domain science.
+It's grounded in a verified real interview question from Eli Lilly's Bio-IT / Clinical engineering team, and built out into a working product from there. It's not a broad pharmacovigilance suite competing with Oracle Argus, ArisGlobal, or Veeva Vault Safety — it's a focused answer to one hard piece of that problem: getting federated, multi-region adverse-event data into a central store correctly, with partition tolerance, exactly-once processing, and correct multi-timezone ordering, under real failure conditions.
 
 ## The four problems this actually solves
 
@@ -156,7 +156,7 @@ Every decision, review finding, and fix is in `WORKLOG.md` and `ARCHITECTURE_PRO
 
 ## What's here vs. what's next
 
-This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. Observability (Prometheus + Grafana, Slice 6), a genuine multi-region cluster — dc-us: 3-node Cassandra/RF=3 + 3-broker Kafka, dc-eu: 1-node Cassandra/RF=1 + 1-broker Kafka, MirrorMaker 2 replication, `LOCAL_QUORUM` reads/writes (Slices 7, 14) — real per-site API-key auth and project-owned TLS across every service (Slice 15), real load-test numbers under real multi-site traffic (Slice 16: p95 ~101ms, confirmed per-site rate-limit isolation, the Cassandra outbox's Paxos LWT insert identified as the actual bottleneck), Kubernetes deployment manifests (Slice 17), a real backup/restore drill (Slice 18), 2+ instances of `pharos-consumer` sharing one Kafka consumer group (Slice 19), and durable access-audit logging for every `pharos-cli` query/DLQ/replay action (Slice 20) are all real, not aspirational. A server-rendered web dashboard (Slice 21) and a live chaos-injection control panel for demoing partition/duplicate/clock-skew recovery (Slice 23) sit on top of all of it. Closing the remaining gaps (see `PLAN.md`'s roadmap section, and its own "audit remediation" entries for the honest list of what's still deliberately deferred vs. what was simply found and fixed) is ongoing work, not a gap in what's already been built.
+This is genuinely engineered to production practices, not merely demo-ready — but it hasn't yet been operated in production at scale, and it's worth being direct about that difference rather than implying more maturity than exists. Observability (Prometheus + Grafana, Slice 6), a genuine multi-region cluster — dc-us: 3-node Cassandra/RF=3 + 3-broker Kafka, dc-eu: 1-node Cassandra/RF=1 + 1-broker Kafka, MirrorMaker 2 replication, `LOCAL_QUORUM` reads/writes (Slices 7, 14) — real per-site API-key auth and project-owned TLS across every service (Slice 15), real load-test numbers under real multi-site traffic (Slice 16: p95 ~101ms, confirmed per-site rate-limit isolation, the Cassandra outbox's Paxos LWT insert identified as the actual bottleneck), Kubernetes deployment manifests (Slice 17), a real backup/restore drill (Slice 18), 2+ instances of `pharos-consumer` sharing one Kafka consumer group (Slice 19), and durable access-audit logging for every `pharos-cli` query/DLQ/replay action (Slice 20) are all real, not aspirational. A server-rendered web dashboard (Slice 21) and a live chaos-injection control panel for demoing partition/duplicate/clock-skew recovery (Slice 23) sit on top of all of it. Closing the remaining gaps (see `PLAN.md`'s roadmap section, and its own "audit remediation" entries for the honest list of what's still deliberately deferred vs. what was simply found and fixed) is ongoing work, not a gap in what's already been built.
 
 ### Observability
 
@@ -174,10 +174,14 @@ internal/               Implementation packages, one per concern above plus faul
 migrations/             Cassandra schema (bootstrapped automatically at startup too)
 deploy/                 Dockerfiles and Kubernetes manifests for every service (Slice 17)
 docs/api/               OpenAPI specs for the edge and Central Ingestion HTTP APIs
+docs/security-threat-model.md   Per-component trust boundaries and known gaps
+docs/benchmark-results.md       Real load-test numbers (Slice 16) and how to reproduce them
 PLAN.md                 Living architecture doc — source of truth for every design decision
 ARCHITECTURE_PROPOSALS.md   Proposal/review trail for every non-trivial design change
 WORKLOG.md              Dated log of every implementation session, by whoever did it
+CHANGELOG.md            What shipped, in product terms — see WORKLOG.md for the full story
 CONTRIBUTING.md         Branch/PR/proposal-review workflow
+CODE_OF_CONDUCT.md      Contributor Covenant
 SECURITY.md             Security policy and known, deliberate gaps
 ```
 

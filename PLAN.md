@@ -16,24 +16,31 @@ arriving from clinical trial sites across many countries and time zones, and get
 them into a central store without losing or duplicating data — even when a site
 loses connectivity for hours or days.
 
-**This is a portfolio piece for competitive SWE recruiting, targeted specifically
-at Eli Lilly Bio-IT / Clinical engineering.** It is grounded in a verified real
-interview question from that team: *"design a system to track adverse drug events
-reported from clinical trials across multiple countries and time zones."*
+**This is a real product, grounded in a verified real interview question from
+Eli Lilly's Bio-IT / Clinical engineering team:** *"design a system to track
+adverse drug events reported from clinical trials across multiple countries
+and time zones."* That question names a genuine, documented industry pain
+point — federated pharmacovigilance data collection under partition and
+failure — and this project is a working answer to it, engineered and
+documented to be presented and evaluated as a product, not a classroom
+exercise.
 
 **What this project deliberately is NOT:**
-- Not a domain-science project. Earlier concepts for this portfolio slot (an ML
+- Not a domain-science project. Earlier concepts for this product slot (an ML
   model on tabular pharma data, a distributed molecular docking pipeline, a
   lab-automation protocol compiler) were killed after verification showed mature,
   funded incumbents already own those spaces (VirtualFlow/VinaLC for docking at
   HPC scale; Synthace's Antha + Tecan for lab automation).
-- Not an attempt to replace real pharmacovigilance platforms (Oracle Argus,
-  ArisGlobal, Veeva Vault Safety). We are not competing with them.
-- Not a commercial product.
+- Not an attempt to replace full pharmacovigilance platforms (Oracle Argus,
+  ArisGlobal, Veeva Vault Safety) — those cover case management, regulatory
+  reporting, and signal detection across an entire safety org. Pharos solves
+  one specific, hard piece of that problem well: reliable, correctly-ordered,
+  exactly-once ingestion of adverse-event data from many disconnected sites
+  into a central store.
 
-**What it IS:** a demonstration of distributed-systems engineering depth, using a
-pharma-relevant payload shape (FHIR-ish adverse event records) as the vehicle.
-Correctness under partition and failure is the point — not feature breadth.
+**What it IS:** a distributed-systems product, using a pharma-relevant payload
+shape (FHIR-ish adverse event records) as its real domain. Correctness under
+partition and failure is the point — not feature breadth.
 
 ### On the name
 
@@ -52,8 +59,8 @@ production-ready — those are different bars, and conflating them would be
 dishonest about what's actually been built. Gideon wants this to genuinely
 reach production-hardening eventually, but explicitly chose to sequence it:
 
-1. **Phase 1 (now): make it portfolio-ready.** A README and a working demo
-   that let a reader/interviewer actually understand and see the system run,
+1. **Phase 1 (now): make it demo-ready.** A README and a working demo
+   that let a reader/evaluator actually understand and see the system run,
    accurately representing what exists today — including being explicit about
    what's deliberately out of scope so far, rather than implying more
    maturity than is real.
@@ -767,8 +774,8 @@ verified against real infrastructure the same way every earlier slice was.
   readiness probes wired to the metrics from Slice 6, basic CI image build.
 
   **Done 2026-09-05.** Kubernetes chosen over a vaguer "equivalent IaC" --
-  more recognizable and directly demonstrable for this project's stated
-  recruiting audience. `deploy/docker/Dockerfile.{ingestion,consumer,edge,cli}`
+  more recognizable and directly demonstrable to anyone evaluating this as
+  a real deployment target. `deploy/docker/Dockerfile.{ingestion,consumer,edge,cli}`
   (multi-stage, `CGO_ENABLED=0` scratch images -- every dependency in this
   project, including `modernc.org/sqlite`, is pure Go, so scratch is
   genuinely sufficient, not just minimal for its own sake); `deploy/k8s/`
@@ -1180,7 +1187,7 @@ verified against real infrastructure the same way every earlier slice was.
   outcome branches for real. Full suite (`go test -race -count=1 -p 1
   ./...`) passed cleanly twice in a row.
 
-### Slice 21 — Web dashboard (portfolio accessibility — not production hardening) *(was Slice 14)*
+### Slice 21 — Web dashboard (demo/operator accessibility — not production hardening) *(was Slice 14)*
 
 Scoped 2026-08-31, sequenced separately from every numbered slice above.
 Everything in this project is currently operated via `curl` + `pharos-cli`
@@ -1188,7 +1195,7 @@ Everything in this project is currently operated via `curl` + `pharos-cli`
 challenges are the actual point, and a web frontend proves nothing about
 partition tolerance or exactly-once semantics that the CLI + fault-injection
 suite doesn't already prove better. This slice exists for a narrower
-reason: a non-technical viewer (a recruiter, an interviewer without a
+reason: a non-technical viewer (a prospective customer, a stakeholder without a
 terminal handy) can't run commands, and a browser page they can just look
 at closes that gap. **This is not a production-hardening item — don't let
 it get counted as progress on Slices 8-20, and don't let it block or get
@@ -1296,7 +1303,7 @@ authenticated HTTP endpoint (Slice 15), which is what actually calls
 `RecordAccess` — but a read-only query never leaves this process, so there is
 no equivalent enforcement point to inherit it from. Left unaudited rather
 than retrofitting a required "operator" prompt/cookie: Slice 21's own
-framing is "portfolio accessibility, not production hardening," and gating
+framing is "demo/operator accessibility, not production hardening," and gating
 every dashboard page view behind an identity prompt (the dashboard has no
 identity concept at all today, unlike the CLI's simple self-declared flag)
 would work against that stated goal for a UI whose data was already

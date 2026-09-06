@@ -1,0 +1,52 @@
+name: Bug report
+description: Report incorrect behavior, a regression, or a failed test
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Include steps to reproduce and which service(s) were involved.
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: What did you expect vs. what actually happened?
+      placeholder: A retried submission to pharos-ingestion created a second record instead of being deduplicated...
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Commands, payloads, or a k6/curl script — whatever someone else can follow.
+      placeholder: |
+        1. `docker compose up -d`
+        2. `./scripts/demo.sh` (or a specific `curl`/`pharos-cli` invocation)
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Which service(s) (pharos-edge/ingestion/consumer/dashboard/cli), Docker Compose vs. Kubernetes, commit or image tag.
+      placeholder: docker compose, pharos-ingestion commit abc123...
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: Service logs, `/metrics` output, or `pharos-cli` output if query/audit related.
+      placeholder: Paste redacted logs or output here.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate
+          required: true
