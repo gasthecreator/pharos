@@ -960,6 +960,98 @@ verified against real infrastructure the same way every earlier slice was.
   §2.4 rather than inventing a second audit mechanism — and, once Slice 10
   (DLQ replay) exists, who replayed what belongs in the same audit trail.
 
+  **Done 2026-09-06.** New `internal/audit` package: `Store` interface
+  (`RecordAccess`, `ListByOperator`, `Close`) with a `CassandraStore`
+  (`pharos.access_audit_log`, partitioned by `operator`, clustered by a
+  `timeuuid` `audit_id` DESC for natural newest-first ordering plus
+  per-entry uniqueness with no separate counter) and a `MemoryStore` for
+  `--memory` CLI mode/tests. Named and shaped after `LateArrivalAudit`
+  (§2.4, Slice 13) per PLAN.md's own instruction, but genuinely
+  persisted — `LateArrivalAudit` itself was confirmed, by inspection, to
+  still only ever live in a `WatermarkTracker`'s in-memory state with no
+  Cassandra table and no INSERT anywhere; a real pre-existing gap for its
+  own "21 CFR Part 11" purpose, out of this slice's explicit scope to fix
+  (the instruction was to follow its *pattern*, not extend a mechanism
+  that isn't durable to begin with).
+
+  Wired into `pharos-cli`: a new `--operator` flag, required (and
+  enforced, not just documented) for `query`/`dlq list`/`dlq get` against
+  real Cassandra — `query.Service` has no identity concept of its own
+  (confirmed via `grep -n "^func "` across `internal/query/service.go`),
+  so without this, real access to patient adverse-event data would carry
+  no attributable identity at all. Every one of those commands now
+  records a `RecordAccess` call (outcome derived from the underlying call's
+  own error, so success/failure is never hand-typed twice) after it runs.
+  A new `pharos-cli audit list --operator <name> [--limit <n>]` command
+  reads the trail back — without it, every entry this slice writes would
+  be unread and pointless; --operator here deliberately means the trail
+  being *inspected*, not the inspector, so it isn't defaulted the way
+  query/dlq's self-identity is.
+
+  **Two real, previously-undiscovered bugs found by reading the DLQ replay
+  code, not by hitting a failure first**: (1) `replayDLQRecord` built its
+  HTTP request with zero headers at all — no `X-Site-ID`/`X-API-Key` —
+  meaning `pharos-cli dlq replay` has been silently broken (401) against
+  every real deployment since Slice 15 turned auth on by default, never
+  caught because Slice 15's own testing used curl with explicit headers or
+  `--memory`, never this actual CLI path. (2) the same function's
+  `http.Client{}` carried no TLS trust config at all, so against the
+  HTTPS-with-this-project's-own-CA every real deployment actually runs
+  (per README), replay would *also* fail with "certificate signed by
+  unknown authority" even with the headers fixed — a second gap in the
+  identical function. Fixed both: new `--site-id`/`--api-key` flags sent
+  as headers, and `--ca-cert` (already an existing global flag) now also
+  builds the replay client's `tls.Config` via `tlsutil.ClientConfig.StdTLSConfig()`,
+  the same helper every other TLS client in this project already uses.
+
+  Server-side: `internal/ingestion/handler.go`'s `Handler` gained an
+  `auditStore audit.Store` field and a `SetAuditStore` setter mirroring
+  `SetKeyStore` exactly (opt-in, no breaking change). `HandleDLQReplay`
+  now records one `DLQ_REPLAY` entry per attempt — not just successes —
+  keyed by the *authenticated* site from `auth.SiteIDFromContext` (the
+  real credential the middleware already checked, not a self-declared
+  one), covering not-found/conflict/forbidden/failed/rejected/accepted
+  outcomes. `cmd/pharos-ingestion/main.go` connects a Cassandra-backed
+  audit store using the same `--cassandra-hosts`/`--cassandra-port`/
+  `--cassandra-keyspace`/`--ca-cert` flags every other store already uses,
+  falling back to a process-local `MemoryStore` (with a clear warning) on
+  connection failure rather than failing closed like the API key store:
+  this is a compliance record for an action the auth middleware's
+  site-ownership check already guards, not the security control itself,
+  so an unreachable audit backend blocking all ingestion traffic would be
+  a disproportionate outage for what it protects.
+
+  New tests: `internal/audit`'s own unit tests (3, `MemoryStore`) plus a
+  real-Cassandra integration test (`TestCassandraStore_RealIntegration`,
+  random per-run operator name, proving persistence/ordering/outcome/
+  resource fidelity). `internal/ingestion/auth_test.go` gained two new
+  tests exercising audit recording through the *genuine* `RequireAPIKey`
+  middleware path (not a direct `HandleDLQReplay` call, since the
+  authenticated-site context key is deliberately unexported outside
+  `internal/auth`): one proving a successful self-replay records a
+  `SUCCESS` entry, one proving a cross-site *forbidden* replay attempt is
+  still recorded (with an outcome mentioning why) — "who tried what"
+  matters for compliance as much as "who succeeded."
+
+  **Verified live, not assumed**, against the real running stack (not the
+  test suite): built real `pharos-cli`/`pharos-ingestion` binaries, ran
+  ingestion with real TLS + auth enabled (the actual default), created a
+  real site API key, submitted a real malformed event that landed in the
+  real DLQ with a real idempotency key, then round-tripped `dlq list`/
+  `dlq get` and confirmed both showed up seconds later via
+  `pharos-cli audit list --operator compliance-officer@test` reading real
+  rows back from Cassandra. Replayed that still-invalid record via the
+  now-fixed CLI path and got a real structured HTTP 422 (proving the auth
+  headers and TLS trust fix actually work — this would previously have
+  been a bare 401 or a TLS handshake error) whose `DLQ_REPLAY` audit entry
+  landed under the *site's own* operator identity, not the CLI's. Then
+  seeded a second, validly-payloaded DLQ record directly through the real
+  `CassandraOutboxStore` (mirroring the existing unit test's own approach,
+  just against real Cassandra) and replayed it for a genuine HTTP 200 —
+  confirmed a `SUCCESS` audit entry landed for that one too, proving both
+  outcome branches for real. Full suite (`go test -race -count=1 -p 1
+  ./...`) passed cleanly twice in a row.
+
 ### Slice 21 — Web dashboard (portfolio accessibility — not production hardening) *(was Slice 14)*
 
 Scoped 2026-08-31, sequenced separately from every numbered slice above.

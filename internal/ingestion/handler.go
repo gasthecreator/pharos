@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/kafka"
@@ -57,6 +59,7 @@ type Handler struct {
 	producer     kafka.Producer
 	leaseTimeout time.Duration
 	keyStore     auth.KeyStore // nil disables per-site API key auth (§2.1, §2.2, Slice 15)
+	auditStore   audit.Store   // nil disables DLQ-replay access-audit recording (§2.4, Slice 20)
 	keyLocks     sync.Map      // In-process per-key mutex map as optimization layer (§2.2)
 
 	// Observability counters
@@ -97,6 +100,43 @@ func NewHandlerWithOutbox(limiter ratelimit.RateLimiter, outbox dedup.OutboxStor
 // the handler is built.
 func (h *Handler) SetKeyStore(store auth.KeyStore) {
 	h.keyStore = store
+}
+
+// SetAuditStore enables access-audit recording (§2.4, Slice 20) for DLQ
+// replay -- "who replayed what," in the same pharos.access_audit_log trail
+// pharos-cli's own query/dlq-inspection commands write to, per PLAN.md's
+// explicit instruction not to build a second mechanism. Kept as a
+// post-construction setter mirroring SetKeyStore exactly, for the same
+// reason: opt-in per deployment, no breaking change to existing callers.
+func (h *Handler) SetAuditStore(store audit.Store) {
+	h.auditStore = store
+}
+
+// recordReplayAudit writes one DLQ_REPLAY entry keyed by the authenticated
+// site (the actual credential HandleDLQReplay checked, not a self-declared
+// identity) if an audit store is configured. Recording failures are logged
+// via fmt to stderr-equivalent (this package has no logger dependency
+// today) rather than surfaced to the HTTP caller: a replay that genuinely
+// succeeded or failed already has its own real HTTP status: reporting an
+// audit-write hiccup as if the replay itself failed would be misleading in
+// the opposite, more dangerous direction -- masking a real success as an
+// error.
+func (h *Handler) recordReplayAudit(ctx context.Context, r *http.Request, resource, outcome string) {
+	if h.auditStore == nil {
+		return
+	}
+	operator, ok := auth.SiteIDFromContext(r.Context())
+	if !ok {
+		operator = "unauthenticated"
+	}
+	if err := h.auditStore.RecordAccess(ctx, audit.AccessAudit{
+		Operator: operator,
+		Action:   "DLQ_REPLAY",
+		Resource: resource,
+		Outcome:  outcome,
+	}); err != nil {
+		log.Printf("WARNING: failed to record DLQ replay access-audit entry for %s: %v", resource, err)
+	}
 }
 
 func (h *Handler) lockKey(key string) func() {
@@ -582,6 +622,7 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "dlq record not found: " + err.Error()})
+		h.recordReplayAudit(r.Context(), r, key, "ERROR: not found: "+err.Error())
 		return
 	}
 	if rec.Status != dedup.StatusPublished {
@@ -590,6 +631,7 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": fmt.Sprintf("cannot replay %s: record status is %s, expected PUBLISHED", key, rec.Status),
 		})
+		h.recordReplayAudit(r.Context(), r, key, fmt.Sprintf("ERROR: not PUBLISHED (status=%s)", rec.Status))
 		return
 	}
 
@@ -602,6 +644,7 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"error": fmt.Sprintf("authenticated as site %s, cannot replay a DLQ record owned by site %s", authenticatedSiteID, rec.SiteID),
 		})
+		h.recordReplayAudit(r.Context(), r, key, fmt.Sprintf("ERROR: forbidden, authenticated site %s does not own this record (site %s)", authenticatedSiteID, rec.SiteID))
 		return
 	}
 
@@ -620,16 +663,20 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 				"result":  outcome.Result,
 				"warning": "replay succeeded but failed to mark the original DLQ record replayed: " + markErr.Error(),
 			})
+			h.recordReplayAudit(r.Context(), r, key, "SUCCESS (warning: failed to mark original DLQ record replayed: "+markErr.Error()+")")
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(outcome.Result)
+		h.recordReplayAudit(r.Context(), r, key, "SUCCESS")
 	case outcomeFailed:
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(outcome.Result)
+		h.recordReplayAudit(r.Context(), r, key, "ERROR: transient failure: "+outcome.Result.Error)
 	default: // outcomeRejected: still invalid, original DLQ record untouched
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		_ = json.NewEncoder(w).Encode(outcome.Result)
+		h.recordReplayAudit(r.Context(), r, key, "ERROR: still rejected: "+outcome.Result.Error)
 	}
 }
 
