@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/dashboard"
 	"github.com/gasthecreator/pharos/internal/query"
 	"github.com/gasthecreator/pharos/internal/tlsutil"
@@ -31,9 +32,11 @@ func main() {
 	log.Printf("[pharos-dashboard] Starting on port %d...", *port)
 
 	var svc query.Service
+	var auditStore audit.Store
 	if *useMemory {
 		log.Println("[pharos-dashboard] Running with in-memory sample data (--memory)")
 		svc = query.NewMemoryService()
+		auditStore = audit.NewMemoryStore()
 	} else {
 		cfg := query.DefaultCassandraServiceConfig()
 		cfg.Hosts = strings.Split(*cassandraHosts, ",")
@@ -48,8 +51,34 @@ func main() {
 		}
 		svc = cSvc
 		log.Printf("[pharos-dashboard] Connected to Cassandra at %s:%d (keyspace: %s)", *cassandraHosts, *cassandraPort, *cassandraKeyspace)
+
+		// Read-side access-audit trail (§2.4, Slice 20/21: every view of real
+		// adverse-event data through this dashboard, the same trail
+		// pharos-cli's own --operator flag writes to). Falls back to a
+		// process-local MemoryStore on connection failure rather than
+		// failing closed: this is a compliance record, not the security
+		// control itself (there is none here to begin with -- PLAN.md's own
+		// explicit scope decision), so refusing to serve the dashboard over
+		// an unreachable audit backend would be a disproportionate outage
+		// for what it protects.
+		auditCfg := audit.DefaultCassandraConfig()
+		auditCfg.Hosts = strings.Split(*cassandraHosts, ",")
+		auditCfg.Port = *cassandraPort
+		auditCfg.Keyspace = *cassandraKeyspace
+		if *caCert != "" {
+			auditCfg.TLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+		}
+		aStore, err := audit.NewCassandraStore(auditCfg)
+		if err != nil {
+			log.Printf("[pharos-dashboard] WARNING: access-audit store connection failed: %v. Falling back to a process-local MemoryStore (dashboard access-audit entries will not survive a restart).", err)
+			auditStore = audit.NewMemoryStore()
+		} else {
+			auditStore = aStore
+			log.Println("[pharos-dashboard] Read-side access-audit trail connected (§2.4, Slice 20/21).")
+		}
 	}
 	defer svc.Close()
+	defer auditStore.Close()
 
 	chaosOpts := dashboard.ChaosOptions{
 		Enabled:             *enableChaos,
@@ -59,7 +88,7 @@ func main() {
 	if *enableChaos {
 		log.Println("[pharos-dashboard] WARNING: --enable-chaos is set -- the Chaos Control Panel can stop/restart real Cassandra nodes and partition dc-us/dc-eu. Only run this on a local/demo instance.")
 	}
-	handler, err := dashboard.NewHandler(svc, *centralURL, *grafanaURL, *caCert, chaosOpts)
+	handler, err := dashboard.NewHandler(svc, auditStore, *centralURL, *grafanaURL, *caCert, chaosOpts)
 	if err != nil {
 		log.Fatalf("[pharos-dashboard] Failed to initialize handler: %v", err)
 	}

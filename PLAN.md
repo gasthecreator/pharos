@@ -1307,6 +1307,33 @@ name, mirroring the CLI's own `--operator` flag, would let these three
 handlers call `audit.Store.RecordAccess` exactly the way `pharos-cli`'s
 `recordAccess` helper already does.
 
+**Resolved 2026-09-06 (audit remediation):** closed exactly as the
+paragraph above described it would be closed, on request. A session cookie
+(`pharos_operator`, no `Expires`/`MaxAge` — deliberately not a persistent
+login) captures a self-declared operator name via a new `/operator`
+GET/POST form; every read of real adverse-event data —
+`handleIndex`/`handleQuery`/`handleDLQList`/`handleDLQDetail` (the recent-
+events feed included: it shows the identical sensitive fields as the query
+views and has no CLI equivalent to inherit auditing from, so it was brought
+into scope alongside the three originally named) — now redirects to that
+form if no operator cookie is set yet, then calls
+`audit.Store.RecordAccess` afterward, mirroring `pharos-cli`'s own
+`recordAccess` helper action-string-for-action-string (`QUERY_EVENT`,
+`QUERY_SITE`, `QUERY_STUDY`, `DLQ_LIST`, `DLQ_GET`, plus a new
+`LIST_RECENT` for the feed) so the two surfaces write into one coherent
+trail, not two parallel ones. `/submit` and `/chaos` stay deliberately
+ungated — the reasoning above for why still holds unchanged for those two.
+Verified live: ran the real binary against the live cluster, hit `/` with
+no cookie and got redirected to `/operator?next=%2F`, posted an operator
+name and got redirected back with the cookie set (`Set-Cookie:
+pharos_operator=...; HttpOnly; SameSite=Lax`, no `Expires`), then confirmed
+via `pharos-cli audit list --operator <name>` that the dashboard's own
+`LIST_RECENT`/`DLQ_LIST` views landed in the exact same
+`access_audit_log` table the CLI's commands write to — one shared trail,
+not two. `scripts/demo.sh` updated to identify as an operator before its
+own dashboard query check, and to confirm that view shows up in the same
+operator's audit trail the CLI commands above it already populated.
+
 **Verified live, not assumed**: built the real binary, ran it against the
 live Cassandra cluster's genuine accumulated data from this session's
 earlier slices (the recent-events feed rendered real fault-injection/load-test

@@ -40,6 +40,63 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Slice 21 — dashboard read-side access-audit logging (closes the deferred gap)
+
+**Author:** Claude Code
+
+**What:** Every view of real adverse-event data through the web dashboard
+(recent-events feed, query, DLQ list/detail) now writes to the same durable
+access-audit trail `pharos-cli`'s `--operator` flag already writes to,
+closing the asymmetry Slice 21's own writeup deliberately left open
+pending exactly this. New `/operator` GET/POST route: a session cookie
+(`pharos_operator`, no `Expires`/`MaxAge`) captures a self-declared
+operator name once per browser; the four read handlers redirect there if
+unset, then record access afterward with `pharos-cli`-matching action
+strings (`QUERY_EVENT`, `QUERY_SITE`, `QUERY_STUDY`, `DLQ_LIST`, `DLQ_GET`,
+plus a new `LIST_RECENT` for the feed, which has no CLI equivalent to
+inherit from but shows the identical sensitive fields as the query views).
+`/submit` and `/chaos` stay ungated (their own existing accountability —
+per-request site credentials, and "infrastructure action, not patient
+data" — already covers them).
+
+**Why:** Direct follow-up ask, naming the deferred item by its own
+documented title.
+
+**How:** `internal/dashboard.Handler` gained an `audit.Store` field
+(`cmd/pharos-dashboard` wires it the same way `pharos-ingestion` already
+does: Cassandra-backed, falling back to a process-local `MemoryStore` on
+connection failure since this is a compliance record, not the security
+control itself). A `requireOperator` helper redirects to `/operator?next=`
+when no cookie is set; `safeNextPath` restricts that redirect target to a
+same-origin relative path so `next` (a caller-controlled value) can't be
+turned into an open redirect. `recordAccess` mirrors `cmd/pharos-cli`'s own
+helper exactly, including recording failed lookups, not just successes.
+
+**Files/modules touched:** `internal/dashboard/dashboard.go`,
+`internal/dashboard/chaos.go` (added an always-empty `Operator` field so
+the shared layout template can reference it safely), `cmd/pharos-dashboard/main.go`,
+`internal/dashboard/templates/{layout,operator}.html` (new template),
+`scripts/demo.sh` (identifies as an operator before its dashboard query
+check, then confirms that view landed in the shared audit trail),
+`PLAN.md`, `SECURITY.md`.
+
+**Tests added/updated:** `internal/dashboard/operator_test.go` (new):
+redirect-without-cookie for all four gated routes, cookie set/redirect on
+successful operator submission (asserting no `Expires`/`MaxAge`), empty-
+operator submission rejected server-side, `safeNextPath`'s open-redirect
+rejection, and two audit-recording tests (one confirming every gated
+handler's exact action/resource lands in the trail, one confirming a
+failed lookup still gets recorded). All nine pre-existing dashboard tests
+for the four now-gated handlers updated to carry an operator cookie.
+Verified live against the real Cassandra cluster: redirect →
+`POST /operator` → `Set-Cookie` (no `Expires`) → real query rendered →
+`pharos-cli audit list --operator <name>` shows the dashboard's own
+`LIST_RECENT`/`DLQ_LIST` entries in the identical `access_audit_log` table
+the CLI writes to.
+
+**Follow-ups / left open:** None — this was the one specific gap named,
+and it's fully closed.
+
 ## [2026-09-06] Claude Code: Slice 17 — multi-node kind retry (item #6 follow-up)
 
 **Author:** Claude Code

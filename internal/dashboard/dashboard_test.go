@@ -9,13 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/query"
 )
 
 func newTestHandler(t *testing.T, svc query.Service, centralURL string) *Handler {
 	t.Helper()
-	h, err := NewHandler(svc, centralURL, "http://localhost:3000", "", ChaosOptions{})
+	h, err := NewHandler(svc, audit.NewMemoryStore(), centralURL, "http://localhost:3000", "", ChaosOptions{})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}
@@ -72,6 +73,7 @@ func TestHandleIndex_RendersRecentEvents(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -103,6 +105,7 @@ func TestHandleQuery_NoIDShowsBlankForm(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/query", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -119,6 +122,7 @@ func TestHandleQuery_ByEvent(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/query?type=event&id=SITE-DASH-01:1", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -135,6 +139,7 @@ func TestHandleQuery_ByEventNotFound(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/query?type=event&id=NOPE:999", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -151,6 +156,7 @@ func TestHandleQuery_BySite(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/query?type=site&id=SITE-DASH-01", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -167,6 +173,7 @@ func TestHandleQuery_InvalidFromTimeShowsError(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/query?type=study&id=STUDY-DASH&from=not-a-time", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 
@@ -183,6 +190,7 @@ func TestHandleDLQList_AndDetail(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	listReq := httptest.NewRequest(http.MethodGet, "/dlq?site=SITE-DASH-01", nil)
+	listReq.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	listRec := httptest.NewRecorder()
 	mux.ServeHTTP(listRec, listReq)
 	if listRec.Code != http.StatusOK {
@@ -193,6 +201,7 @@ func TestHandleDLQList_AndDetail(t *testing.T) {
 	}
 
 	detailReq := httptest.NewRequest(http.MethodGet, "/dlq/SITE-DASH-01:99", nil)
+	detailReq.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	detailRec := httptest.NewRecorder()
 	mux.ServeHTTP(detailRec, detailReq)
 	if detailRec.Code != http.StatusOK {
@@ -212,6 +221,7 @@ func TestHandleDLQDetail_NotFoundIs404(t *testing.T) {
 	mux := newTestMux(t, svc, "http://unused.example")
 
 	req := httptest.NewRequest(http.MethodGet, "/dlq/NOPE:1", nil)
+	req.AddCookie(&http.Cookie{Name: operatorCookieName, Value: "test-operator"})
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
 

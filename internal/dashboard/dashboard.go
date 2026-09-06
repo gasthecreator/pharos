@@ -9,10 +9,16 @@
 // human at the browser to supply the real owning site's own credentials
 // per request; the dashboard never stores or remembers them.
 //
-// Read-only query/DLQ views deliberately record no access-audit entry,
-// unlike pharos-cli's equivalent commands (§2.4, Slice 20: --operator
-// required, every call audited) -- see PLAN.md's Slice 21 writeup ("Read-side
-// audit asymmetry") for the reasoning and what closing this gap would need.
+// Every view of real adverse-event data (the recent-events feed, query,
+// DLQ list/detail) now records an access-audit entry, keyed by a
+// self-declared operator name captured once per browser via a session
+// cookie -- closing the asymmetry with pharos-cli's own --operator
+// requirement (§2.4, Slice 20) that PLAN.md's Slice 21 writeup originally
+// left open, deliberately, pending exactly this. /submit and /chaos are not
+// gated: submitting a test event already requires the real owning site's
+// own credentials per request (a stronger, per-action accountability than
+// operator self-declaration), and the chaos panel is an infrastructure
+// action, not a view of patient data.
 package dashboard
 
 import (
@@ -23,16 +29,25 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/query"
 	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
+
+// operatorCookieName holds the self-declared operator identity captured by
+// handleOperatorForm. Deliberately a session cookie (no Max-Age/Expires):
+// this is an audit-trail identity, not a "remember me" convenience, so it
+// should not silently outlive the browser session it was entered in.
+const operatorCookieName = "pharos_operator"
 
 //go:embed templates/*.html
 var templateFS embed.FS
@@ -51,6 +66,7 @@ type ChaosOptions struct {
 // Handler serves every pharos-dashboard route.
 type Handler struct {
 	svc        query.Service
+	auditStore audit.Store
 	centralURL string
 	grafanaURL string
 	httpClient *http.Client
@@ -72,8 +88,10 @@ type Handler struct {
 // requirement pharos-cli's own dlq replay path needs (§2.4, Slice 20 fixed
 // this exact gap there; the dashboard's proxy path needs it for the same
 // reason: every real deployment runs Central Ingestion behind this
-// project's self-signed CA, not a publicly trusted one).
-func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string, chaos ChaosOptions) (*Handler, error) {
+// project's self-signed CA, not a publicly trusted one). auditStore records
+// who viewed real adverse-event data through this dashboard, the same
+// trail pharos-cli's own --operator flag writes to.
+func NewHandler(svc query.Service, auditStore audit.Store, centralURL, grafanaURL, caCert string, chaos ChaosOptions) (*Handler, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	if caCert != "" {
 		tlsCfg, err := (tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}).StdTLSConfig()
@@ -88,6 +106,7 @@ func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string, chaos 
 	}
 	return &Handler{
 		svc:        svc,
+		auditStore: auditStore,
 		centralURL: strings.TrimRight(centralURL, "/"),
 		grafanaURL: grafanaURL,
 		httpClient: client,
@@ -103,7 +122,7 @@ func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string, chaos 
 // colliding with each other, since html/template's block/define names are
 // only scoped within one template.Template.
 func loadTemplates() (map[string]*template.Template, error) {
-	pages := []string{"index.html", "query.html", "dlq_list.html", "dlq_detail.html", "submit.html", "chaos.html"}
+	pages := []string{"index.html", "query.html", "dlq_list.html", "dlq_detail.html", "submit.html", "chaos.html", "operator.html"}
 	out := make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -145,6 +164,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /submit", h.handleSubmitForm)
 	mux.HandleFunc("POST /submit", h.handleSubmitPost)
 	mux.HandleFunc("GET /healthz", h.handleHealth)
+	mux.HandleFunc("GET /operator", h.handleOperatorForm)
+	mux.HandleFunc("POST /operator", h.handleOperatorSubmit)
 
 	// Chaos Control Panel (§2.4, PLAN.md Slice 23) -- registered
 	// unconditionally so /chaos always exists and clearly reports itself as
@@ -167,9 +188,108 @@ func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// currentOperator returns the self-declared operator identity captured for
+// this browser, or "" if none has been set yet.
+func (h *Handler) currentOperator(r *http.Request) string {
+	c, err := r.Cookie(operatorCookieName)
+	if err != nil {
+		return ""
+	}
+	return c.Value
+}
+
+// safeNextPath restricts an operator-form redirect target to a same-origin
+// relative path -- next comes from a query/form value a caller controls, so
+// accepting an absolute URL (e.g. "//evil.example.com") would turn this
+// into an open redirect. Anything that doesn't look like a plain local
+// path falls back to "/".
+func safeNextPath(next string) string {
+	if next == "" || !strings.HasPrefix(next, "/") || strings.HasPrefix(next, "//") {
+		return "/"
+	}
+	return next
+}
+
+// requireOperator redirects to the operator-identification form when this
+// browser has no operator cookie yet, returning ok=false so the caller
+// stops handling the current request. next is the original request the
+// caller should return to once an operator is set.
+func (h *Handler) requireOperator(w http.ResponseWriter, r *http.Request) (operator string, ok bool) {
+	operator = h.currentOperator(r)
+	if operator != "" {
+		return operator, true
+	}
+	http.Redirect(w, r, "/operator?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
+	return "", false
+}
+
+// recordAccess writes one entry to the access-audit trail (§2.4, Slice 20)
+// for a real view of adverse-event data through the dashboard -- the exact
+// same trail, and the same "record even on error" reasoning, as
+// cmd/pharos-cli's own recordAccess helper: an operator who successfully
+// viewed real data should still see it even if the audit write itself had
+// a transient problem, and a failed lookup is itself worth recording (who
+// tried to access what, not just who succeeded).
+func (h *Handler) recordAccess(ctx context.Context, operator, action, resource string, err error) {
+	outcome := "SUCCESS"
+	if err != nil {
+		outcome = "ERROR: " + err.Error()
+	}
+	if auditErr := h.auditStore.RecordAccess(ctx, audit.AccessAudit{
+		Operator: operator,
+		Action:   action,
+		Resource: resource,
+		Outcome:  outcome,
+	}); auditErr != nil {
+		log.Printf("[pharos-dashboard] WARNING: failed to record access-audit entry for %s %s: %v", action, resource, auditErr)
+	}
+}
+
+// operatorData mirrors what operator.html actually renders. Operator is
+// deliberately left unset (unlike every other page's data type) -- the
+// "Viewing as X · switch" banner layout.html renders from it would be
+// redundant while already on the identify-yourself page itself.
+type operatorData struct {
+	GrafanaURL      string
+	Operator        string
+	CurrentOperator string
+	Next            string
+}
+
+func (h *Handler) handleOperatorForm(w http.ResponseWriter, r *http.Request) {
+	h.render(w, "operator.html", operatorData{
+		GrafanaURL:      h.grafanaURL,
+		CurrentOperator: h.currentOperator(r),
+		Next:            safeNextPath(r.URL.Query().Get("next")),
+	})
+}
+
+func (h *Handler) handleOperatorSubmit(w http.ResponseWriter, r *http.Request) {
+	operator := strings.TrimSpace(r.FormValue("operator"))
+	next := safeNextPath(r.FormValue("next"))
+	if operator == "" {
+		h.render(w, "operator.html", operatorData{
+			GrafanaURL: h.grafanaURL,
+			Next:       next,
+		})
+		return
+	}
+	// Deliberately no Expires/MaxAge (see operatorCookieName's own docs):
+	// this is an audit identity, not a persistent login.
+	http.SetCookie(w, &http.Cookie{
+		Name:     operatorCookieName,
+		Value:    operator,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
+	http.Redirect(w, r, next, http.StatusFound)
+}
+
 // indexData mirrors what index.html actually renders.
 type indexData struct {
 	GrafanaURL string
+	Operator   string
 	Events     []*consumer.CanonicalRecord
 }
 
@@ -182,17 +302,23 @@ func (h *Handler) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	operator, ok := h.requireOperator(w, r)
+	if !ok {
+		return
+	}
 	events, err := h.svc.ListRecentEvents(r.Context(), 100)
+	h.recordAccess(r.Context(), operator, "LIST_RECENT", "ALL_SITES", err)
 	if err != nil {
 		http.Error(w, "failed to load recent events: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	h.render(w, "index.html", indexData{GrafanaURL: h.grafanaURL, Events: events})
+	h.render(w, "index.html", indexData{GrafanaURL: h.grafanaURL, Operator: operator, Events: events})
 }
 
 // queryData mirrors what query.html actually renders.
 type queryData struct {
 	GrafanaURL   string
+	Operator     string
 	Type, ID     string
 	From, To     string
 	MinSeq       string
@@ -203,9 +329,14 @@ type queryData struct {
 }
 
 func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.requireOperator(w, r)
+	if !ok {
+		return
+	}
 	q := r.URL.Query()
 	data := queryData{
 		GrafanaURL: h.grafanaURL,
+		Operator:   operator,
 		Type:       q.Get("type"),
 		ID:         q.Get("id"),
 		From:       q.Get("from"),
@@ -225,6 +356,7 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 	switch data.Type {
 	case "event":
 		rec, err := h.svc.GetEvent(ctx, data.ID)
+		h.recordAccess(ctx, operator, "QUERY_EVENT", data.ID, err)
 		if err != nil {
 			data.Error = "Event not found: " + err.Error()
 		} else {
@@ -243,6 +375,7 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		records, err := h.svc.GetEventsBySite(ctx, data.ID, minSeq)
+		h.recordAccess(ctx, operator, "QUERY_SITE", data.ID, err)
 		if err != nil {
 			data.Error = "Query failed: " + err.Error()
 		} else {
@@ -272,6 +405,7 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 			endTime = parsed
 		}
 		records, err := h.svc.GetEventsByStudy(ctx, data.ID, startTime, endTime)
+		h.recordAccess(ctx, operator, "QUERY_STUDY", data.ID, err)
 		if err != nil {
 			data.Error = "Query failed: " + err.Error()
 		} else {
@@ -288,14 +422,19 @@ func (h *Handler) handleQuery(w http.ResponseWriter, r *http.Request) {
 // dlqListData mirrors what dlq_list.html actually renders.
 type dlqListData struct {
 	GrafanaURL string
+	Operator   string
 	SiteID     string
 	Error      string
 	Records    []*query.DLQRecord
 }
 
 func (h *Handler) handleDLQList(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.requireOperator(w, r)
+	if !ok {
+		return
+	}
 	siteID := r.URL.Query().Get("site")
-	data := dlqListData{GrafanaURL: h.grafanaURL, SiteID: siteID}
+	data := dlqListData{GrafanaURL: h.grafanaURL, Operator: operator, SiteID: siteID}
 
 	var records []*query.DLQRecord
 	var err error
@@ -304,6 +443,11 @@ func (h *Handler) handleDLQList(w http.ResponseWriter, r *http.Request) {
 	} else {
 		records, err = h.svc.ListAllDLQEvents(r.Context(), 100)
 	}
+	listResource := siteID
+	if listResource == "" {
+		listResource = "ALL_SITES"
+	}
+	h.recordAccess(r.Context(), operator, "DLQ_LIST", listResource, err)
 	if err != nil {
 		data.Error = "DLQ query failed: " + err.Error()
 	} else {
@@ -315,19 +459,25 @@ func (h *Handler) handleDLQList(w http.ResponseWriter, r *http.Request) {
 // dlqDetailData mirrors what dlq_detail.html actually renders.
 type dlqDetailData struct {
 	GrafanaURL   string
+	Operator     string
 	Record       *query.DLQRecord
 	ReplayResult string
 	ReplayError  bool
 }
 
 func (h *Handler) handleDLQDetail(w http.ResponseWriter, r *http.Request) {
+	operator, ok := h.requireOperator(w, r)
+	if !ok {
+		return
+	}
 	key := r.PathValue("key")
 	rec, err := h.svc.GetDLQEvent(r.Context(), key)
+	h.recordAccess(r.Context(), operator, "DLQ_GET", key, err)
 	if err != nil {
 		http.Error(w, "DLQ event not found: "+err.Error(), http.StatusNotFound)
 		return
 	}
-	h.render(w, "dlq_detail.html", dlqDetailData{GrafanaURL: h.grafanaURL, Record: rec})
+	h.render(w, "dlq_detail.html", dlqDetailData{GrafanaURL: h.grafanaURL, Operator: operator, Record: rec})
 }
 
 // dlqReplayResponse mirrors internal/ingestion.Handler.HandleDLQReplay's
@@ -410,7 +560,11 @@ func (h *Handler) replayDLQRecord(ctx context.Context, idempotencyKey, siteID, a
 
 // submitData mirrors what submit.html actually renders.
 type submitData struct {
-	GrafanaURL  string
+	GrafanaURL string
+	// Operator is always left unset -- /submit is deliberately not
+	// operator-gated (see this package's own doc comment for why), so
+	// layout.html's "Viewing as" banner never renders here.
+	Operator    string
 	SiteID      string
 	Payload     string
 	Result      string

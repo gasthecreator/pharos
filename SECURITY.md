@@ -28,12 +28,14 @@ As of this writing:
   only under real memory constraints; see PLAN.md Slice 15's addendum for
   what changed. Not yet carried into the Kubernetes deployment (`deploy/k8s/`
   keeps its original client-only TLS scope).
-- Every `pharos-cli` query/DLQ/replay action is recorded in a durable
-  access-audit trail, keyed by a required `--operator` (Slice 20); the
-  web dashboard's DLQ replay/submit actions inherit this too, since those
-  proxy through the same authenticated Central Ingestion endpoint. Its
-  read-only query/DLQ views do not (see PLAN.md's Slice 21 "Read-side audit
-  asymmetry" for why, and what closing it would need).
+- Every `pharos-cli` query/DLQ/replay action, and every real view of
+  adverse-event data through the web dashboard (recent-events feed, query,
+  DLQ list/detail), is recorded in one durable, shared access-audit trail —
+  keyed by a required `--operator` for the CLI, and by a self-declared
+  operator name captured once per browser via a session cookie for the
+  dashboard (no `Expires`/`MaxAge` — not a persistent login). See PLAN.md's
+  Slice 21 addendum for how this closed the asymmetry an earlier pass here
+  had left open.
 
 ## Known, deliberate gaps
 
