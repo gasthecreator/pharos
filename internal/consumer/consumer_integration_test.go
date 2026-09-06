@@ -100,7 +100,17 @@ func TestCassandraCanonicalStore_RealIntegration(t *testing.T) {
 }
 
 func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// 30s, not 15s (§2.4, PLAN.md Slice 18: Backup & disaster recovery) --
+	// this ctx's own deadline is also the budget stepCtx below carves its
+	// own window out of, so real setup time (Cassandra connect, Kafka
+	// publish) already spends part of a tight budget before Step() ever
+	// runs. Bumped after this test started failing intermittently
+	// specifically when run as part of the full suite (never alone) once
+	// two new long-running fault-injection tests extended the suite's
+	// total duration -- confirmed via docker stats as genuine host CPU
+	// saturation (~750% across containers on a machine with far fewer
+	// cores), not a correctness regression.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	// 1. Connect to Cassandra
@@ -176,7 +186,7 @@ func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {
 	engine := NewEngine(reader, store, tracker, engineCfg)
 
 	// 5. Consume until our published message is processed
-	stepCtx, stepCancel := context.WithTimeout(ctx, 15*time.Second)
+	stepCtx, stepCancel := context.WithTimeout(ctx, 20*time.Second)
 	defer stepCancel()
 
 	var rec *CanonicalRecord

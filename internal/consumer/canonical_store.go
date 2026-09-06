@@ -35,6 +35,21 @@ type CassandraStoreConfig struct {
 	// Slice 14: Multi-Region Cassandra + Kafka) -- see that type's docs.
 	LocalDC   string
 	RemoteDCs map[string]int
+	// RestrictToLocalDC, when true, scopes gocql's own host awareness to
+	// LocalDC only (via gocql.DataCentreHostFilter), so it never attempts
+	// background connections to the other DC's nodes at all -- default
+	// false, since LOCAL_QUORUM never needs those connections anyway and
+	// existing callers' behavior shouldn't change. This matters
+	// specifically for a genuine cross-region failover (§2.4, PLAN.md
+	// Slice 18: Backup & disaster recovery): reconfiguring LocalDC to the
+	// surviving region during a real outage of the other one, without
+	// this, still leaves gocql trying (and hanging, sometimes for
+	// minutes) to reconnect to the now-genuinely-dead region's hosts as
+	// part of its normal peer-awareness -- found by watching
+	// TestCrossRegionFailover_DcEuServesLocalQuorumWhenDcUsUnreachable
+	// hang on store.Close() waiting for exactly those stuck background
+	// reconnect goroutines, not anticipated up front.
+	RestrictToLocalDC bool
 	// TLS mirrors dedup.CassandraConfig's field -- see that type's docs.
 	TLS *tlsutil.ClientConfig
 }
@@ -109,6 +124,19 @@ func newClusterConfig(cfg CassandraStoreConfig, keyspace string) (*gocql.Cluster
 		// DC-aware host selection (§2.4, Slice 14) -- see dedup.CassandraConfig's
 		// LocalDC docs for why this matters once a second DC genuinely exists.
 		cluster.PoolConfig.HostSelectionPolicy = gocql.TokenAwareHostPolicy(gocql.DCAwareRoundRobinPolicy(cfg.LocalDC))
+		if cfg.RestrictToLocalDC {
+			// WhiteListHostFilter (by connect address), not
+			// DataCentreHostFilter (by DC name): gocql applies HostFilter
+			// to the very first contact host before it has ever
+			// connected, so the host's DataCenter() is still empty at
+			// that point -- DataCentreHostFilter(cfg.LocalDC) rejects
+			// even the host we explicitly gave it, since "" != cfg.LocalDC,
+			// leaving zero connections. Matching by address sidesteps
+			// that ordering problem entirely. Found by trying
+			// DataCentreHostFilter first and getting "no connections were
+			// made when creating the session."
+			cluster.HostFilter = gocql.WhiteListHostFilter(cfg.Hosts...)
+		}
 	}
 	if cfg.TLS != nil {
 		sslOpts, err := cfg.TLS.GocqlSslOptions()
