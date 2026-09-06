@@ -1,0 +1,34 @@
+{{define "title"}}Pharos — DLQ{{end}}
+{{define "content"}}
+<h1>Dead-Letter Rejected Events</h1>
+<p class="subtitle">Events that failed FHIR validation, with their structured rejection reasons.</p>
+
+<form class="panel" method="GET" action="/dlq">
+  <label>Filter by site (optional)</label>
+  <input type="text" name="site" value="{{.SiteID}}" placeholder="e.g. SITE-US-01">
+  <button type="submit">Filter</button>
+</form>
+
+{{if .Error}}<div class="result-err">{{.Error}}</div>{{end}}
+
+{{if not .Records}}
+  <p class="empty">No dead-letter events found.</p>
+{{else}}
+<table>
+  <tr><th>Idempotency Key</th><th>Site</th><th>Rejected At</th><th>Reason</th><th>Status</th></tr>
+  {{range .Records}}
+  <tr>
+    <td><a href="/dlq/{{.IdempotencyKey}}">{{.IdempotencyKey}}</a></td>
+    <td>{{.SiteID}}</td>
+    <td>{{.RejectedAt.Format "2006-01-02 15:04:05"}}</td>
+    <td>{{.RejectionReason}}</td>
+    <td>
+      {{if eq .Status "PUBLISHED"}}<span class="badge badge-published">PUBLISHED</span>
+      {{else if eq .Status "REPLAYED"}}<span class="badge badge-replayed">REPLAYED</span>
+      {{else}}<span class="badge badge-publishing">{{.Status}}</span>{{end}}
+    </td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+{{end}}

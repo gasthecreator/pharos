@@ -1,0 +1,38 @@
+{{define "title"}}Pharos — DLQ Detail{{end}}
+{{define "content"}}
+<h1>Dead-Letter Event: {{.Record.IdempotencyKey}}</h1>
+
+{{if .ReplayResult}}
+  {{if .ReplayError}}<div class="result-err">{{.ReplayResult}}</div>{{else}}<div class="result-ok">{{.ReplayResult}}</div>{{end}}
+{{end}}
+
+<div class="panel">
+  <table>
+    <tr><th>Site ID</th><td>{{.Record.SiteID}}</td></tr>
+    <tr><th>Rejected At</th><td>{{.Record.RejectedAt.Format "2006-01-02T15:04:05Z07:00"}}</td></tr>
+    <tr><th>Rejection Reason</th><td>{{.Record.RejectionReason}}</td></tr>
+    <tr><th>Status</th><td>{{.Record.Status}}</td></tr>
+    <tr><th>Kafka Lineage</th><td>{{.Record.KafkaTopic}} / partition {{.Record.KafkaPartition}} / offset {{.Record.KafkaOffset}}</td></tr>
+  </table>
+  <p><strong>Validation Errors</strong></p>
+  <pre class="payload">{{.Record.ValidationErrors}}</pre>
+  <p><strong>Rejected Wire Payload</strong></p>
+  <pre class="payload">{{.Record.Payload}}</pre>
+</div>
+
+{{if eq .Record.Status "PUBLISHED"}}
+<div class="panel">
+  <h2 style="margin-top:0">Replay this event</h2>
+  <p class="muted">Resubmits the exact stored payload through the real validation/dedup/publish path. Requires the
+  owning site's own credentials (§2.1, §2.2, Slice 15) -- this dashboard holds no standing credential of its own and
+  never stores what's entered here; it's forwarded to Central Ingestion for this one request only.</p>
+  <form method="POST" action="/dlq/{{.Record.IdempotencyKey}}/replay">
+    <label>Site ID</label>
+    <input type="text" name="site_id" value="{{.Record.SiteID}}" required>
+    <label>API Key</label>
+    <input type="password" name="api_key" required>
+    <button type="submit" class="danger">Replay</button>
+  </form>
+</div>
+{{end}}
+{{end}}

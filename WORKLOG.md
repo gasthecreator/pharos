@@ -40,6 +40,85 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Slice 21 — Web dashboard
+
+**Author:** Claude Code
+
+**What:** New `pharos-dashboard` binary and `internal/dashboard` package —
+server-rendered Go (`html/template`, stdlib `net/http`), reusing
+`internal/query.Service` unchanged. Recent-events feed, DLQ view with a
+replay action, site/study/event query page, test-event submission form,
+Grafana link-out. New `pharos.events_recent` table and `ListRecentEvents`
+capability on `internal/consumer`/`internal/query` to support the feed,
+since no existing query answered "what's come in recently, across every
+site."
+
+**Why:** Per PLAN.md's Slice 21 — portfolio accessibility for a
+non-technical viewer who can't run `curl`/`pharos-cli`, explicitly not a
+production-hardening item. Built directly by Claude Code rather than handed
+to Gemini, per this session's standing instruction to complete every
+remaining scoped slice without further feature-work handoffs.
+
+**How:** The three query-table shapes already in `internal/consumer` --
+`canonical_events` (keyed only by idempotency_key), `events_by_study` and
+`events_by_site` (each scoped to one partition key) -- can't answer "recent
+across every site" without `ALLOW FILTERING` or a full scan. Added
+`events_recent`, bucketed by the UTC hour of `ConsumedAt` (not the clinical
+`EventTime`, which can be backfilled and would scatter a recency feed
+across old buckets), written as a fifth parallel upsert in `SaveEvent`.
+`ListRecentEvents` fans out over the last 48 hour buckets rather than an
+unbounded scan. Returned records are deliberately partial (no
+payload/timing/Kafka fields, since a feed row links to `GetEvent` for full
+detail) -- the one method in this codebase whose `CanonicalRecord` results
+aren't fully populated, called out clearly in its docs so nobody assumes
+otherwise later.
+
+The dashboard has no identity of its own -- PLAN.md's "authentication is
+out of scope" holds -- but DLQ replay and event submission both hit
+auth-enforcing endpoints (Slice 15). Rather than a standing service-account
+credential (which couldn't replay *any* site's record anyway, since Slice
+15 requires the authenticated site to match the record's owner), both forms
+ask the human at the browser for that site's own Site ID/API Key per
+submission, forwarded to Central Ingestion for that one request only, never
+stored -- the same X-Site-ID/X-API-Key + CA-trusted-TLS proxy shape
+pharos-cli's own (Slice 20-fixed) replay path uses. This is also why the
+dashboard needed zero changes to get "who replayed what" audited: Slice
+20's server-side `HandleDLQReplay` recording already covers every caller.
+
+Verified live against the real cluster's own accumulated data from earlier
+in this session (the feed rendered genuine fault-injection/load-test
+records, not seeded fixtures): created a real site key, submitted a real
+malformed event through the dashboard's submit form (real HTTP 422 shown
+verbatim), replayed that real DLQ record through the dashboard with real
+credentials (real "still rejected" result, since the stored payload itself
+was still invalid), and confirmed via `pharos-cli audit list` that Slice
+20's audit trail recorded the attempt with no dashboard-side change needed
+-- proof the two slices genuinely integrate.
+
+**Files/modules touched:** new `cmd/pharos-dashboard/main.go`;
+`internal/dashboard/dashboard.go`, `internal/dashboard/dashboard_test.go`,
+`internal/dashboard/templates/{layout,index,query,dlq_list,dlq_detail,submit}.html`;
+`internal/consumer/canonical_store.go` (`events_recent` schema,
+`ListRecentEvents` on both Cassandra and in-memory stores, `hourBucket`
+helper); `internal/consumer/recent_events_test.go`;
+`internal/consumer/consumer_integration_test.go` (extended with a real
+`ListRecentEvents` assertion); `internal/query/types.go`,
+`internal/query/service.go` (`ListRecentEvents` added to `Service`); `PLAN.md`
+(Slice 21 marked done).
+
+**Tests added/updated:** `internal/dashboard`'s full handler-level suite
+(index, all three query types, DLQ list/detail, replay and submit against
+an `httptest.Server` standing in for Central Ingestion -- proving
+credentials are validated locally before any outbound call, headers are
+forwarded correctly, and a non-200 response is never shown as success);
+`TestMemoryCanonicalStore_ListRecentEvents_NewestFirst`,
+`_RespectsLimit`, `_UpsertUpdatesConsumedAt`; the real-Cassandra
+`TestCassandraCanonicalStore_RealIntegration` extended with a genuine
+`events_recent` round-trip.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope.
+
 ## [2026-09-06] Claude Code: Slice 20 — Compliance / access-audit logging
 
 **Author:** Claude Code

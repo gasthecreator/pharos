@@ -214,6 +214,15 @@ func (s *CassandraService) GetEventsBySite(ctx context.Context, siteID string, m
 	return mergeCanonicalRecords(hot, cold), nil
 }
 
+// ListRecentEvents answers "what's come in recently, across every site"
+// (§2.4, Slice 21) via pharos.events_recent. Deliberately hot-tier only,
+// like ListAllDLQEvents: this is a live-activity feed by nature, not a
+// historical query, so merging in the archive tier here would mean scanning
+// cold storage for what's meant to be a quick recency check.
+func (s *CassandraService) ListRecentEvents(ctx context.Context, limit int) ([]*consumer.CanonicalRecord, error) {
+	return s.canonicalStore.ListRecentEvents(ctx, limit)
+}
+
 // mergeCanonicalRecords combines hot- and cold-tier results, deduplicating by
 // idempotency_key. A key can legitimately exist in both tiers briefly -- the
 // archival job exports before it deletes, so a row can be in both places for
@@ -526,6 +535,10 @@ func (m *MemoryService) GetEventsByStudy(ctx context.Context, studyID string, st
 
 func (m *MemoryService) GetEventsBySite(ctx context.Context, siteID string, minLocalSeq int64) ([]*consumer.CanonicalRecord, error) {
 	return m.canonicalStore.GetEventsBySite(ctx, siteID, minLocalSeq)
+}
+
+func (m *MemoryService) ListRecentEvents(ctx context.Context, limit int) ([]*consumer.CanonicalRecord, error) {
+	return m.canonicalStore.ListRecentEvents(ctx, limit)
 }
 
 func (m *MemoryService) GetDLQEvent(ctx context.Context, idempotencyKey string) (*DLQRecord, error) {

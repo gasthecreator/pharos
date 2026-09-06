@@ -1,0 +1,26 @@
+{{define "title"}}Pharos — Recent Events{{end}}
+{{define "content"}}
+<h1>Recent Adverse Events</h1>
+<p class="subtitle">Live feed across every trial site, newest first. Click a row for full detail.</p>
+
+{{if not .Events}}
+  <p class="empty">No events recorded yet.</p>
+{{else}}
+<table>
+  <tr><th>Consumed At (UTC)</th><th>Site</th><th>Study</th><th>Seq</th><th>Severity</th><th>MedDRA</th><th>Subject</th><th>Late?</th><th></th></tr>
+  {{range .Events}}
+  <tr>
+    <td>{{.ConsumedAt.Format "2006-01-02 15:04:05"}}</td>
+    <td>{{.SiteID}}</td>
+    <td>{{.StudyID}}</td>
+    <td>{{.LocalSeq}}</td>
+    <td>{{.Severity}}</td>
+    <td>{{.EventCode}}</td>
+    <td>{{.Subject}}</td>
+    <td>{{if .IsLate}}<span class="badge badge-late">LATE</span>{{else}}—{{end}}</td>
+    <td><a href="/query?type=event&id={{.IdempotencyKey}}">view</a></td>
+  </tr>
+  {{end}}
+</table>
+{{end}}
+{{end}}

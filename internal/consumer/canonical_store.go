@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -257,6 +258,31 @@ func (s *CassandraCanonicalStore) EnsureSchema() error {
 			study_id text,
 			PRIMARY KEY (study_id)
 		);`,
+		// events_recent (§2.4, Slice 21: web dashboard) answers "what's come
+		// in recently, across every site" -- a query shape neither
+		// canonical_events (keyed only by idempotency_key, no ordering) nor
+		// events_by_study/events_by_site (both scoped to one partition key)
+		// can answer without ALLOW FILTERING or a full-table scan, both
+		// already avoided everywhere else in this schema. Bucketed by UTC
+		// hour rather than one giant partition: an unbounded single
+		// partition would grow forever and eventually blow past Cassandra's
+		// per-partition size guidance for a busy pipeline; an hour bucket
+		// bounds it and lets ListRecentEvents fan out over a small,
+		// predictable number of recent partitions instead.
+		`CREATE TABLE IF NOT EXISTS pharos.events_recent (
+			hour_bucket text,
+			consumed_at timestamp,
+			idempotency_key text,
+			site_id text,
+			study_id text,
+			local_seq bigint,
+			event_time timestamp,
+			severity text,
+			event_code text,
+			subject text,
+			is_late boolean,
+			PRIMARY KEY ((hour_bucket), consumed_at, idempotency_key)
+		) WITH CLUSTERING ORDER BY (consumed_at DESC, idempotency_key ASC);`,
 		`CREATE TABLE IF NOT EXISTS pharos.consumer_watermark_checkpoints (
 			group_id text,
 			previous_emitted timestamp,
@@ -312,8 +338,15 @@ func (s *CassandraCanonicalStore) SaveEvent(ctx context.Context, r *CanonicalRec
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 	`
 
+	const insertRecent = `
+		INSERT INTO pharos.events_recent (
+			hour_bucket, consumed_at, idempotency_key, site_id, study_id,
+			local_seq, event_time, severity, event_code, subject, is_late
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+	`
+
 	var wg sync.WaitGroup
-	errCh := make(chan error, 4)
+	errCh := make(chan error, 5)
 
 	// 1. Table: canonical_events
 	wg.Add(1)
@@ -359,7 +392,23 @@ func (s *CassandraCanonicalStore) SaveEvent(ctx context.Context, r *CanonicalRec
 		}
 	}()
 
-	// 4. Table: known_studies (archive-tracking, §2.4 Slice 11) -- lets the
+	// 4. Table: events_recent (§2.4, Slice 21) -- bucketed by the UTC hour
+	// of ConsumedAt (when the pipeline actually processed it, not the
+	// clinical EventTime, which can be backfilled/late and would scatter a
+	// "what just happened" feed across arbitrary past buckets).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err := session.Query(insertRecent,
+			hourBucket(r.ConsumedAt), r.ConsumedAt, r.IdempotencyKey, r.SiteID, r.StudyID,
+			r.LocalSeq, r.EventTime, r.Severity, r.EventCode, r.Subject, r.IsLate,
+		).WithContext(ctx).Exec()
+		if err != nil {
+			errCh <- fmt.Errorf("insert events_recent failed: %w", err)
+		}
+	}()
+
+	// 5. Table: known_studies (archive-tracking, §2.4 Slice 11) -- lets the
 	// archival job discover which studies to scan without ALLOW FILTERING
 	// or a secondary index, both already avoided elsewhere in this project.
 	wg.Add(1)
@@ -443,6 +492,62 @@ func (s *CassandraCanonicalStore) GetEventsByStudy(ctx context.Context, studyID 
 
 	if err := iter.Close(); err != nil {
 		return nil, err
+	}
+	return results, nil
+}
+
+// hourBucket formats t (which must already be UTC) as events_recent's
+// partition key -- one partition per UTC hour, bounding partition size for
+// a busy pipeline instead of one unbounded partition growing forever.
+func hourBucket(t time.Time) string {
+	return t.Format("2006-01-02-15")
+}
+
+// ListRecentEvents answers "what's come in recently, across every site" for
+// the Slice 21 dashboard's live feed -- fans out over the last hoursBack
+// hour-bucket partitions of events_recent (newest first), merges, and caps
+// at limit, rather than a single unbounded partition or ALLOW FILTERING
+// across canonical_events. Returned records are intentionally partial
+// (idempotency key, site/study, sequence, timing, severity/code/subject) --
+// events_recent doesn't duplicate the full FHIR payload, since a feed row
+// links to GetEvent for full detail rather than needing it inline; Payload/
+// RecordedTime/IngestionTime/Kafka* are left zero-valued on every result.
+func (s *CassandraCanonicalStore) ListRecentEvents(ctx context.Context, limit int) ([]*CanonicalRecord, error) {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+	const hoursBack = 48
+
+	const query = `
+		SELECT hour_bucket, consumed_at, idempotency_key, site_id, study_id,
+		       local_seq, event_time, severity, event_code, subject, is_late
+		FROM pharos.events_recent
+		WHERE hour_bucket = ?
+		LIMIT ?;
+	`
+
+	var results []*CanonicalRecord
+	now := time.Now().UTC()
+	for h := 0; h < hoursBack && len(results) < limit; h++ {
+		bucket := hourBucket(now.Add(-time.Duration(h) * time.Hour))
+		iter := session.Query(query, bucket, limit-len(results)).WithContext(ctx).Iter()
+
+		var r CanonicalRecord
+		var bucketStr string
+		for iter.Scan(
+			&bucketStr, &r.ConsumedAt, &r.IdempotencyKey, &r.SiteID, &r.StudyID,
+			&r.LocalSeq, &r.EventTime, &r.Severity, &r.EventCode, &r.Subject, &r.IsLate,
+		) {
+			recordCopy := r
+			results = append(results, &recordCopy)
+		}
+		if err := iter.Close(); err != nil {
+			return nil, fmt.Errorf("failed to scan events_recent bucket %s: %w", bucket, err)
+		}
 	}
 	return results, nil
 }
@@ -678,6 +783,7 @@ type MemoryCanonicalStore struct {
 	byKey       map[string]*CanonicalRecord
 	byStudy     map[string][]*CanonicalRecord
 	bySite      map[string][]*CanonicalRecord
+	recent      []*CanonicalRecord // mirrors events_recent (§2.4, Slice 21); sorted at read time, not write time
 	checkpoints map[string]WatermarkCheckpoint
 	saveHook    func(r *CanonicalRecord) error
 	saveCalls   int
@@ -740,6 +846,18 @@ func (m *MemoryCanonicalStore) SaveEvent(ctx context.Context, r *CanonicalRecord
 		m.bySite[r.SiteID] = append(siteList, &recCopy)
 	}
 
+	foundRecent := false
+	for i, existing := range m.recent {
+		if existing.IdempotencyKey == r.IdempotencyKey {
+			m.recent[i] = &recCopy
+			foundRecent = true
+			break
+		}
+	}
+	if !foundRecent {
+		m.recent = append(m.recent, &recCopy)
+	}
+
 	return nil
 }
 
@@ -780,6 +898,38 @@ func (m *MemoryCanonicalStore) GetEventsBySite(ctx context.Context, siteID strin
 			recCopy := *r
 			results = append(results, &recCopy)
 		}
+	}
+	return results, nil
+}
+
+// ListRecentEvents mirrors CassandraCanonicalStore.ListRecentEvents's
+// contract (newest ConsumedAt first, capped at limit) but -- since this
+// store has no bucketed-partition equivalent to fan out over -- simply
+// sorts every saved record at read time. Unlike the Cassandra
+// implementation, records here are returned fully populated (this store
+// keeps whole records anyway), not the partial summary shape
+// events_recent stores; callers should treat the returned fields as a
+// superset, never assume a field is populated only because this store
+// happens to populate it.
+func (m *MemoryCanonicalStore) ListRecentEvents(ctx context.Context, limit int) ([]*CanonicalRecord, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 50
+	}
+	sorted := make([]*CanonicalRecord, len(m.recent))
+	copy(sorted, m.recent)
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ConsumedAt.After(sorted[j].ConsumedAt)
+	})
+	if len(sorted) > limit {
+		sorted = sorted[:limit]
+	}
+	results := make([]*CanonicalRecord, len(sorted))
+	for i, r := range sorted {
+		recCopy := *r
+		results[i] = &recCopy
 	}
 	return results, nil
 }
