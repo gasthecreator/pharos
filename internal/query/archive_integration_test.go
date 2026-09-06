@@ -83,7 +83,7 @@ func TestArchivalLifecycle_RealCassandra(t *testing.T) {
 	if err != nil || !dlqClaim.Acquired {
 		t.Fatalf("failed to seed DLQ claim: %v (acquired=%v)", err, dlqClaim.Acquired)
 	}
-	if err := outboxStore.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 0); err != nil {
+	if err := outboxStore.MarkDLQPublished(ctx, dlqKey, dlqClaim.ClaimedAt, "pharos.events.dlq", 0, 0); err != nil {
 		t.Fatalf("failed to mark seeded DLQ record published: %v", err)
 	}
 

@@ -404,20 +404,32 @@ func (s *CassandraOutboxStore) InsertClaim(ctx context.Context, rec OutboxRecord
 	}, nil
 }
 
-// MarkPublished updates status='PUBLISHED' with Kafka metadata.
-func (s *CassandraOutboxStore) MarkPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error {
+// MarkPublished updates status='PUBLISHED' with Kafka metadata, fenced by
+// expectedClaimedAt (§2.4, Slice 22) -- the CAS now checks claimed_at, not
+// just status, so a claimant whose lease was already stolen (a different
+// claimed_at now on the row) can never overwrite whoever's finalize should
+// actually win. Previously this CAS's applied result was silently
+// discarded, meaning even the pre-existing `IF status = 'PUBLISHING'` guard
+// did nothing observable: a stale claimant with the OLD claimed_at could
+// still finalize as long as status hadn't already flipped to PUBLISHED,
+// silently clobbering the real claimant's Kafka lineage bookkeeping with
+// its own. See ErrClaimSuperseded's docs for what callers should do here.
+func (s *CassandraOutboxStore) MarkPublished(ctx context.Context, idempotencyKey string, expectedClaimedAt time.Time, topic string, partition int, offset int64) error {
 	now := time.Now().UTC()
 	query := `
 		UPDATE event_outbox
 		SET status = 'PUBLISHED', published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ?
 		WHERE idempotency_key = ?
-		IF status = 'PUBLISHING';
+		IF status = 'PUBLISHING' AND claimed_at = ?;
 	`
 	markMap := make(map[string]interface{})
-	_, err := s.session.Query(query, now, topic, partition, offset, idempotencyKey).
+	applied, err := s.session.Query(query, now, topic, partition, offset, idempotencyKey, expectedClaimedAt).
 		WithContext(ctx).SerialConsistency(s.cfg.SerialConsistency).MapScanCAS(markMap)
 	if err != nil {
 		return fmt.Errorf("failed to mark outbox published: %w", err)
+	}
+	if !applied {
+		return ErrClaimSuperseded
 	}
 
 	// Remove from pending_outbox index
@@ -540,20 +552,26 @@ func (s *CassandraOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord
 	}, nil
 }
 
-// MarkDLQPublished updates status='PUBLISHED' on pharos.dead_letter_events and dead_letter_events_by_site.
-func (s *CassandraOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey string, topic string, partition int, offset int64) error {
+// MarkDLQPublished updates status='PUBLISHED' on pharos.dead_letter_events
+// and dead_letter_events_by_site, fenced by expectedClaimedAt exactly like
+// MarkPublished (§2.4, Slice 22) -- see that method's docs for the full
+// rationale.
+func (s *CassandraOutboxStore) MarkDLQPublished(ctx context.Context, idempotencyKey string, expectedClaimedAt time.Time, topic string, partition int, offset int64) error {
 	now := time.Now().UTC()
 	query := `
 		UPDATE dead_letter_events
 		SET status = 'PUBLISHED', published_at = ?, kafka_topic = ?, kafka_partition = ?, kafka_offset = ?
 		WHERE idempotency_key = ?
-		IF status = 'PUBLISHING';
+		IF status = 'PUBLISHING' AND claimed_at = ?;
 	`
 	markMap := make(map[string]interface{})
-	_, err := s.session.Query(query, now, topic, partition, offset, idempotencyKey).
+	applied, err := s.session.Query(query, now, topic, partition, offset, idempotencyKey, expectedClaimedAt).
 		WithContext(ctx).SerialConsistency(s.cfg.SerialConsistency).MapScanCAS(markMap)
 	if err != nil {
 		return fmt.Errorf("failed to mark DLQ outbox published: %w", err)
+	}
+	if !applied {
+		return ErrClaimSuperseded
 	}
 
 	// Update dead_letter_events_by_site

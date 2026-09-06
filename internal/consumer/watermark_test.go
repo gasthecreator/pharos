@@ -90,7 +90,7 @@ func TestWatermarkTracker_CompleteToRevisedLifecycle(t *testing.T) {
 		ID:    windowID,
 		Start: baseTime,
 		End:   baseTime.Add(1 * time.Hour),
-	})
+	}, baseTime)
 
 	w, ok := tracker.GetWindow(windowID)
 	if !ok || w.Status != WindowStatusOpen {

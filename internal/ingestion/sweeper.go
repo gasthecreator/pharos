@@ -57,7 +57,7 @@ func (s *Sweeper) Step(ctx context.Context) (int, error) {
 				"site_id":         rec.SiteID,
 			})
 			if err == nil {
-				_ = s.store.MarkPublished(ctx, rec.IdempotencyKey, meta.Topic, meta.Partition, meta.Offset)
+				_ = s.store.MarkPublished(ctx, rec.IdempotencyKey, claim.ClaimedAt, meta.Topic, meta.Partition, meta.Offset)
 				recovered++
 			}
 		}
@@ -73,7 +73,7 @@ func (s *Sweeper) Step(ctx context.Context) (int, error) {
 				"rejection_reason": dlq.RejectionReason,
 			})
 			if err == nil {
-				_ = s.store.MarkDLQPublished(ctx, dlq.IdempotencyKey, meta.Topic, meta.Partition, meta.Offset)
+				_ = s.store.MarkDLQPublished(ctx, dlq.IdempotencyKey, claim.ClaimedAt, meta.Topic, meta.Partition, meta.Offset)
 				recovered++
 			}
 		}
