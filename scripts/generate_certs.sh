@@ -48,22 +48,30 @@ EOF
   rm -f "${name}.csr" "${name}-ext.cnf"
 }
 
-# 2. Cassandra: shared cert across all 5 nodes (dc-us: 1-3, dc-eu: 4-5),
+# 2. Cassandra: shared cert across all 4 nodes (dc-us: 1-3, dc-eu: 4),
 # covering both container-internal names (inter-node + in-container client
 # access) and localhost/127.0.0.1 (host-side Go clients via the exposed port).
+# Was 5 nodes (dc-eu: 4-5) before Slice 15's memory-driven topology
+# reduction dropped dc-eu to 1 node/cassandra-4 -- see docker-compose.yml's
+# Cassandra section comment for the full story; this SAN list and the
+# cassandra-{N}.yaml generation loop below were the one spot that reduction
+# missed updating, since an extra unused SAN/file is harmless (over-
+# provisioning, not under), not something that fails loudly.
 # EXTRA_CASSANDRA_SANS/EXTRA_KAFKA_SANS (empty by default, unused by the
 # Docker Compose flow) let deploy/k8s's own cert-generation step (§2.4,
 # PLAN.md Slice 17: Deployment automation) append K8s headless-Service DNS
 # names to the same shared cert/CA rather than duplicating this whole
 # script for a second SAN list.
-CASSANDRA_SANS="DNS:localhost,DNS:pharos-cassandra-1,DNS:pharos-cassandra-2,DNS:pharos-cassandra-3,DNS:pharos-cassandra-4,DNS:pharos-cassandra-5,IP:127.0.0.1"
+CASSANDRA_SANS="DNS:localhost,DNS:pharos-cassandra-1,DNS:pharos-cassandra-2,DNS:pharos-cassandra-3,DNS:pharos-cassandra-4,IP:127.0.0.1"
 if [ -n "${EXTRA_CASSANDRA_SANS:-}" ]; then
   CASSANDRA_SANS="${CASSANDRA_SANS},${EXTRA_CASSANDRA_SANS}"
 fi
 issue_cert "cassandra" "Pharos Cassandra Cluster" "${CASSANDRA_SANS}"
 
-# 3. Kafka: shared cert across all 5 brokers (cluster A: 1-3, cluster B: 4-5).
-KAFKA_SANS="DNS:localhost,DNS:pharos-kafka-1,DNS:pharos-kafka-2,DNS:pharos-kafka-3,DNS:pharos-kafka-4,DNS:pharos-kafka-5,IP:127.0.0.1"
+# 3. Kafka: shared cert across all 4 brokers (cluster A: 1-3, cluster B: 4)
+# -- was 5 (cluster B: 4-5) before the same Slice 15 reduction dropped
+# cluster B to 1 broker; see the Cassandra comment above.
+KAFKA_SANS="DNS:localhost,DNS:pharos-kafka-1,DNS:pharos-kafka-2,DNS:pharos-kafka-3,DNS:pharos-kafka-4,IP:127.0.0.1"
 if [ -n "${EXTRA_KAFKA_SANS:-}" ]; then
   KAFKA_SANS="${KAFKA_SANS},${EXTRA_KAFKA_SANS}"
 fi
@@ -205,12 +213,12 @@ PYEOF
 # thinking through what "writable + shared across containers" actually means
 # before wiring it into docker-compose.yml, not discovered by watching it
 # corrupt a running cluster.
-for i in 1 2 3 4 5; do
+for i in 1 2 3 4; do
   cp cassandra.yaml "cassandra-${i}.yaml"
 done
 
 echo "Done. CA: ca-cert.pem / ca-key.pem"
-echo "Cassandra: cassandra-cert.pem, cassandra-key.pem, cassandra-keystore.jks, cassandra-truststore.jks, cassandra-{1..5}.yaml"
+echo "Cassandra: cassandra-cert.pem, cassandra-key.pem, cassandra-keystore.jks, cassandra-truststore.jks, cassandra-{1..4}.yaml"
 echo "Kafka:     kafka-cert.pem, kafka-key.pem, kafka-keystore.jks, kafka-truststore.jks"
 echo "Ingestion: ingestion-cert.pem, ingestion-key.pem"
 echo "Keystore/truststore password: ${STORE_PASS} (override with PHAROS_TLS_STORE_PASS)"

@@ -40,6 +40,86 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Third-pass re-audit — confirmed clean after dashboard audit logging, found and fixed 3 more small drifts
+
+**Author:** Claude Code
+
+**What:** Asked for one more full sweep after the dashboard read-side
+access-audit work landed, to confirm nothing was missed against what
+PLAN.md scopes. Found and fixed three small documentation-via-code drift
+items, none of them functional bugs and none a repeat of either prior
+pass:
+
+1. **`scripts/generate_certs.sh` still generated a `cassandra-5`/`kafka-5`
+   cert and listed both in its TLS SANs** — Slice 15 dropped the topology
+   to 4 Cassandra nodes / 4 Kafka brokers, but this script's SAN lists and
+   its `for i in 1 2 3 4 5` cert-file loop were never trimmed. Harmless
+   (an unused extra SAN is over-provisioning, not under-provisioning) but
+   genuinely stale. Removed the `-5` entries from `CASSANDRA_SANS` and
+   `KAFKA_SANS`, fixed the loop bound to `1 2 3 4`, and added a comment
+   explaining the Slice 15 history so it doesn't drift again unnoticed.
+2. **`Makefile`'s `test` target didn't match CI's own safe invocation** —
+   plain `go test -race ./...`, while `.github/workflows/ci.yml` runs
+   packages with `-p 1` (concurrent real Cassandra/Kafka connections
+   across packages OOM-killed the dev topology once TLS was added) and
+   runs `internal/chaos` as a fully separate invocation (its disruptive
+   tests, immediately before `internal/consumer`'s in alphabetical order,
+   caused intermittent spurious failures there). `CONTRIBUTING.md`
+   explicitly tells contributors to run `make test` before opening a PR,
+   so the stale target meant following the project's own documented
+   workflow could flake or OOM a real cluster in exactly the ways CI's
+   own comments describe having already hit and fixed. Mirrored CI's
+   two-step invocation exactly.
+3. **`loadtest/README.md` referenced the pre-metrics-split Prometheus
+   metric names** — `pharos_cassandra_write_duration_seconds` and
+   `pharos_outbox_publish_duration_seconds`, missing the
+   `_consumer_`/`_ingestion_` infix the metrics-split refactor (first
+   pass, item #3) actually registers them under. PLAN.md and WORKLOG.md
+   already had the correct full names; this one file was never updated.
+   Fixed both references.
+
+Also re-verified, found clean, no changes needed: `.github/workflows/ci.yml`,
+`.gitignore`, `go.mod`, `scripts/{backup,restore}_cassandra.sh` (both
+schema-agnostic), `scripts/loadtest_setup.sh`, `nginx/nginx.conf`,
+`deploy/k8s/{05-ingestion,06-consumer}.yaml`, `loadtest/pharos_load_test.js`,
+`internal/model/adverse_event.go`'s optional fields, `internal/audit`'s test
+coverage, every `t.Skip`/TODO/FIXME/nolint in the repo, `docker-compose.yml`'s
+full topology, the Grafana dashboard JSON's metric-name references (all
+match the metrics-split refactor's actual registered names), and the
+dashboard templates' `Operator`/`CurrentOperator` field wiring from the
+just-merged audit-logging change.
+
+**Why:** Direct follow-up ask ("one final time... every nook and cranny")
+after the dashboard audit-logging work landed — using the same audit
+methodology a third time on a codebase that had just changed again.
+
+**How:** Grepped the whole repo for TODO/FIXME/nolint/skip patterns first
+(all clean), confirmed PLAN.md's Slice list has no gaps (1-23, all Done),
+then inventoried every file under `scripts/`, `docs/`, `deploy/`, and
+`loadtest/` against the two prior passes' notes to find genuinely
+unexamined files, read each in full, and cross-referenced its concrete
+claims (table names, metric names, container/node counts, port numbers,
+API key prefixes) against actual current code. Separately compared
+`Makefile`'s `test` target line-by-line against `.github/workflows/ci.yml`'s
+own test steps, since that's a "does the documented local workflow match
+the proven-safe CI workflow" check neither prior pass had done. Each fix
+verified live: `generate_certs.sh` re-run against a scratch `CERT_DIR`
+(confirmed exactly 4 cert files and no `pharos-cassandra-5` SAN via
+`openssl x509 -noout -text`), `make test` run to completion (including
+`internal/chaos`'s two real-Docker tests), and the corrected metric names
+confirmed against `internal/metrics/{ingestion,consumer}metrics`'s actual
+`Name:` fields.
+
+**Files/modules touched:** `scripts/generate_certs.sh`, `Makefile`,
+`loadtest/README.md`.
+
+**Tests added/updated:** None (documentation/script drift, not
+behavioral code) — verified via live re-runs instead, as above.
+
+**Follow-ups / left open:** Same as both prior passes' (K8s at full
+scale, K8s internode/inter-broker TLS at full scale) — this pass found
+nothing new in that category, only doc/script currency drift.
+
 ## [2026-09-06] Claude Code: Slice 21 — dashboard read-side access-audit logging (closes the deferred gap)
 
 **Author:** Claude Code
