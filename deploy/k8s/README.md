@@ -159,3 +159,22 @@ follow-up, not a manifest patch: either a multi-node `kind` cluster
 of one shared cgroup) or a larger host. Full detail, including the exact
 commands and log lines, is in `PLAN.md`'s Slice 17 addendum dated the same
 day.
+
+**Retried with a multi-node cluster, same day:** `kind create cluster
+--config` with 1 control-plane + 3 workers instead of the default
+single-node topology, same unmodified manifests. Genuinely better in part
+-- Cassandra came up cleanly across all 4 pods this time, naturally spread
+by the scheduler across 3 different worker containers, further than the
+single-node attempt got before the migrations Job stalled it. But once
+Kafka's 4 brokers started bootstrapping simultaneously, host load climbed
+to the same ~11-13 peak that caused the single-node cascade -- this time
+surfacing as `kubectl`/`docker` themselves going unresponsive (API server
+TLS handshake timeouts, `docker ps` queuing 30+ seconds) rather than
+kubelet-driven pod restarts, but the same underlying cause. Torn down at
+that point rather than wait for a confirmed crash. **Multi-node changes
+*where* the contention lands (separate per-node cgroups instead of one
+shared one) and it measurably helped -- it does not raise the ceiling
+itself**: 4 kind nodes' own kubelet/containerd/kube-proxy overhead plus the
+full workload still has to fit in the same 8 real CPU cores this host has
+always had. The fix really is just the host now -- see `PLAN.md`'s Slice 17
+addendum for the full account.
