@@ -97,6 +97,30 @@ func TestCassandraCanonicalStore_RealIntegration(t *testing.T) {
 	if len(studyEvents2) != 1 {
 		t.Fatalf("CRITICAL IDEMPOTENCY FAILURE: duplicate row created in events_by_study (count=%d)", len(studyEvents2))
 	}
+
+	// 6. Recent feed: ListRecentEvents (§2.4, Slice 21) -- the record's
+	// ConsumedAt is time.Now().UTC(), so it lands in the current hour
+	// bucket and must appear in a large-enough recent query. A high limit
+	// (real traffic from other tests/processes may also be in the current
+	// bucket) proves "contains this record," not "contains only this
+	// record," since this test doesn't own the whole bucket exclusively.
+	recent, err := store.ListRecentEvents(ctx, 500)
+	if err != nil {
+		t.Fatalf("ListRecentEvents failed: %v", err)
+	}
+	foundInRecent := false
+	for _, r := range recent {
+		if r.IdempotencyKey == idKey {
+			foundInRecent = true
+			if r.SiteID != siteID || r.StudyID != studyID || r.Severity != "moderate" || r.EventCode != "10013661" || r.Subject != "PATIENT-999" {
+				t.Errorf("ListRecentEvents returned a summary record with mismatched fields: %+v", r)
+			}
+			break
+		}
+	}
+	if !foundInRecent {
+		t.Fatalf("expected %s to appear in ListRecentEvents (real events_recent write), it did not", idKey)
+	}
 }
 
 func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {

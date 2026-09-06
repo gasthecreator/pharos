@@ -30,6 +30,13 @@ type Service interface {
 	GetEvent(ctx context.Context, idempotencyKey string) (*consumer.CanonicalRecord, error)
 	GetEventsByStudy(ctx context.Context, studyID string, startTime, endTime time.Time) ([]*consumer.CanonicalRecord, error)
 	GetEventsBySite(ctx context.Context, siteID string, minLocalSeq int64) ([]*consumer.CanonicalRecord, error)
+	// ListRecentEvents answers "what's come in recently, across every
+	// site" (§2.4, Slice 21: web dashboard). Results are ordered newest
+	// ConsumedAt first; CassandraService's results are intentionally
+	// partial (no Payload/RecordedTime/IngestionTime/Kafka* -- see
+	// consumer.CassandraCanonicalStore.ListRecentEvents), so callers
+	// needing full detail should follow up with GetEvent.
+	ListRecentEvents(ctx context.Context, limit int) ([]*consumer.CanonicalRecord, error)
 
 	// DLQ inspection queries (§2.3)
 	GetDLQEvent(ctx context.Context, idempotencyKey string) (*DLQRecord, error)

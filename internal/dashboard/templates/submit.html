@@ -1,0 +1,21 @@
+{{define "title"}}Pharos — Submit Test Event{{end}}
+{{define "content"}}
+<h1>Submit a Test Adverse Event</h1>
+<p class="subtitle">Posts directly to Central Ingestion's real <code>/api/v1/events</code> endpoint (§2.3) --
+exercising the actual live pipeline, not a simulation. Requires a real site credential (§2.1, §2.2, Slice 15);
+nothing entered here is stored by this dashboard beyond this one request.</p>
+
+{{if .Result}}
+  {{if .ResultError}}<div class="result-err">{{.Result}}</div>{{else}}<div class="result-ok">{{.Result}}</div>{{end}}
+{{end}}
+
+<form class="panel" method="POST" action="/submit">
+  <label>Site ID</label>
+  <input type="text" name="site_id" value="{{.SiteID}}" required placeholder="e.g. SITE-US-01">
+  <label>API Key</label>
+  <input type="password" name="api_key" required>
+  <label>Event JSON (a single FHIR AdverseEvent resource)</label>
+  <textarea name="payload" required>{{.Payload}}</textarea>
+  <button type="submit">Submit Event</button>
+</form>
+{{end}}

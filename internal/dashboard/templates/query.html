@@ -1,0 +1,76 @@
+{{define "title"}}Pharos — Query{{end}}
+{{define "content"}}
+<h1>Query Adverse Events</h1>
+<p class="subtitle">Mirrors <code>pharos-cli query</code>'s existing query shapes.</p>
+
+<form class="panel" method="GET" action="/query">
+  <label>Query type</label>
+  <select name="type">
+    <option value="study" {{if eq .Type "study"}}selected{{end}}>By study (date range)</option>
+    <option value="site" {{if eq .Type "site"}}selected{{end}}>By site (min sequence)</option>
+    <option value="event" {{if eq .Type "event"}}selected{{end}}>Single event (idempotency key)</option>
+  </select>
+  <label>ID (study_id / site_id / idempotency_key)</label>
+  <input type="text" name="id" value="{{.ID}}" placeholder="e.g. STUDY-001, SITE-US-01, or SITE-US-01:1">
+  <div class="row">
+    <div>
+      <label>From (RFC3339, study queries only)</label>
+      <input type="text" name="from" value="{{.From}}" placeholder="2026-08-01T00:00:00Z">
+    </div>
+    <div>
+      <label>To (RFC3339, study queries only)</label>
+      <input type="text" name="to" value="{{.To}}" placeholder="2026-08-31T23:59:59Z">
+    </div>
+    <div>
+      <label>Min sequence (site queries only)</label>
+      <input type="text" name="min_seq" value="{{.MinSeq}}" placeholder="1">
+    </div>
+  </div>
+  <button type="submit">Query</button>
+</form>
+
+{{if .Error}}<div class="result-err">{{.Error}}</div>{{end}}
+
+{{if .SingleRecord}}
+  {{with .SingleRecord}}
+  <div class="panel">
+    <h2 style="margin-top:0">{{.IdempotencyKey}}</h2>
+    <table>
+      <tr><th>Site</th><td>{{.SiteID}}</td></tr>
+      <tr><th>Study</th><td>{{.StudyID}}</td></tr>
+      <tr><th>Local Seq</th><td>{{.LocalSeq}}</td></tr>
+      <tr><th>Subject</th><td>{{.Subject}}</td></tr>
+      <tr><th>Severity</th><td>{{.Severity}}</td></tr>
+      <tr><th>MedDRA Code</th><td>{{.EventCode}}</td></tr>
+      <tr><th>Event Time</th><td>{{.EventTime.Format "2006-01-02T15:04:05Z07:00"}}</td></tr>
+      <tr><th>Recorded Time</th><td>{{.RecordedTime.Format "2006-01-02T15:04:05Z07:00"}}</td></tr>
+      <tr><th>Ingestion Time</th><td>{{.IngestionTime.Format "2006-01-02T15:04:05Z07:00"}}</td></tr>
+      <tr><th>Consumed At</th><td>{{.ConsumedAt.Format "2006-01-02T15:04:05Z07:00"}}</td></tr>
+      <tr><th>Late Arrival?</th><td>{{if .IsLate}}<span class="badge badge-late">LATE</span>{{else}}No{{end}}</td></tr>
+      <tr><th>Kafka Lineage</th><td>{{.KafkaTopic}} / partition {{.KafkaPartition}} / offset {{.KafkaOffset}}</td></tr>
+    </table>
+    <p><strong>Raw FHIR Payload</strong></p>
+    <pre class="payload">{{.Payload}}</pre>
+  </div>
+  {{end}}
+{{else if .Records}}
+<table>
+  <tr><th>Idempotency Key</th><th>Site</th><th>Seq</th><th>Study</th><th>Event Time</th><th>Severity</th><th>MedDRA</th><th>Subject</th><th>Late?</th></tr>
+  {{range .Records}}
+  <tr>
+    <td><a href="/query?type=event&id={{.IdempotencyKey}}">{{.IdempotencyKey}}</a></td>
+    <td>{{.SiteID}}</td>
+    <td>{{.LocalSeq}}</td>
+    <td>{{.StudyID}}</td>
+    <td>{{.EventTime.Format "2006-01-02 15:04:05"}}</td>
+    <td>{{.Severity}}</td>
+    <td>{{.EventCode}}</td>
+    <td>{{.Subject}}</td>
+    <td>{{if .IsLate}}<span class="badge badge-late">LATE</span>{{else}}—{{end}}</td>
+  </tr>
+  {{end}}
+</table>
+{{else if .Submitted}}
+  <p class="empty">No matching events found.</p>
+{{end}}
+{{end}}

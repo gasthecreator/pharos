@@ -1102,6 +1102,88 @@ short polling interval is enough for a demo.
 Claude scopes/reviews as usual. Sequence whenever convenient; not a
 dependency of Slices 8-20 or vice versa.
 
+**Done 2026-09-06.** *(Built by Claude Code directly, not Gemini — superseded
+by the session-standing instruction to build every remaining slice without
+handing off feature work.)* New `pharos-dashboard` binary (`cmd/pharos-dashboard/main.go`)
+and `internal/dashboard` package, stdlib `html/template` + `net/http`
+exactly as decided, reusing `internal/query.Service` unchanged — no new
+business logic, only a presentation layer over it, matching the same
+interface `pharos-cli` already uses.
+
+Every scope bullet: a recent-events feed across all sites (new
+`ListRecentEvents` capability, below), a DLQ view with a replay action, a
+site/study/event query page mirroring `pharos-cli query`'s shapes, a test
+event submission form, and a Grafana link-out (`--grafana-url`, default
+`http://localhost:3000`).
+
+**A real gap surfaced while scoping "recent-events feed across all
+sites":** no existing query answered it. `canonical_events` is keyed only by
+idempotency_key (no ordering); `events_by_study`/`events_by_site` are each
+scoped to one partition key. None of the three can answer "what's come in
+recently, across every site" without `ALLOW FILTERING` or a full-table
+scan — both already avoided everywhere else in this schema. Added a new
+`pharos.events_recent` table, bucketed by the UTC hour of `ConsumedAt` (not
+clinical `EventTime`, which can be backfilled/late and would scatter a
+"what just happened" feed across arbitrary past buckets) — bounds partition
+size the way every other write-time query table in this schema already
+does, rather than one partition growing forever. `CassandraCanonicalStore.SaveEvent`
+now writes it as a fifth parallel upsert; `ListRecentEvents` fans out over
+the last 48 hour-bucket partitions (newest first) rather than scanning
+unboundedly. Returned records are intentionally partial (no
+payload/timing/Kafka fields — a feed row links to `GetEvent` for full
+detail instead of duplicating the whole payload into a fourth table for
+data a summary view doesn't need); documented clearly since every other
+`CanonicalRecord`-returning method in this codebase returns a fully
+populated record. `MemoryCanonicalStore` got the equivalent (sort-at-read
+rather than bucket simulation, since it already holds whole records).
+Wired through `query.Service`'s existing interface (`CassandraService`/`MemoryService`),
+not a new one.
+
+**Auth boundary, decided explicitly, not defaulted into:** the dashboard
+has no identity of its own (PLAN.md's own "authentication is out of scope"
+still holds), but DLQ replay and event submission both hit
+auth-enforcing real endpoints (§2.1, §2.2, Slice 15). Rather than the
+dashboard holding a standing service-account credential (which couldn't
+replay *any* site's record anyway, since Slice 15's own check requires the
+authenticated site to match the record's owner) or silently degrading
+those two actions, both forms ask the human at the browser for that
+specific site's Site ID/API Key per submission — forwarded to Central
+Ingestion for that one request only, never stored, exactly the same
+`X-Site-ID`/`X-API-Key` + `--ca-cert`-trusted-TLS proxy shape `pharos-cli`'s
+own (Slice 20-fixed) replay path uses. This is also why the dashboard
+needed no changes to get "who replayed what" audited: Slice 20's
+server-side `HandleDLQReplay` recording already covers every caller,
+dashboard included, keyed by whichever site the human authenticated as.
+
+**Verified live, not assumed**: built the real binary, ran it against the
+live Cassandra cluster's genuine accumulated data from this session's
+earlier slices (the recent-events feed rendered real fault-injection/load-test
+records already in the cluster, not seeded fixtures). Created a real site
+key, submitted a real malformed event through the dashboard's own submit
+form (proxied to real Central Ingestion, got a real HTTP 422 shown
+verbatim), then replayed that real DLQ record through the dashboard's
+replay form with real credentials — got a real "still rejected" result
+back (the stored payload's own `actuality` was still invalid, exactly as
+expected for its own unmodified stored bytes) — and confirmed via
+`pharos-cli audit list --operator SITE-DASH-LIVE` that Slice 20's
+server-side audit trail recorded the attempt without any dashboard-side
+change, proving the two slices genuinely integrate rather than just
+coexisting.
+
+New tests: `internal/consumer` gained `ListRecentEvents` coverage (a real
+Cassandra integration test proving a saved event lands in and is
+returned by the real `events_recent` table; three `MemoryCanonicalStore`
+unit tests for ordering, limit, and upsert-updates-position semantics).
+`internal/dashboard` gained handler-level tests for every route (index,
+query by all three types, DLQ list/detail, and — using an `httptest.Server`
+standing in for Central Ingestion — replay and submit, including proving
+credentials are validated locally *before* ever calling out, that
+X-Site-ID/X-API-Key are forwarded correctly, and that a non-200 response is
+shown as an error rather than mistaken for success).
+
+Full suite (`go test -race -count=1 -p 1 ./...`) passed cleanly twice in a
+row.
+
 ### Slice 22 — Property-based & deterministic simulation testing
 
 Scoped 2026-08-31. Every fault-injection test in this project (existing and
