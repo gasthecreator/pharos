@@ -57,9 +57,14 @@ This is tracked explicitly, not hidden. As of this writing there is:
   cleanly, but the one-shot migrations Job triggered a genuine CPU-contention
   cascading failure on this specific 8-core host once a single-node `kind`
   cluster's own K8s control-plane overhead was added on top of the identical
-  application workload. Not a manifest bug: see PLAN.md Slice 17's addendum
-  for the full account and what a real fix would need (a multi-node `kind`
-  cluster or a larger host).
+  application workload. Retried the same day with a multi-node `kind`
+  cluster (1 control-plane + 3 workers) specifically to test that mitigation
+  — Cassandra came up further/cleaner than the single-node attempt, but
+  once Kafka's 4 brokers began bootstrapping, host load hit the same ~11-13
+  peak and `kubectl`/`docker` themselves became unresponsive. Not a manifest
+  bug either time: this host's 8 physical cores are the actual ceiling,
+  which changing the `kind` node topology alone can't raise — see PLAN.md
+  Slice 17's addendum for the full account.
 
 Don't run this outside a local/dev environment, and don't feed it real
 personal or clinical data.

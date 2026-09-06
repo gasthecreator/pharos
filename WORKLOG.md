@@ -40,6 +40,57 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Slice 17 — multi-node kind retry (item #6 follow-up)
+
+**Author:** Claude Code
+
+**What:** Retried the full-scale K8s deployment attempt (documented in
+Slice 17's addendum below) against a multi-node `kind` cluster (1
+control-plane + 3 workers, via `kind create cluster --config`) instead of
+the default single-node topology, specifically to test the mitigation that
+attempt's own writeup named as the likely fix. Unmodified manifests,
+`replicas: 3` as committed.
+
+**Why:** Direct follow-up ask, naming the exact mitigation to try.
+
+**How:** Result is genuinely mixed, not a simple pass/fail. Cassandra came
+up cleanly across all 4 pods, naturally spread by the scheduler across 3
+different worker containers (`nodetool status` confirmed both DCs
+healthy) — further than the single-node attempt got before its own
+migrations Job stalled it. `deploy.sh` itself hit a new cost specific to
+multi-node: `kind load docker-image` now pushes every image into all 4
+nodes instead of 1, and each fresh worker had to independently pull
+`apache/kafka:3.8.0` from scratch (~70s each) — together this ran past the
+script's own wait timeouts (tuned for single-node speed), so it exited
+early and the rest was applied manually to keep verifying. Once Kafka's 4
+brokers began bootstrapping simultaneously across the workers, host load
+climbed to the same ~11-13 peak that caused the single-node cascade — this
+time surfacing as `kubectl`/`docker` themselves going unresponsive (API
+server TLS handshake timeouts, `docker ps` queuing 30+ seconds) rather than
+kubelet-driven pod restarts, but the same underlying cause. Torn down
+proactively at that point.
+
+**Conclusion:** multi-node `kind` is a real, working mitigation for *where*
+the contention lands (separate per-node cgroups instead of one shared one)
+and it measurably helped — Cassandra's full bring-up succeeded outright
+this run. It does not raise the ceiling itself: 4 kind nodes' own
+kubelet/containerd/kube-proxy overhead plus the full application workload
+still has to fit inside the same 8 real CPU cores this host has always
+had. The real fix narrows to just a bigger host now, not a different `kind`
+topology on this one.
+
+**Files/modules touched:** `PLAN.md` (Slice 17 addendum), `SECURITY.md`,
+`deploy/k8s/README.md`. No code or manifest changes — this was a
+verification attempt, and the manifests were already confirmed correct by
+the single-node attempt.
+
+**Tests added/updated:** None (infrastructure verification, not code).
+Docker Compose cluster torn down and restored around this attempt; full
+non-chaos + chaos suites not re-run since no code changed.
+
+**Follow-ups / left open:** Same as before — the only remaining fix for
+full-scale K8s verification is a host with more physical CPU cores.
+
 ## [2026-09-06] Claude Code: Second-pass re-audit — verified the 17-finding remediation, found and fixed 4 more
 
 **Author:** Claude Code

@@ -862,6 +862,46 @@ verified against real infrastructure the same way every earlier slice was.
   a beefier host — both are follow-up work, not something to paper over by
   quietly shrinking `replicas` in the committed manifests a second time.
 
+  **Retried with a multi-node `kind` cluster, same day:** the follow-up this
+  addendum named. `kind create cluster` with an explicit 4-node config (1
+  control-plane + 3 workers) instead of the default single all-in-one node,
+  same unmodified manifests. The specific mitigation genuinely worked in
+  part: Cassandra came up cleanly across all 4 nodes with zero issues this
+  time -- the scheduler naturally spread the 4 pods across 3 different
+  worker containers (`nodetool status` confirmed both DCs healthy), and
+  Kafka's 4 brokers likewise landed on separate workers once deployed.
+  `deploy.sh` itself hit a new, previously-unseen cost specific to
+  multi-node: `kind load docker-image` now pushes each of the 5 application
+  images into all 4 node containers instead of 1, and each fresh worker had
+  to independently pull the 207MB `apache/kafka:3.8.0` image from scratch
+  (~70s each, since only the control-plane had it cached from the earlier
+  single-node attempt) -- together this ran past `deploy.sh`'s own
+  `kubectl rollout status`/`wait` timeouts (tuned for single-node speed),
+  so the script exited early on those, and the rest was applied manually to
+  keep verifying. Once Kafka's 4 JVMs began actually bootstrapping (KRaft
+  init, JIT warmup) simultaneously across the 3 worker nodes, host load
+  climbed to the *same* peak (~11-13) that triggered the single-node
+  cascade -- this time presenting as `kubectl`/`docker` themselves becoming
+  unresponsive (`TLS handshake timeout` reaching the API server; plain
+  `docker ps` itself queuing for 30+ seconds) rather than kubelet-driven pod
+  restarts, but the same underlying signal. Torn down proactively at that
+  point rather than wait for an actual crash to confirm what the load
+  average and an unresponsive Docker daemon already showed clearly enough.
+  **Conclusion: multi-node `kind` is a real, working mitigation for *where*
+  the contention lands** -- pod scheduling, health-check execution, and
+  Cassandra's own bring-up all benefited genuinely from being spread across
+  separate node cgroups instead of one shared one, and Cassandra's full
+  bring-up succeeded outright this run, further than the single-node
+  attempt got. **It does not raise the ceiling itself** -- 4 kind node
+  containers (each running their own kubelet/containerd/kube-proxy) plus
+  the full application workload still has to fit inside the same 8 real
+  CPU cores this host has always had, and once Kafka's bootstrap CPU spike
+  landed on top of that fixed per-node overhead, the aggregate demand hit
+  the same wall regardless of which container boundary it was distributed
+  across. The real fix named above narrows to just the second option: a
+  host with more CPU cores than this one, not a different `kind` topology
+  on the same one.
+
 - **Slice 18 — Backup & disaster recovery** *(was Slice 11)*. Cassandra
   snapshot/restore procedure for the multi-node cluster from Slice 7, an
   actual tested restore drill (not just a documented procedure that's never
