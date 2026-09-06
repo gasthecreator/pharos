@@ -40,6 +40,73 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Second-pass re-audit — verified the 17-finding remediation, found and fixed 4 more
+
+**Author:** Claude Code
+
+**What:** Asked to reaudit the repo after the 17-finding remediation (below)
+to confirm nothing was missed. Found and fixed four more items, none of them
+a repeat of the original 17:
+
+1. **`scripts/demo.sh` had a real bug in its own new dashboard-verification
+   step** — it queried `/query?type=site&value=$SITE_ID`, but
+   `internal/dashboard`'s actual query param is `id`, not `value`. The
+   script's own defensive fallback message ("non-fatal, didn't spot the key")
+   silently absorbed this, so the demo ran green while that one assertion
+   never actually verified anything. Fixed and confirmed live: the corrected
+   URL genuinely returns the record.
+2. **`docs/api/edge-openapi.yaml` never documented `/admin/chaos/{partition,heal,status}`**
+   — Slice 23's chaos-simulation routes on the edge collector, gated behind
+   `--enable-chaos`. Same category of gap as the ingestion spec's missing
+   DLQ-replay endpoint from the first pass, just not caught then because the
+   first pass's item #14 only looked at ingestion's spec, not edge's. Added
+   all three paths plus a `ChaosStatus` schema.
+3. **Items #1, #2, #3, and #4 from the first pass had zero permanent
+   regression test coverage** — each was verified live during that session
+   with a throwaway script, then the script was deleted per that session's
+   own cleanup discipline, leaving nothing in the actual test suite to catch
+   a future regression. Added 7 tests: `TestCassandraOutboxStore_OutboxPruning`
+   and `TestCassandraOutboxStore_DLQLeaseStealSyncsBySite` (real Cassandra,
+   `internal/dedup`), `TestCassandraCanonicalStore_LateArrivalAuditPersistence`
+   plus three `MemoryCanonicalStore` unit tests (`internal/consumer`), and
+   three `TestMetricsIsolation_*Only` tests (one per service's metrics
+   subpackage) that scrape `/metrics` from a test binary whose only import
+   is that one subpackage, directly catching the exact cross-service-leak
+   shape item #3 originally fixed.
+4. **`pharos-cli`'s own usage banner was stale the moment item #1 landed** —
+   `archive run` was still described as "move records older than the
+   threshold to cold storage," which stopped being the whole story once the
+   same command started pruning `event_outbox` outright too. Fixed, plus
+   added a missing `audit late-arrivals` example.
+
+**Why:** Direct follow-up ask ("reaudit the repo again to confirm we are not
+missing anything") after the first remediation pass landed — verifying that
+"resolved" work actually stays resolved, and using the same audit
+methodology a second time on a codebase that had just changed substantially.
+
+**How:** Systematic sweep: re-ran `go build`/`vet`/`gofmt`/`golangci-lint`
+and the full non-chaos + chaos suites first (all clean, confirming the
+first pass's fixes hadn't regressed), then checked test coverage for each
+of the first pass's real-code items specifically, cross-referenced every
+service's actual HTTP routes against its OpenAPI spec (not just the one
+spec already touched), and actually ran `scripts/demo.sh` end-to-end rather
+than relying on its earlier `bash -n` syntax check alone — that's what
+caught the wrong query parameter.
+
+**Files/modules touched:** `scripts/demo.sh`, `docs/api/edge-openapi.yaml`,
+`cmd/pharos-cli/main.go`, `internal/dedup/cassandra_integration_test.go`,
+`internal/consumer/{consumer_integration_test.go,late_arrival_audit_store_test.go}`
+(new), `internal/metrics/{edge,ingestion,consumer}metrics/isolation_test.go`
+(new).
+
+**Tests added/updated:** All 7 listed above; full non-chaos + chaos suites
+re-run clean afterward, cluster confirmed zero OOM/restarts throughout.
+
+**Follow-ups / left open:** Same as the first pass's (K8s at full scale,
+K8s internode/inter-broker TLS, dashboard read-side audit logging) — this
+pass didn't find anything new in that category, only test-coverage and
+doc-currency gaps in the first pass's own remediation.
+
 ## [2026-09-06] Claude Code: Audit remediation — full-repo review, 17 findings resolved
 
 **Author:** Claude Code

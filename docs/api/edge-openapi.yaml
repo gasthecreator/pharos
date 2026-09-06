@@ -85,6 +85,51 @@ paths:
               schema:
                 type: string
 
+  /admin/chaos/partition:
+    post:
+      summary: Simulate a network partition on this site's forwarder (§2.4, Slice 23)
+      description: >
+        Only registered when this instance is started with `--enable-chaos`
+        (off by default — any caller who can reach this port could otherwise
+        cut this site off from Central Ingestion). Stops the forwarder's
+        outbound requests from reaching Central Ingestion without touching
+        local capture: events keep queuing in the SQLite WAL, proving the
+        store-and-forward design under a real simulated outage rather than
+        just a stopped-container one. Intended caller is the web dashboard's
+        Chaos Control Panel, which requires the equivalent `--enable-chaos`
+        opt-in itself.
+      responses:
+        "200":
+          description: Partition now active
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaosStatus"
+
+  /admin/chaos/heal:
+    post:
+      summary: End a simulated network partition (§2.4, Slice 23)
+      description: Only registered under `--enable-chaos`; see `/admin/chaos/partition`.
+      responses:
+        "200":
+          description: Partition healed; forwarding resumes
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaosStatus"
+
+  /admin/chaos/status:
+    get:
+      summary: Current simulated-partition state (§2.4, Slice 23)
+      description: Only registered under `--enable-chaos`; see `/admin/chaos/partition`.
+      responses:
+        "200":
+          description: Current state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChaosStatus"
+
 components:
   schemas:
     CaptureResponse:
@@ -127,6 +172,13 @@ components:
         oldest_pending_time:
           type: string
           format: date-time
+
+    ChaosStatus:
+      type: object
+      properties:
+        partitioned:
+          type: boolean
+          description: Whether this site's forwarder is currently simulating a network partition (§2.4, Slice 23)
 
     ErrorResponse:
       type: object
