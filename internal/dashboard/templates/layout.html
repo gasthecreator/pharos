@@ -53,6 +53,7 @@
   <a href="/submit">Submit Test Event</a>
   <a href="/chaos">Chaos Panel</a>
   {{if .GrafanaURL}}<a href="{{.GrafanaURL}}" target="_blank" rel="noopener">Grafana &rarr;</a>{{end}}
+  {{if .Operator}}<span class="muted" style="margin-left:auto;color:#cdd7ff">Viewing as <strong style="color:#fff">{{.Operator}}</strong> &middot; <a href="/operator">switch</a></span>{{end}}
 </header>
 <main>
 {{block "content" .}}{{end}}

@@ -1,0 +1,14 @@
+{{define "title"}}Pharos — Identify Yourself{{end}}
+{{define "content"}}
+<h1>Identify Yourself</h1>
+<p class="subtitle">Every view of real adverse-event data through this dashboard is recorded in the access-audit
+trail (§2.4, Slice 20) — the same trail <code>pharos-cli</code>'s own <code>--operator</code> flag writes to. This is
+a one-time identification for this browser session, not a login: nothing is verified, only recorded.</p>
+
+<form class="panel" method="POST" action="/operator">
+  <label>Your name or ID</label>
+  <input type="text" name="operator" value="{{.CurrentOperator}}" required autofocus placeholder="e.g. alice@sponsor.example">
+  <input type="hidden" name="next" value="{{.Next}}">
+  <button type="submit">Continue</button>
+</form>
+{{end}}

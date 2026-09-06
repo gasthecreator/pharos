@@ -20,7 +20,11 @@ const regionPartitionAutoHeal = 60 * time.Second
 // chaosData mirrors what chaos.html actually renders.
 type chaosData struct {
 	GrafanaURL string
-	Enabled    bool
+	// Operator is always left unset -- /chaos is deliberately not
+	// operator-gated (see internal/dashboard's own package doc for why), so
+	// layout.html's "Viewing as" banner never renders here.
+	Operator string
+	Enabled  bool
 
 	Ledger       *Ledger
 	LedgerFailed bool

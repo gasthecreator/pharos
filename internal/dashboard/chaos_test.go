@@ -9,13 +9,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/chaos"
 )
 
 func newDisabledChaosHandler(t *testing.T) *Handler {
 	t.Helper()
 	svc := seedMemoryService(t)
-	h, err := NewHandler(svc, "http://unused.example", "http://localhost:3000", "", ChaosOptions{Enabled: false})
+	h, err := NewHandler(svc, audit.NewMemoryStore(), "http://unused.example", "http://localhost:3000", "", ChaosOptions{Enabled: false})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}
@@ -81,7 +82,7 @@ func TestChaosActions_RefuseWhenDisabled(t *testing.T) {
 func newEnabledChaosHandler(t *testing.T, centralURL string) *Handler {
 	t.Helper()
 	svc := seedMemoryService(t)
-	h, err := NewHandler(svc, centralURL, "http://localhost:3000", "", ChaosOptions{Enabled: true})
+	h, err := NewHandler(svc, audit.NewMemoryStore(), centralURL, "http://localhost:3000", "", ChaosOptions{Enabled: true})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}

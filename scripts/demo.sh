@@ -247,11 +247,20 @@ wait_for_log "$LOG_DIR/dashboard.log" "Ready on http" 30
 
 info "Dashboard health check:"
 curl -sf "http://localhost:$DASHBOARD_PORT/healthz" && echo
+info "Identifying as an operator (every view of real adverse-event data through the dashboard is now access-audited, same as pharos-cli's own --operator flag -- §2.4, Slice 21):"
+DASHBOARD_COOKIES=$(mktemp)
+curl -s -c "$DASHBOARD_COOKIES" -X POST "http://localhost:$DASHBOARD_PORT/operator" \
+  --data-urlencode "operator=$SITE_ID" --data-urlencode "next=/" -o /dev/null
 info "Dashboard query view for this run's own site (same query.Service pharos-cli uses):"
-curl -s "http://localhost:$DASHBOARD_PORT/query?type=site&id=$SITE_ID" | grep -o "$IDKEY" | head -1 \
+curl -s -b "$DASHBOARD_COOKIES" "http://localhost:$DASHBOARD_PORT/query?type=site&id=$SITE_ID" | grep -o "$IDKEY" | head -1 \
   && info "  -> found $IDKEY rendered on the dashboard's own query page." \
   || info "  -> (didn't spot $IDKEY in the rendered page -- non-fatal, the CLI already proved this data is queryable above)"
-info "Chaos control panel route (present but inert without --enable-chaos):"
+info "Confirming the dashboard's own view was recorded in the same access-audit trail as the CLI queries above:"
+./bin/pharos-cli audit list --operator "$SITE_ID" --ca-cert certs/ca-cert.pem --json 2>/dev/null | grep -q "QUERY_SITE" \
+  && info "  -> QUERY_SITE entry from the dashboard found in operator $SITE_ID's audit trail." \
+  || info "  -> (didn't spot a dashboard-originated entry -- non-fatal, see $LOG_DIR/dashboard.log)"
+rm -f "$DASHBOARD_COOKIES"
+info "Chaos control panel route (present but inert without --enable-chaos, and deliberately not operator-gated -- it's an infrastructure action, not a view of patient data):"
 curl -s -o /dev/null -w "  GET /chaos -> HTTP %{http_code}\n" "http://localhost:$DASHBOARD_PORT/chaos"
 
 log "Demo complete."
