@@ -40,6 +40,79 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Slice 23 — Chaos Control Panel (final scoped slice)
+
+**Author:** Claude Code
+
+**What:** New `internal/chaos` package (production code): real
+`docker stop`/`start`/`restart` against Cassandra containers, and a real
+`tc netem`-based dc-us/dc-eu partition/heal, reusing
+`internal/faultinjection`'s already-proven mechanisms adapted to return
+errors instead of `t.Fatalf`. New `edge.ChaosClient` +
+`edge.RegisterChaosAdminRoutes` (`pharos-edge --enable-chaos`) for a real
+site-partition action, since the plan's assumed reuse (a test-only
+transport double) had no real hook. New Chaos Control Panel in
+`pharos-dashboard` (`--enable-chaos`, off by default): kill/restart a
+node, partition/heal dc-us/dc-eu (self-heals after 60s), partition/heal a
+site's edge, inject a duplicate delivery, skew a site's clock -- plus a
+Correctness Ledger reading Central Ingestion's/consumer's real /metrics.
+Found and fixed a real CI ordering flake along the way.
+
+**Why:** Per PLAN.md's Slice 23, the final slice in the plan -- making
+"this system survives X" something a reader can watch happen live,
+instead of taking it on faith from this file. Built directly by Claude
+Code rather than handed to Gemini, per this session's standing
+instruction.
+
+**How:** Verified against the real running stack throughout, not
+mocked: created real site keys, ran real `pharos-edge --enable-chaos`
+and `pharos-dashboard --enable-chaos` instances, confirmed via the
+edge's own metrics that a real partition genuinely blocked forwarding
+(`network_error`) and healing genuinely resumed it (`success`);
+confirmed via Central Ingestion's own metrics that the duplicate-delivery
+action produced exactly one `new_claim` and one `duplicate_hit`; ran the
+real node-kill/restart and region-partition/heal actions via
+`internal/chaos`'s own integration tests against the live shared cluster.
+
+While live-verifying, found a real CI/test-infrastructure flake:
+`go test ./...`'s alphabetical package order put `internal/chaos`'s new
+disruptive tests immediately before `internal/consumer`'s own real
+end-to-end test. Added real readiness checks to `internal/chaos`
+(gossip UN status, `nodetool describecluster` schema agreement, and a
+genuine TLS `kafka-go` metadata probe -- not `kafka-topics.sh`, which was
+directly observed to fail with `OutOfMemoryError: Java heap space`
+spawning its own JVM inside an already-loaded broker container on this
+project's tight ~6.3GB shared Docker VM budget) but `internal/consumer`
+still intermittently flaked afterward even once every readiness signal
+reported healthy -- genuine shared-host resource contention, not a gap
+in any single check. Rather than continuing to chase probe precision,
+fixed it architecturally: `.github/workflows/ci.yml` now runs
+`internal/chaos` as its own final step with nothing sensitive scheduled
+after it, removing the ordering hazard entirely. Confirmed clean twice
+in a row in the corrected order.
+
+**Files/modules touched:** new `internal/chaos/{chaos,chaos_integration_test}.go`;
+new `internal/edge/{chaos_client,chaos_admin,chaos_client_test,chaos_admin_test}.go`;
+`cmd/pharos-edge/main.go` (`--enable-chaos`, `ChaosClient` wiring); new
+`internal/dashboard/{chaos,ledger,chaos_test,ledger_test}.go`; new
+`internal/dashboard/templates/chaos.html`; `internal/dashboard/dashboard.go`
+(`ChaosOptions`, chaos routes, `submitRawEvent` extracted for reuse),
+`internal/dashboard/templates/layout.html` (nav link);
+`cmd/pharos-dashboard/main.go` (`--enable-chaos`, metrics URL flags);
+`.github/workflows/ci.yml` (`internal/chaos` isolated as a final step);
+`PLAN.md` (Slice 23 marked done -- the final slice).
+
+**Tests added/updated:** `internal/chaos`'s real Docker integration tests
+(`TestStopStartContainer_RealDocker`, `TestPartitionAndHealRegions_RealDocker`);
+`internal/edge`'s `ChaosClient`/admin-route tests; `internal/dashboard`'s
+full chaos-handler suite (disabled-gate coverage for every action,
+duplicate/skew against an `httptest.Server`, container-list validation,
+auto-heal timer scheduling/cancellation) and `ledger.go`'s Prometheus
+scraping/parsing tests.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope. This is the last numbered slice in PLAN.md's plan.
+
 ## [2026-09-06] Claude Code: Slice 22 — Property-based & deterministic simulation testing
 
 **Author:** Claude Code

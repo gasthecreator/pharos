@@ -1404,6 +1404,117 @@ naturally waits for Slice 14.
 **Who builds it:** feature work, so Gemini per the established split in
 §6 — Claude scopes/reviews as usual.
 
+**Done 2026-09-06.** *(Built by Claude Code directly, superseding the
+Gemini split — this session's standing instruction to complete every
+remaining scoped slice itself.)* This is the final slice in this
+project's numbered plan.
+
+New `internal/chaos` package (production code, not test-only): `StopContainer`/
+`StartContainer`/`RestartContainer` (`docker stop`/`start`/`restart` against
+the real `pharos-cassandra-N` containers) and `PartitionRegions`/
+`HealRegionPartition`, reusing the exact `tc netem`-via-`docker-exec`
+mechanism `internal/faultinjection/regional_partition_test.go` already
+proved correct, adapted to return errors instead of calling `t.Fatalf` so
+it's callable from a running process, not just a test binary.
+
+**Site partition needed genuinely new capability, not reuse**, contrary to
+this slice's own original phrasing ("the same transport-blocking pattern
+`internal/faultinjection` already uses... against a real edge instance
+instead of a test harness"): that pattern
+(`network_partition_test.go`'s `partitionableTransport`) is a pure
+in-process test double with no hook a running `pharos-edge` process could
+ever expose. Built a real equivalent instead: new `edge.ChaosClient`
+(wraps the real `HTTPClient`, defaults to pass-through, `SetPartitioned`
+toggles a simulated connection-refused failure) and
+`edge.RegisterChaosAdminRoutes` (`/admin/chaos/partition`|`heal`|`status`),
+wired into `cmd/pharos-edge/main.go` behind a new `--enable-chaos` flag on
+`pharos-edge` itself — the dashboard has no standing knowledge of which
+edges exist or their credentials, so the operator supplies the target
+edge's own admin URL per action, matching the same "human supplies the
+specific target per request" pattern replay/submit already established
+in Slice 21.
+
+**Duplicate delivery and clock skew both reuse the existing submission
+proxy** (Slice 21's `submitRawEvent`, factored out of `handleSubmitPost`
+for this reuse) rather than inventing a second write path: "inject a
+duplicate" is the identical payload POSTed twice in a row (the real
+mechanism `internal/ingestion/outbox_test.go`'s own
+`TestSequentialDuplicateIdempotency` already proves at the unit level,
+exercised here against the real running Central Ingestion); "skew a
+site's clock" submits one real event with `date`/`recordedDate` offset
+from now by an operator-supplied Go duration — data-level skew, not
+literal OS clock manipulation (edge has no `Clock` abstraction in
+production, and this project's actual resilience claim is about
+handling skewed *event timestamps*, which is what the watermark/
+late-arrival machinery already exists to prove, not about the host
+clock itself).
+
+**Correctness Ledger** reads Central Ingestion's and `pharos-consumer`'s
+real `/metrics` endpoints (Slice 6) via a small (~60 line) Prometheus
+exposition-format line scanner (`internal/dashboard/ledger.go`) — no new
+data source, no new metrics client dependency. Surfaces requests total,
+new-claim/duplicate-hit counts, DLQ writes, consumed/late-arrival/error
+counts, Kafka lag, and the current watermark (with computed age) —
+everything this slice's scope asked for that the existing metrics
+already expose.
+
+**Safety guard implemented exactly as specified, not assumed**: a new
+`ChaosOptions{Enabled bool}` on `pharos-dashboard` (`--enable-chaos`, off
+by default) gates every action handler *individually* (`requireChaosEnabled`,
+checked first in every one) — not just route registration, so there's no
+way to reach a live action even via a direct request while disabled. The
+region-partition action additionally self-heals after 60s
+(`time.AfterFunc`, cancelable if healed manually first) so a forgotten
+browser tab can't leave the real cluster partitioned indefinitely — an
+explicit safety net beyond what was asked, since the operator flag alone
+doesn't protect against simply forgetting to heal.
+
+**A real, previously-undiscovered CI/test-infrastructure flake was found
+and fixed while live-verifying this slice**: `go test ./...` runs packages
+in alphabetical order, which put `internal/chaos`'s new disruptive tests
+(a real `docker stop`/`start` cycle on a live Cassandra node, a real
+`tc`-based dc-us/dc-eu partition + heal) immediately before
+`internal/consumer`'s own real end-to-end test. Even after this project's
+already-tight ~6.3GB shared Docker VM budget settled by every readiness
+signal tried (gossip UN status, `nodetool describecluster` schema
+agreement, and finally a genuine TLS `kafka-go` metadata probe — deliberately
+*not* `kafka-topics.sh`, which was directly observed to fail with
+`OutOfMemoryError: Java heap space` spawning its own JVM inside an
+already-loaded broker container, itself a real illustration of how tight
+this budget is), `internal/consumer`'s test still intermittently hit
+spurious Cassandra/Kafka timeouts immediately afterward. Rather than
+continuing to chase an ever more precise readiness probe for what is
+fundamentally shared-host resource contention, `.github/workflows/ci.yml`
+now runs `internal/chaos` as its own final step, with nothing sensitive
+scheduled immediately after it — removing the ordering hazard entirely
+instead of narrowing its probability. The three readiness checks stay in
+`internal/chaos`'s own tests regardless (still correct and valuable for
+that package's own internal reliability, e.g. its own second
+partition-after-heal call depends on the first heal having genuinely
+completed).
+
+**Verified live, not assumed**, against the real running stack: built real
+`pharos-ingestion`/`pharos-edge`/`pharos-dashboard`/`pharos-cli` binaries.
+Confirmed the Correctness Ledger renders real, live data (ingestion
+`/metrics` reachable, consumer's correctly reported unreachable since none
+was running). Ran a real site-partition/heal cycle against a real
+`pharos-edge --enable-chaos` instance: confirmed via the edge's own
+`/admin/chaos/status` and `pharos_edge_forwarder_outcomes_total` metric
+that forwarding genuinely failed (`network_error`) while partitioned and
+genuinely resumed (`success`) after healing — the real store-and-forward
+recovery cycle (§2.1), not simulated. Ran the real duplicate-delivery
+action and confirmed via Central Ingestion's own metrics exactly one
+`new_claim` and one `duplicate_hit` resulted. Ran the real clock-skew
+action and confirmed the event was accepted with the deliberately skewed
+timestamp. Ran the real node-kill/restart and region-partition/heal
+actions directly via `internal/chaos`'s own integration tests against the
+live shared cluster (confirmed via `nodetool status` before/after that the
+cluster returned to full health).
+
+Full suite passed cleanly twice in a row with `internal/chaos` correctly
+isolated as CI now runs it (`go test -race -count=1 -p 1` over every other
+package, then `internal/chaos` on its own).
+
 ---
 
 ## 2. Core engineering challenges (design decisions)

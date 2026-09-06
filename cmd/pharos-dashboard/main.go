@@ -23,6 +23,9 @@ func main() {
 	centralURL := flag.String("central-url", "http://localhost:8091", "Central Ingestion base URL, for DLQ replay and test-event submission")
 	grafanaURL := flag.String("grafana-url", "http://localhost:3000", "Grafana base URL to link out to for system health (§2.4, Slice 6); empty hides the link")
 	useMemory := flag.Bool("memory", false, "Run with in-memory sample data for offline demo (no Cassandra required)")
+	enableChaos := flag.Bool("enable-chaos", false, "Enable the Chaos Control Panel's infrastructure-mutating actions (§2.4, Slice 23); off by default -- only ever enable this on a local/demo instance")
+	ingestionMetricsURL := flag.String("ingestion-metrics-url", "http://localhost:8091/metrics", "Central Ingestion's /metrics endpoint, for the Correctness Ledger panel")
+	consumerMetricsURL := flag.String("consumer-metrics-url", "http://localhost:9091/metrics", "pharos-consumer's /metrics endpoint, for the Correctness Ledger panel")
 	flag.Parse()
 
 	log.Printf("[pharos-dashboard] Starting on port %d...", *port)
@@ -48,7 +51,15 @@ func main() {
 	}
 	defer svc.Close()
 
-	handler, err := dashboard.NewHandler(svc, *centralURL, *grafanaURL, *caCert)
+	chaosOpts := dashboard.ChaosOptions{
+		Enabled:             *enableChaos,
+		IngestionMetricsURL: *ingestionMetricsURL,
+		ConsumerMetricsURL:  *consumerMetricsURL,
+	}
+	if *enableChaos {
+		log.Println("[pharos-dashboard] WARNING: --enable-chaos is set -- the Chaos Control Panel can stop/restart real Cassandra nodes and partition dc-us/dc-eu. Only run this on a local/demo instance.")
+	}
+	handler, err := dashboard.NewHandler(svc, *centralURL, *grafanaURL, *caCert, chaosOpts)
 	if err != nil {
 		log.Fatalf("[pharos-dashboard] Failed to initialize handler: %v", err)
 	}

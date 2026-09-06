@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gasthecreator/pharos/internal/consumer"
@@ -31,6 +32,17 @@ import (
 //go:embed templates/*.html
 var templateFS embed.FS
 
+// ChaosOptions configures the §2.4, PLAN.md Slice 23 Chaos Control Panel.
+// The zero value (Enabled: false) disables it entirely -- chaos actions
+// mutate real running infrastructure, so the dashboard must never expose
+// them just because it happens to be reachable; this is Slice 23's own
+// explicit safety guard, not an assumption left to the caller.
+type ChaosOptions struct {
+	Enabled             bool
+	IngestionMetricsURL string
+	ConsumerMetricsURL  string
+}
+
 // Handler serves every pharos-dashboard route.
 type Handler struct {
 	svc        query.Service
@@ -38,6 +50,15 @@ type Handler struct {
 	grafanaURL string
 	httpClient *http.Client
 	templates  map[string]*template.Template
+
+	chaos           ChaosOptions
+	regionHealMu    sync.Mutex
+	regionHealTimer *time.Timer
+	// regionAutoHealOverride, if set, replaces regionPartitionAutoHeal's
+	// fixed duration -- test-only (unexported, same-package tests can set
+	// it directly), so a determinism/timeout test doesn't have to wait 60
+	// real seconds for the production auto-heal window.
+	regionAutoHealOverride time.Duration
 }
 
 // NewHandler constructs a dashboard Handler. caCert, if non-empty, is used
@@ -47,7 +68,7 @@ type Handler struct {
 // this exact gap there; the dashboard's proxy path needs it for the same
 // reason: every real deployment runs Central Ingestion behind this
 // project's self-signed CA, not a publicly trusted one).
-func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string) (*Handler, error) {
+func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string, chaos ChaosOptions) (*Handler, error) {
 	client := &http.Client{Timeout: 15 * time.Second}
 	if caCert != "" {
 		tlsCfg, err := (tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}).StdTLSConfig()
@@ -66,6 +87,7 @@ func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string) (*Hand
 		grafanaURL: grafanaURL,
 		httpClient: client,
 		templates:  templates,
+		chaos:      chaos,
 	}, nil
 }
 
@@ -76,7 +98,7 @@ func NewHandler(svc query.Service, centralURL, grafanaURL, caCert string) (*Hand
 // colliding with each other, since html/template's block/define names are
 // only scoped within one template.Template.
 func loadTemplates() (map[string]*template.Template, error) {
-	pages := []string{"index.html", "query.html", "dlq_list.html", "dlq_detail.html", "submit.html"}
+	pages := []string{"index.html", "query.html", "dlq_list.html", "dlq_detail.html", "submit.html", "chaos.html"}
 	out := make(map[string]*template.Template, len(pages))
 	for _, page := range pages {
 		t, err := template.ParseFS(templateFS, "templates/layout.html", "templates/"+page)
@@ -118,6 +140,21 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /submit", h.handleSubmitForm)
 	mux.HandleFunc("POST /submit", h.handleSubmitPost)
 	mux.HandleFunc("GET /healthz", h.handleHealth)
+
+	// Chaos Control Panel (§2.4, PLAN.md Slice 23) -- registered
+	// unconditionally so /chaos always exists and clearly reports itself as
+	// disabled rather than 404ing (less confusing than "page not found" for
+	// an operator who forgot --enable-chaos); every ACTION handler still
+	// individually refuses to do anything unless h.chaos.Enabled, so the
+	// safety guard doesn't depend on this registration choice.
+	mux.HandleFunc("GET /chaos", h.handleChaosPanel)
+	mux.HandleFunc("POST /chaos/cassandra", h.handleChaosCassandra)
+	mux.HandleFunc("POST /chaos/region/partition", h.handleChaosRegionPartition)
+	mux.HandleFunc("POST /chaos/region/heal", h.handleChaosRegionHeal)
+	mux.HandleFunc("POST /chaos/edge/partition", h.handleChaosEdgePartition)
+	mux.HandleFunc("POST /chaos/edge/heal", h.handleChaosEdgeHeal)
+	mux.HandleFunc("POST /chaos/duplicate", h.handleChaosDuplicate)
+	mux.HandleFunc("POST /chaos/skew", h.handleChaosSkew)
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -403,24 +440,42 @@ func (h *Handler) handleSubmitPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body, err := json.Marshal(struct {
-		SiteID string            `json:"site_id"`
-		Events []json.RawMessage `json:"events"`
-	}{SiteID: siteID, Events: []json.RawMessage{json.RawMessage(payload)}})
+	statusCode, respBody, err := h.submitRawEvent(r.Context(), siteID, apiKey, []byte(payload))
 	if err != nil {
-		data.Result = "Failed to build request: " + err.Error()
+		data.Result = "Could not reach Central Ingestion at " + h.centralURL + ": " + err.Error()
 		data.ResultError = true
 		h.render(w, "submit.html", data)
 		return
 	}
 
-	url := h.centralURL + "/api/v1/events"
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		data.Result = "Failed to build request: " + err.Error()
+	if statusCode == http.StatusOK {
+		data.Result = fmt.Sprintf("HTTP %d:\n%s", statusCode, respBody)
+	} else {
+		data.Result = fmt.Sprintf("HTTP %d:\n%s", statusCode, respBody)
 		data.ResultError = true
-		h.render(w, "submit.html", data)
-		return
+	}
+	h.render(w, "submit.html", data)
+}
+
+// submitRawEvent POSTs one FHIR AdverseEvent payload to Central Ingestion's
+// real /api/v1/events endpoint, wrapped in the real BatchRequest shape --
+// shared by handleSubmitPost and the Chaos Control Panel's duplicate/skew
+// actions (§2.4, Slice 23), all of which are "submit this exact event
+// through the real pipeline" at heart, differing only in what constructs
+// payload and how many times it's called.
+func (h *Handler) submitRawEvent(ctx context.Context, siteID, apiKey string, payload []byte) (statusCode int, body string, err error) {
+	reqBody, err := json.Marshal(struct {
+		SiteID string            `json:"site_id"`
+		Events []json.RawMessage `json:"events"`
+	}{SiteID: siteID, Events: []json.RawMessage{json.RawMessage(payload)}})
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to build request: %w", err)
+	}
+
+	url := h.centralURL + "/api/v1/events"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(reqBody))
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Site-ID", siteID)
@@ -428,21 +483,11 @@ func (h *Handler) handleSubmitPost(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		data.Result = "Could not reach Central Ingestion at " + h.centralURL + ": " + err.Error()
-		data.ResultError = true
-		h.render(w, "submit.html", data)
-		return
+		return 0, "", err
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode == http.StatusOK {
-		data.Result = fmt.Sprintf("HTTP %d:\n%s", resp.StatusCode, string(respBody))
-	} else {
-		data.Result = fmt.Sprintf("HTTP %d:\n%s", resp.StatusCode, string(respBody))
-		data.ResultError = true
-	}
-	h.render(w, "submit.html", data)
+	return resp.StatusCode, string(respBody), nil
 }
 
 const defaultSamplePayload = `{

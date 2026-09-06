@@ -15,7 +15,7 @@ import (
 
 func newTestHandler(t *testing.T, svc query.Service, centralURL string) *Handler {
 	t.Helper()
-	h, err := NewHandler(svc, centralURL, "http://localhost:3000", "")
+	h, err := NewHandler(svc, centralURL, "http://localhost:3000", "", ChaosOptions{})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}
