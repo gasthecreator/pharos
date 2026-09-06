@@ -17,40 +17,33 @@ import (
 	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/kafka"
-	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/metrics/ingestionmetrics"
 	"github.com/gasthecreator/pharos/internal/model"
 	"github.com/gasthecreator/pharos/internal/ratelimit"
+	"github.com/gasthecreator/pharos/internal/wire"
 )
 
-// EventStatus constants for ingestion results.
+// EventStatus constants for ingestion results -- aliased from internal/wire
+// (audit remediation, §2.4 PLAN.md), the canonical, dependency-free home
+// for every type on this package's wire boundary with internal/edge. Kept
+// as aliases (not re-declared) so every existing internal/ingestion call
+// site below keeps compiling unchanged -- StatusAccepted here and
+// wire.StatusAccepted are the exact same value, not a lookalike constant.
 const (
-	StatusAccepted = "ACCEPTED"
-	StatusRejected = "REJECTED"
-	StatusFailed   = "FAILED" // Transient infrastructure failure (Cassandra outbox or Kafka publish error) requiring retry (§2.1, §2.2)
+	StatusAccepted = wire.StatusAccepted
+	StatusRejected = wire.StatusRejected
+	StatusFailed   = wire.StatusFailed
 )
 
-// EventResult represents the validation and ingestion result for a single adverse event.
-type EventResult struct {
-	IdempotencyKey string `json:"idempotency_key"`
-	Status         string `json:"status"`
-	Error          string `json:"error,omitempty"`
-}
-
-// BatchRequest represents the wire format for submitting a batch of events to Central Ingestion.
-type BatchRequest struct {
-	SiteID string            `json:"site_id,omitempty"`
-	Events []json.RawMessage `json:"events"`
-}
-
-// BatchResponse represents the structured response returned by Central Ingestion.
-type BatchResponse struct {
-	Total    int           `json:"total"`
-	Accepted int           `json:"accepted"`
-	Rejected int           `json:"rejected"`
-	Failed   int           `json:"failed,omitempty"`
-	Results  []EventResult `json:"results"`
-	Error    string        `json:"error,omitempty"`
-}
+// EventResult, BatchRequest, and BatchResponse are type aliases (`=`, not
+// new types) to internal/wire's definitions -- every existing field access,
+// struct literal, and function signature in this package keeps working
+// unchanged, while internal/edge can now depend on internal/wire directly
+// instead of transitively pulling in this entire package (and its
+// package-level Prometheus metric registrations) just for these three types.
+type EventResult = wire.EventResult
+type BatchRequest = wire.BatchRequest
+type BatchResponse = wire.BatchResponse
 
 // Handler handles Central Ingestion HTTP intake (§2.3).
 type Handler struct {
@@ -237,7 +230,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 	}
 
 	if unmarshalErr != nil {
-		metrics.ValidationFailuresTotal.Inc()
+		ingestionmetrics.ValidationFailuresTotal.Inc()
 		errMsg := "malformed event payload: " + unmarshalErr.Error()
 		result := EventResult{
 			IdempotencyKey: keyStr,
@@ -273,7 +266,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 						"site_id":          siteID,
 						"rejection_reason": "malformed JSON payload",
 					})
-					metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
+					ingestionmetrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
 					if pErr != nil {
 						unlock()
 						return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
@@ -287,7 +280,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, claim.ClaimedAt, kafka.DLQTopic, 0, 0)
 				}
 				atomic.AddUint64(&h.dlqCount, 1)
-				metrics.DLQWritesTotal.Inc()
+				ingestionmetrics.DLQWritesTotal.Inc()
 			}
 			unlock()
 		}
@@ -296,7 +289,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 
 	valErr := ev.Validate()
 	if valErr != nil {
-		metrics.ValidationFailuresTotal.Inc()
+		ingestionmetrics.ValidationFailuresTotal.Inc()
 		result := EventResult{
 			IdempotencyKey: keyStr,
 			Status:         StatusRejected,
@@ -331,7 +324,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 						"site_id":          siteID,
 						"rejection_reason": valErr.Error(),
 					})
-					metrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
+					ingestionmetrics.OutboxPublishDuration.WithLabelValues(kafka.DLQTopic).Observe(time.Since(publishStart).Seconds())
 					if pErr != nil {
 						unlock()
 						return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
@@ -345,7 +338,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 					_ = h.outboxStore.MarkDLQPublished(ctx, keyStr, claim.ClaimedAt, kafka.DLQTopic, 0, 0)
 				}
 				atomic.AddUint64(&h.dlqCount, 1)
-				metrics.DLQWritesTotal.Inc()
+				ingestionmetrics.DLQWritesTotal.Inc()
 			}
 			unlock()
 		}
@@ -375,14 +368,14 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 		}
 
 		if claim.Acquired {
-			metrics.DedupOutcomesTotal.WithLabelValues("new_claim").Inc()
+			ingestionmetrics.DedupOutcomesTotal.WithLabelValues("new_claim").Inc()
 			if h.producer != nil {
 				publishStart := time.Now()
 				meta, pErr := h.producer.Publish(ctx, kafka.MainTopic, []byte(siteID), raw, map[string]string{
 					"idempotency_key": keyStr,
 					"site_id":         siteID,
 				})
-				metrics.OutboxPublishDuration.WithLabelValues(kafka.MainTopic).Observe(time.Since(publishStart).Seconds())
+				ingestionmetrics.OutboxPublishDuration.WithLabelValues(kafka.MainTopic).Observe(time.Since(publishStart).Seconds())
 				if pErr != nil {
 					unlock()
 					return eventProcessResult{Outcome: outcomeFailed, Result: EventResult{
@@ -399,7 +392,7 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 			// Duplicate or concurrent in-flight
 			if claim.Status == dedup.StatusPublished {
 				atomic.AddUint64(&h.dedupHits, 1)
-				metrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
+				ingestionmetrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
 			}
 		}
 		unlock()
@@ -417,8 +410,8 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	rw := &statusRecordingWriter{ResponseWriter: w, statusCode: http.StatusOK}
 	w = rw
 	defer func() {
-		metrics.IngestionRequestsTotal.WithLabelValues(strconv.Itoa(rw.statusCode)).Inc()
-		metrics.IngestionRequestDuration.Observe(time.Since(start).Seconds())
+		ingestionmetrics.RequestsTotal.WithLabelValues(strconv.Itoa(rw.statusCode)).Inc()
+		ingestionmetrics.RequestDuration.Observe(time.Since(start).Seconds())
 	}()
 
 	if r.Method != http.MethodPost {
@@ -516,7 +509,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 
 	if !allowed {
 		atomic.AddUint64(&h.throttledReqs, 1)
-		metrics.RateLimitRejectionsTotal.WithLabelValues(siteID).Inc()
+		ingestionmetrics.RateLimitRejectionsTotal.WithLabelValues(siteID).Inc()
 		resetSecs := int(limitRes.ResetAfter.Seconds())
 		if resetSecs < 1 {
 			resetSecs = 1

@@ -156,7 +156,7 @@ Every decision, review finding, and fix is in `WORKLOG.md` and `ARCHITECTURE_PRO
 
 ## What's here vs. what's next
 
-This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. There's no deployment automation (Kubernetes manifests, Slice 17, in progress), backup/DR plan, multi-instance scaling, or compliance/access-audit logging exercised yet. Observability (Prometheus + Grafana, Slice 6), a genuine multi-region cluster — dc-us: 3-node Cassandra/RF=3 + 3-broker Kafka, dc-eu: 1-node Cassandra/RF=1 + 1-broker Kafka, MirrorMaker 2 replication, `LOCAL_QUORUM` reads/writes (Slices 7, 14) — real per-site API-key auth and project-owned TLS across every service (Slice 15), and real load-test numbers under real multi-site traffic (Slice 16: p95 ~101ms, confirmed per-site rate-limit isolation, the Cassandra outbox's Paxos LWT insert identified as the actual bottleneck) are all real, not aspirational; closing the rest of the gap is ongoing work, not a gap in what's already been built; see `PLAN.md`'s roadmap section for the specifics.
+This is genuinely portfolio-ready, not production-ready — those are different bars, and it's worth being direct about the difference rather than implying more maturity than exists. Observability (Prometheus + Grafana, Slice 6), a genuine multi-region cluster — dc-us: 3-node Cassandra/RF=3 + 3-broker Kafka, dc-eu: 1-node Cassandra/RF=1 + 1-broker Kafka, MirrorMaker 2 replication, `LOCAL_QUORUM` reads/writes (Slices 7, 14) — real per-site API-key auth and project-owned TLS across every service (Slice 15), real load-test numbers under real multi-site traffic (Slice 16: p95 ~101ms, confirmed per-site rate-limit isolation, the Cassandra outbox's Paxos LWT insert identified as the actual bottleneck), Kubernetes deployment manifests (Slice 17), a real backup/restore drill (Slice 18), 2+ instances of `pharos-consumer` sharing one Kafka consumer group (Slice 19), and durable access-audit logging for every `pharos-cli` query/DLQ/replay action (Slice 20) are all real, not aspirational. A server-rendered web dashboard (Slice 21) and a live chaos-injection control panel for demoing partition/duplicate/clock-skew recovery (Slice 23) sit on top of all of it. Closing the remaining gaps (see `PLAN.md`'s roadmap section, and its own "audit remediation" entries for the honest list of what's still deliberately deferred vs. what was simply found and fixed) is ongoing work, not a gap in what's already been built.
 
 ### Observability
 
@@ -169,8 +169,10 @@ cmd/pharos-edge         Per-site collector: HTTP capture + SQLite WAL + forwarde
 cmd/pharos-ingestion    Central Ingestion: rate-limit, validate, dedup/outbox, publish
 cmd/pharos-consumer     Kafka consumer: watermarking, canonical Cassandra writes
 cmd/pharos-cli          Query & DLQ inspection CLI
+cmd/pharos-dashboard    Server-rendered web dashboard + chaos control panel (Slices 21, 23)
 internal/               Implementation packages, one per concern above plus faultinjection
 migrations/             Cassandra schema (bootstrapped automatically at startup too)
+deploy/                 Dockerfiles and Kubernetes manifests for every service (Slice 17)
 docs/api/               OpenAPI specs for the edge and Central Ingestion HTTP APIs
 PLAN.md                 Living architecture doc — source of truth for every design decision
 ARCHITECTURE_PROPOSALS.md   Proposal/review trail for every non-trivial design change

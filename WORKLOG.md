@@ -40,6 +40,102 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Audit remediation — full-repo review, 17 findings resolved
+
+**Author:** Claude Code
+
+**What:** A full-repo audit against PLAN.md and every other doc, looking
+specifically for things deferred/missed but never explicitly excluded from
+scope (as distinct from deliberate, documented exclusions). Found 17 items;
+resolved all 17. Summary by category:
+
+*Real code fixes:* (1) `event_outbox`/`pending_outbox` had zero pruning —
+added `event_outbox_by_site` index + `archive.RunOutboxPrune`, wired into
+`pharos-cli archive run`, deleting PUBLISHED rows outright (no export —
+`canonical_events`' own idempotent upsert is the permanent dedup backstop,
+so this can't reintroduce duplication). (2) `LateArrivalAudit` (21 CFR Part
+11) was in-memory only — added `consumer_late_arrival_audits`, an
+idempotent upsert keyed the same way the in-memory dedup already was, plus
+`pharos-cli audit late-arrivals`. (3) `internal/edge` importing
+`internal/ingestion` for wire types polluted every service's `/metrics`
+with every other service's metric names — extracted `internal/wire`, split
+`internal/metrics` into per-service subpackages. (4)
+`dead_letter_events_by_site` went stale during DLQ lease-steal recovery —
+now mirrors the steal. (5) `internal/edge/sqlite_store.go` built SQL via
+`fmt.Sprintf` for status constants — now parameterized, only the `IN (...)`
+list stays templated.
+
+*Real infrastructure changes, verified live:* (6) K8s full-scale topology
+(2 DC/4 Cassandra/4 Kafka) attempted for the first time — Cassandra/Kafka
+came up clean, but the migrations Job triggered a genuine CPU-contention
+cascading failure once `kind`'s own control-plane overhead stacked on the
+identical app workload on this 8-core host; not a manifest bug, see PLAN.md
+Slice 17's addendum. (7) Cassandra internode + Kafka inter-broker TLS
+re-enabled (previously narrowed under memory pressure) — genuinely works
+at the topology that ships now, verified via real TLS handshake log lines
+and a full test-suite pass; needed two follow-on fixes found only under
+real load: MirrorMaker 2's AdminClient needed SSL config for the now-SSL
+`INTERNAL` listener (was misreading TLS bytes as a Kafka length prefix and
+OOMing), and Kafka's own JVM heap needed 192M -> 320M once `INTERNAL`
+carried real SSL traffic too (a JVM-internal OOM Docker's own OOM killer
+never caught). Not carried into K8s.
+
+*Doc/code drift reconciled:* (8) PLAN.md's retry/backoff numbers vs actual
+code (mostly accurate, some genuinely undocumented behavior added). (9)
+FHIR field list missing `category`/`outcome`/`recorder`. (10) A stale
+paragraph describing a secondary-index design that was actually replaced
+by `dead_letter_events_by_site`. (11) Dashboard's read-only views lack the
+CLI's access-audit trail — documented as a deliberate asymmetry (Slice 21's
+own "portfolio accessibility, not production hardening" framing), not
+retrofitted.
+
+*Documentation currency:* (12) README's "what's next" section and repo
+layout, stale since ~Slice 16. (13) SECURITY.md's auth/TLS/deployment
+claims, all false since Slice 15/17-20. (14) OpenAPI spec missing the DLQ
+replay endpoint and auth scheme. (15) Makefile missing `pharos-dashboard`.
+(16) No `Dockerfile.dashboard`/K8s manifest for the dashboard — both added,
+built, and smoke-tested. (17) `scripts/demo.sh` never exercised Slices
+20-23, and — found while fixing this — was actually broken (missing
+`--operator`, added after the script was written); fixed and extended to
+show the audit trail and the dashboard/chaos panel.
+
+**Why:** Standing instruction to complete everything scoped, no shortcuts;
+this was the follow-up "what did we miss" pass after Slices 20-23 shipped.
+
+**How:** Each item verified against real infrastructure, not just code
+review — see individual PLAN.md/ARCHITECTURE_PROPOSALS.md addenda dated
+2026-09-06 for the specific evidence (log lines, `docker stats`, test
+runs). Items 6 and 7 (the two flagged as touching shared live infra) were
+confirmed with the user before attempting; item 6's cluster was restarted
+clean first and torn down once it was clearly failing rather than left to
+degrade the host further.
+
+**Files/modules touched:** `internal/wire/` (new), `internal/metrics/{ingestion,consumer,edge}metrics/`
+(new), `internal/archive/job.go`, `internal/dedup/{cassandra_store,store}.go`,
+`internal/consumer/{canonical_store,engine,watermark}.go`,
+`internal/edge/{forwarder,sqlite_store}.go`, `internal/ingestion/handler.go`,
+`internal/dashboard/dashboard.go`, `cmd/pharos-{cli,edge,consumer}/main.go`,
+`migrations/006_event_outbox_pruning.cql`, `docker-compose.yml`,
+`scripts/{generate_certs.sh,demo.sh}`, `kafka/mm2.properties`,
+`deploy/docker/Dockerfile.dashboard` (new), `deploy/k8s/10-dashboard.yaml`
+(new), `deploy/k8s/{deploy.sh,README.md}`, `Makefile`, `README.md`,
+`SECURITY.md`, `docs/api/ingestion-openapi.yaml`, `PLAN.md`,
+`ARCHITECTURE_PROPOSALS.md`.
+
+**Tests added/updated:** `internal/consumer` test files updated for
+`ProcessEvent`'s new return value; `consumer_integration_test.go`'s own
+timeout bumped (60s/50s) after real TLS/crypto cost per hop made the
+original budget unreliable — confirmed via a 180s/170s run that the
+underlying operation was correct, just slower, not hanging. Full
+non-chaos + chaos suites re-run clean after every infrastructure change in
+this entry, not just after the last one.
+
+**Follow-ups / left open:** K8s internode/inter-broker TLS (would need the
+same re-enablement item 7 did, on top of item 6's still-unresolved
+CPU-contention problem). A multi-node `kind` cluster or a larger host, to
+actually finish item 6. Dashboard read-side audit logging, if this project
+ever moves past "portfolio accessibility" framing (see item 11's writeup).
+
 ## [2026-09-06] Claude Code: Slice 23 — Chaos Control Panel (final scoped slice)
 
 **Author:** Claude Code

@@ -13,6 +13,7 @@ import (
 
 	"github.com/gasthecreator/pharos/internal/edge"
 	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/metrics/edgemetrics"
 	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
 
@@ -111,11 +112,11 @@ func main() {
 				if err != nil {
 					continue
 				}
-				metrics.EdgeQueueDepth.Set(float64(stats.PendingCount))
+				edgemetrics.QueueDepth.Set(float64(stats.PendingCount))
 				if !stats.OldestPendingTime.IsZero() {
-					metrics.EdgeQueueOldestPendingSeconds.Set(time.Since(stats.OldestPendingTime).Seconds())
+					edgemetrics.QueueOldestPendingSeconds.Set(time.Since(stats.OldestPendingTime).Seconds())
 				} else {
-					metrics.EdgeQueueOldestPendingSeconds.Set(0)
+					edgemetrics.QueueOldestPendingSeconds.Set(0)
 				}
 			}
 		}

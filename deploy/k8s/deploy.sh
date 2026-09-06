@@ -20,10 +20,11 @@ docker build -f "${ROOT_DIR}/deploy/docker/Dockerfile.ingestion" -t pharos-inges
 docker build -f "${ROOT_DIR}/deploy/docker/Dockerfile.consumer" -t pharos-consumer:local "${ROOT_DIR}"
 docker build -f "${ROOT_DIR}/deploy/docker/Dockerfile.edge" -t pharos-edge:local "${ROOT_DIR}"
 docker build -f "${ROOT_DIR}/deploy/docker/Dockerfile.cli" -t pharos-cli:local "${ROOT_DIR}"
+docker build -f "${ROOT_DIR}/deploy/docker/Dockerfile.dashboard" -t pharos-dashboard:local "${ROOT_DIR}"
 
 if command -v kind &>/dev/null && kind get clusters 2>/dev/null | grep -q "^pharos$"; then
   log "Loading images into kind cluster 'pharos'"
-  kind load docker-image pharos-ingestion:local pharos-consumer:local pharos-edge:local pharos-cli:local --name pharos
+  kind load docker-image pharos-ingestion:local pharos-consumer:local pharos-edge:local pharos-cli:local pharos-dashboard:local --name pharos
 fi
 
 CERT_DIR="${K8S_DIR}/certs"
@@ -112,6 +113,10 @@ fi
 log "Deploying Prometheus"
 kubectl apply -f "${K8S_DIR}/08-observability.yaml"
 kubectl rollout status deployment/prometheus -n "${NAMESPACE}" --timeout=120s
+
+log "Deploying pharos-dashboard"
+kubectl apply -f "${K8S_DIR}/10-dashboard.yaml"
+kubectl rollout status deployment/pharos-dashboard -n "${NAMESPACE}" --timeout=120s
 
 log "Done. kubectl get pods -n ${NAMESPACE}"
 kubectl get pods -n "${NAMESPACE}"

@@ -8,6 +8,11 @@
 // the one write path (DLQ replay, and submitting a test event) requires the
 // human at the browser to supply the real owning site's own credentials
 // per request; the dashboard never stores or remembers them.
+//
+// Read-only query/DLQ views deliberately record no access-audit entry,
+// unlike pharos-cli's equivalent commands (§2.4, Slice 20: --operator
+// required, every call audited) -- see PLAN.md's Slice 21 writeup ("Read-side
+// audit asymmetry") for the reasoning and what closing this gap would need.
 package dashboard
 
 import (

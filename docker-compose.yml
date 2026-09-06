@@ -84,6 +84,23 @@ services:
   # routes queries through it, which coordinates with replicas across pharos-net.
   # cap_add: NET_ADMIN enables tc netem for the simulated-WAN-latency and
   # regional-partition fault-injection scenarios.
+  #
+  # Re-enabled [2026-09-06], audit remediation: internode_encryption is now
+  # `all` (scripts/generate_certs.sh patches server_encryption_options the
+  # same way client_encryption_options already was, reusing the identical
+  # keystore/truststore -- no new certs needed). The addendum above's OOM
+  # measurements were real when written, but against the *5-Cassandra-node*
+  # topology that predated this file's own later dc-eu reduction to 1 node;
+  # re-tried today against the topology that actually ships now (4 Cassandra
+  # nodes, 4 Kafka brokers, MirrorMaker 2, all together) with a full,
+  # from-scratch cluster restart first: zero OOM kills, zero restarts,
+  # steady-state ~4.6-5.1GB against the same 6.275GB ceiling, and the full
+  # non-chaos + chaos test suites both pass. Verified genuinely encrypted,
+  # not just configured, by reading Cassandra's own connection-established
+  # log lines (`encryption = encrypted(factory=openssl;protocol=TLSv1.3;...)`)
+  # for every internode link, cross-DC included -- not inferred from the
+  # absence of an error. See Kafka's mirrored decision below and
+  # kafka/mm2.properties for MirrorMaker 2's own required follow-on fix.
   cassandra-1:
     image: cassandra:5.0
     container_name: pharos-cassandra-1
@@ -104,6 +121,7 @@ services:
       - cassandra-data-1:/var/lib/cassandra
       - ./certs/cassandra-1.yaml:/etc/cassandra/cassandra.yaml
       - ./certs/cassandra-keystore.jks:/tls/cassandra-keystore.jks:ro
+      - ./certs/cassandra-truststore.jks:/tls/cassandra-truststore.jks:ro
       - ./certs/ca-cert.pem:/tls/ca-cert.pem:ro
     healthcheck:
       test: ["CMD-SHELL", "SSL_CERTFILE=/tls/ca-cert.pem cqlsh 127.0.0.1 9042 --ssl -e 'DESCRIBE CLUSTER' > /dev/null 2>&1 || exit 1"]
@@ -132,6 +150,7 @@ services:
       - cassandra-data-2:/var/lib/cassandra
       - ./certs/cassandra-2.yaml:/etc/cassandra/cassandra.yaml
       - ./certs/cassandra-keystore.jks:/tls/cassandra-keystore.jks:ro
+      - ./certs/cassandra-truststore.jks:/tls/cassandra-truststore.jks:ro
       - ./certs/ca-cert.pem:/tls/ca-cert.pem:ro
     depends_on:
       cassandra-1:
@@ -163,6 +182,7 @@ services:
       - cassandra-data-3:/var/lib/cassandra
       - ./certs/cassandra-3.yaml:/etc/cassandra/cassandra.yaml
       - ./certs/cassandra-keystore.jks:/tls/cassandra-keystore.jks:ro
+      - ./certs/cassandra-truststore.jks:/tls/cassandra-truststore.jks:ro
       - ./certs/ca-cert.pem:/tls/ca-cert.pem:ro
     depends_on:
       cassandra-2:
@@ -203,6 +223,7 @@ services:
       - cassandra-data-4:/var/lib/cassandra
       - ./certs/cassandra-4.yaml:/etc/cassandra/cassandra.yaml
       - ./certs/cassandra-keystore.jks:/tls/cassandra-keystore.jks:ro
+      - ./certs/cassandra-truststore.jks:/tls/cassandra-truststore.jks:ro
       - ./certs/ca-cert.pem:/tls/ca-cert.pem:ro
     depends_on:
       # Depends on cassandra-3 (not cassandra-1) specifically: Cassandra
@@ -233,15 +254,32 @@ services:
   # this project's scale) so these brokers fit the same host that used to
   # run untuned ones.
   #
-  # TLS (ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") is on the EXTERNAL
-  # listener only -- the one actually exposed to the host, the real "any
-  # process that can reach the port" exposure this slice exists to close.
-  # INTERNAL (inter-broker) stays PLAINTEXT: it's never exposed outside the
-  # private Docker network, and TLS there was tried and genuinely worked
-  # (verified), but its memory cost stacked with Cassandra's own TLS
-  # overhead produced real, repeated OOM kills across this already
-  # tightly-budgeted 10-node topology that heap tuning alone couldn't
-  # resolve -- see the Cassandra section comment above for the full story.
+  # TLS (ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") was originally
+  # scoped to the EXTERNAL listener only -- INTERNAL (inter-broker) stayed
+  # PLAINTEXT after real, repeated OOM kills on the 10-node topology that
+  # predated this file's later node-count reductions (see the Cassandra
+  # section comment above for the full story). Re-enabled [2026-09-06],
+  # audit remediation: INTERNAL is now SSL too (`listener.security.protocol.map`
+  # below), reusing the same already-issued keystore/truststore -- no new
+  # certs needed, since the SANs already cover every pharos-kafka-N
+  # container name. Re-tried against the topology that actually ships now
+  # (not the 10-node one the original OOM was measured against) with a full
+  # cluster restart first: zero OOM kills, ISR stayed fully in sync
+  # (`kafka-topics.sh --describe` showed every replica caught up), and the
+  # full test suite passes. One real follow-on cost: MirrorMaker 2's own
+  # AdminClient was still configured to speak plaintext to this now-SSL-only
+  # port, which doesn't fail cleanly -- see kafka/mm2.properties for what
+  # that looked like and the fix.
+  #
+  # Second real follow-on cost, found only under sustained produce/consume
+  # load (not the first, lighter test pass): 192M heap wasn't enough once
+  # INTERNAL carries real SSL traffic too, not just EXTERNAL -- a broker ran
+  # its actual JVM heap out from under it (`OutOfMemoryError: Java heap
+  # space`, dozens of internal threads dying, container still reporting
+  # `healthy` throughout since Docker's own OOM killer never fired -- this
+  # was the JVM's own heap ceiling, not the container's). Bumped 192M ->
+  # 320M for all 4 brokers; a full non-chaos + chaos suite run afterward
+  # produced zero further `OutOfMemoryError`s and zero container restarts.
   #
   # Cluster B is 1 broker, not the 2 from Slice 14: even with TLS on
   # client-facing listeners only, per-broker RSS under TLS turned out to be
@@ -265,14 +303,14 @@ services:
     ports:
       - "9092:9092"
     environment:
-      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_HEAP_OPTS: "-Xmx320M -Xms320M"
       KAFKA_NODE_ID: 1
       KAFKA_BROKER_RACK: "dc-us-rack1"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
       KAFKA_LISTENERS: "INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
       KAFKA_ADVERTISED_LISTENERS: "INTERNAL://pharos-kafka-1:19092,EXTERNAL://127.0.0.1:9092"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:SSL,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
@@ -312,14 +350,14 @@ services:
     ports:
       - "9094:9094"
     environment:
-      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_HEAP_OPTS: "-Xmx320M -Xms320M"
       KAFKA_NODE_ID: 2
       KAFKA_BROKER_RACK: "dc-us-rack2"
       KAFKA_PROCESS_ROLES: "broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
       KAFKA_LISTENERS: "INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9094"
       KAFKA_ADVERTISED_LISTENERS: "INTERNAL://pharos-kafka-2:19092,EXTERNAL://127.0.0.1:9094"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:SSL,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
@@ -359,14 +397,14 @@ services:
     ports:
       - "9095:9095"
     environment:
-      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_HEAP_OPTS: "-Xmx320M -Xms320M"
       KAFKA_NODE_ID: 3
       KAFKA_BROKER_RACK: "dc-us-rack3"
       KAFKA_PROCESS_ROLES: "broker"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "1@pharos-kafka-1:9093"
       KAFKA_LISTENERS: "INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9095"
       KAFKA_ADVERTISED_LISTENERS: "INTERNAL://pharos-kafka-3:19092,EXTERNAL://127.0.0.1:9095"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:SSL,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
@@ -406,14 +444,14 @@ services:
     ports:
       - "9096:9096"
     environment:
-      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_HEAP_OPTS: "-Xmx320M -Xms320M"
       KAFKA_NODE_ID: 4
       KAFKA_BROKER_RACK: "dc-eu-rack1"
       KAFKA_PROCESS_ROLES: "broker,controller"
       KAFKA_CONTROLLER_QUORUM_VOTERS: "4@pharos-kafka-4:9093"
       KAFKA_LISTENERS: "INTERNAL://0.0.0.0:19092,EXTERNAL://0.0.0.0:9096,CONTROLLER://0.0.0.0:9093"
       KAFKA_ADVERTISED_LISTENERS: "INTERNAL://pharos-kafka-4:19092,EXTERNAL://127.0.0.1:9096"
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:SSL,EXTERNAL:SSL,CONTROLLER:PLAINTEXT"
       KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
       KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -458,7 +496,7 @@ services:
     cap_add:
       - NET_ADMIN
     environment:
-      KAFKA_HEAP_OPTS: "-Xmx192M -Xms192M"
+      KAFKA_HEAP_OPTS: "-Xmx320M -Xms320M"
     entrypoint: ["/opt/kafka/bin/connect-mirror-maker.sh", "/mm2/mm2.properties"]
     volumes:
       - ./kafka/mm2.properties:/mm2/mm2.properties:ro

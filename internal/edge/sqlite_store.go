@@ -413,19 +413,23 @@ func (s *SQLiteStore) MarkInFlight(ctx context.Context, ids []int64) error {
 	defer s.mu.Unlock()
 
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids)+1)
-	args[0] = time.Now().UTC()
-
+	args := make([]interface{}, 0, len(ids)+4)
+	args = append(args, StatusInFlight, time.Now().UTC())
 	for i, id := range ids {
 		placeholders[i] = "?"
-		args[i+1] = id
+		args = append(args, id)
 	}
+	args = append(args, StatusPending, StatusFailed)
 
+	// Only the IN (...) placeholder list is built via Sprintf here (SQL has
+	// no other way to bind a variadic list of values) -- the status
+	// constants themselves are bound as ordinary query args, not
+	// interpolated into the SQL text (§2.1, audit remediation).
 	query := fmt.Sprintf(`
 		UPDATE queued_events
-		SET status = '%s', updated_at = ?
-		WHERE id IN (%s) AND status IN ('%s', '%s')
-	`, StatusInFlight, strings.Join(placeholders, ","), StatusPending, StatusFailed)
+		SET status = ?, updated_at = ?
+		WHERE id IN (%s) AND status IN (?, ?)
+	`, strings.Join(placeholders, ","))
 
 	_, err := s.db.ExecContext(ctx, query, args...)
 	return err
@@ -441,19 +445,18 @@ func (s *SQLiteStore) MarkAcknowledged(ctx context.Context, ids []int64) error {
 	defer s.mu.Unlock()
 
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids)+1)
-	args[0] = time.Now().UTC()
-
+	args := make([]interface{}, 0, len(ids)+2)
+	args = append(args, StatusAcknowledged, time.Now().UTC())
 	for i, id := range ids {
 		placeholders[i] = "?"
-		args[i+1] = id
+		args = append(args, id)
 	}
 
 	query := fmt.Sprintf(`
 		UPDATE queued_events
-		SET status = '%s', updated_at = ?
+		SET status = ?, updated_at = ?
 		WHERE id IN (%s)
-	`, StatusAcknowledged, strings.Join(placeholders, ","))
+	`, strings.Join(placeholders, ","))
 
 	_, err := s.db.ExecContext(ctx, query, args...)
 	return err
@@ -469,20 +472,18 @@ func (s *SQLiteStore) MarkRejected(ctx context.Context, ids []int64, errReason s
 	defer s.mu.Unlock()
 
 	placeholders := make([]string, len(ids))
-	args := make([]interface{}, len(ids)+2)
-	args[0] = errReason
-	args[1] = time.Now().UTC()
-
+	args := make([]interface{}, 0, len(ids)+3)
+	args = append(args, StatusRejected, errReason, time.Now().UTC())
 	for i, id := range ids {
 		placeholders[i] = "?"
-		args[i+2] = id
+		args = append(args, id)
 	}
 
 	query := fmt.Sprintf(`
 		UPDATE queued_events
-		SET status = '%s', last_error = ?, updated_at = ?
+		SET status = ?, last_error = ?, updated_at = ?
 		WHERE id IN (%s)
-	`, StatusRejected, strings.Join(placeholders, ","))
+	`, strings.Join(placeholders, ","))
 
 	_, err := s.db.ExecContext(ctx, query, args...)
 	return err

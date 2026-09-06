@@ -596,10 +596,10 @@ verified against real infrastructure the same way every earlier slice was.
   TLS scope was narrowed twice against real, repeated OOM kills (`docker
   inspect`: `OOMKilled: true`) that survived Slice 14's own heap tuning — see
   ARCHITECTURE_PROPOSALS.md's Slice 15 addendum for the full sequence.
-  Summary of what shipped: Cassandra's `client_encryption_options` only
-  (internode stays plaintext, since port 7000 never leaves the private
+  Summary of what shipped then: Cassandra's `client_encryption_options` only
+  (internode stayed plaintext, since port 7000 never leaves the private
   Docker network); Kafka's `EXTERNAL` listener only (inter-broker
-  `INTERNAL` stays plaintext); Kafka cluster B (`dc-eu`) reduced from 2
+  `INTERNAL` stayed plaintext); Kafka cluster B (`dc-eu`) reduced from 2
   brokers to 1; and — found necessary only after that still wasn't enough
   headroom — Cassandra's `dc-eu` reduced from 2 nodes/RF=2 to 1 node/RF=1
   (`cassandra-5` removed). Both `dc-eu` reductions use the same reasoning
@@ -608,6 +608,50 @@ verified against real infrastructure the same way every earlier slice was.
   internal replication redundancy isn't a property this project's tests
   exercise. `dc-us` (and Kafka cluster A) keep their full node counts
   throughout, every time.
+
+  **Re-enabled 2026-09-06 (audit remediation):** Cassandra `internode_encryption`
+  and Kafka's `INTERNAL` (inter-broker) listener are both TLS now, at the
+  topology that actually ships (not the larger one the original OOM was
+  measured against, which predated the `dc-eu` node-count reductions above).
+  Verified live against a from-scratch cluster restart: zero OOM kills, zero
+  container restarts, steady-state ~4.6-5.1GB against the same 6.275GB
+  Docker VM ceiling, genuine TLS confirmed via Cassandra's own
+  connection-established log lines (`encryption =
+  encrypted(factory=openssl;protocol=TLSv1.3;...)`) for every internode
+  link including cross-DC, and Kafka's inter-broker replication ISR staying
+  fully caught up. The full non-chaos and chaos test suites both pass (one
+  integration test's own timeout needed bumping — see
+  `internal/consumer/consumer_integration_test.go`'s comment for why: real
+  TLS/crypto cost per hop, not a correctness issue). One real follow-on
+  fix was required: MirrorMaker 2's `bootstrap.servers` point at the
+  now-SSL-only `INTERNAL` listener, and a plaintext AdminClient hitting an
+  SSL port doesn't fail cleanly — it misreads the TLS handshake bytes as a
+  Kafka response length prefix and throws a misleading
+  `OutOfMemoryError: Java heap space` trying to allocate a buffer for that
+  garbage size. Fixed in `kafka/mm2.properties` (SSL security protocol +
+  truststore per cluster alias, reusing the same already-mounted
+  truststore). `deploy/k8s/mm2.properties` and the K8s Kafka manifests keep
+  their original client-only TLS scope for now — this re-enablement was
+  verified against the Docker Compose cluster specifically, not carried into
+  Slice 17's K8s topology.
+
+  **Second real follow-on fix, found only under sustained load:** the first
+  pass above (idle cluster + one non-chaos suite run) showed zero issues,
+  but a heavier pass shortly after — full non-chaos + chaos suites, run
+  right after this same host had just been under severe CPU contention from
+  the Slice 17 full-scale K8s attempt — hit a genuine broker crash:
+  `kafka-1`'s own JVM heap (192M, unchanged since before this re-enablement)
+  ran out from under it once `INTERNAL` carried real SSL traffic too, not
+  just `EXTERNAL` — dozens of internal threads died with
+  `OutOfMemoryError: Java heap space` while the container itself kept
+  reporting `healthy` throughout, since this was the JVM's own heap ceiling,
+  never a container-level OOM kill Docker's own killer would have caught.
+  Bumped `KAFKA_HEAP_OPTS` 192M → 320M for all 4 brokers; a subsequent full
+  non-chaos + chaos suite run produced zero further `OutOfMemoryError`s and
+  zero container restarts. The lesson generalizes: idle-cluster or
+  single-pass verification is not sufficient evidence that a memory/heap
+  change actually holds — sustained load is what surfaces a JVM-internal
+  heap ceiling that container-level RSS monitoring alone won't show.
 
   Two real, previously-latent bugs found and fixed while verifying this
   against live infrastructure, not by planning it: (1) gocql's
@@ -773,6 +817,50 @@ verified against real infrastructure the same way every earlier slice was.
   `PUBLISHED`/queryable in the Cassandra canonical store via direct
   `cqlsh` -- not by trusting the HTTP response alone. Prometheus confirmed
   scraping all three app services successfully.
+
+  **Attempted at full scale 2026-09-06 (audit remediation):** the reduced-
+  scale verification above was deliberate, not an oversight -- this
+  addendum is the deferred full-scale attempt it always implied was still
+  owed. Ran `deploy/k8s/deploy.sh` unmodified (full 2-DC/4-Cassandra/
+  4-Kafka topology, `replicas: 3` as committed) against a fresh single-node
+  `kind` cluster, on the same host as every other slice's verification.
+  Cassandra (all 4 nodes) and Kafka (all 4 brokers) came up cleanly and
+  reached Ready with no issues -- confirmed via `nodetool status` (both DCs
+  up) equivalent readiness probes passing. The one-shot `pharos-migrations`
+  Job then failed to complete: two attempts timed out (`OperationTimedOut`
+  against Cassandra from `cqlsh`, ~60s each) before a third attempt
+  triggered a genuine cascading failure -- `docker stats` showed sustained
+  >1000% CPU on the single kind node (an 8-core host; `uptime` load average
+  reached ~12), and kubelet, unable to complete health-check execs in time,
+  restarted nearly every Cassandra and Kafka pod within the same few
+  seconds, which briefly dropped the node's own memory reading by ~3GB as
+  everything was killed at once before climbing back as pods restarted.
+  This is a materially different and worse failure mode than Docker
+  Compose's own (memory-bound, clean OOM kills of one container at a time,
+  fully resolved for item #7 below) -- `kind`'s single node carries an
+  entire K8s control plane (`kube-apiserver`, `etcd`, `kube-scheduler`,
+  `kube-controller-manager`, `coredns`, `kubelet`, `kube-proxy`) as CPU/RSS
+  tax on top of the identical Cassandra/Kafka JVMs Docker Compose runs with
+  none of that overhead, and this host has only 8 real CPU cores to share
+  across all of it. Manually retried the same migration with generous
+  `cqlsh --connect-timeout=60 --request-timeout=120` flags once the cluster
+  had a moment to settle; that attempt failed differently (DNS resolution
+  failure against the Cassandra headless Service, `socket.gaierror`),
+  consistent with CoreDNS itself being starved of CPU during the same
+  contention window, not a configuration problem in the retry. Torn down
+  (`kind delete cluster`) once host load was confirmed climbing rather than
+  settling, rather than let a genuinely overloaded single-core-constrained
+  Mac keep degrading — this is the correct, honest outcome of the
+  verification this addendum set out to do, not a shortcut: **the K8s
+  manifests are functionally correct (every prior bug-fix above still
+  holds, and the app tier itself was never reached this time only because
+  the migrations Job never got the chance to finish), but this specific
+  8-core/8GB host cannot sustain the full committed topology's control-plane
+  + application CPU demand simultaneously inside one `kind` node.** Fixing
+  this for real would need either a multi-node `kind` cluster (spreading
+  CPU tax across separate node containers instead of one shared cgroup) or
+  a beefier host — both are follow-up work, not something to paper over by
+  quietly shrinking `replicas` in the committed manifests a second time.
 
 - **Slice 18 — Backup & disaster recovery** *(was Slice 11)*. Cassandra
   snapshot/restore procedure for the multi-node cluster from Slice 7, an
@@ -1154,6 +1242,30 @@ own (Slice 20-fixed) replay path uses. This is also why the dashboard
 needed no changes to get "who replayed what" audited: Slice 20's
 server-side `HandleDLQReplay` recording already covers every caller,
 dashboard included, keyed by whichever site the human authenticated as.
+
+**Read-side audit asymmetry with `pharos-cli`, decided explicitly (audit
+remediation):** `handleQuery`/`handleDLQList`/`handleDLQDetail` read the
+exact same real patient adverse-event data `pharos-cli query`/`dlq list`/`dlq
+get` do, through the same `query.Service` interface — but unlike the CLI
+(Slice 20: `--operator` required, every call recorded via
+`audit.Store.RecordAccess`), the dashboard records no access-audit entry for
+any of them. This is a real, deliberate asymmetry, not an oversight covered
+by the write-side reasoning above: DLQ replay/event submission get audited
+"for free" because they proxy through Central Ingestion's own
+authenticated HTTP endpoint (Slice 15), which is what actually calls
+`RecordAccess` — but a read-only query never leaves this process, so there is
+no equivalent enforcement point to inherit it from. Left unaudited rather
+than retrofitting a required "operator" prompt/cookie: Slice 21's own
+framing is "portfolio accessibility, not production hardening," and gating
+every dashboard page view behind an identity prompt (the dashboard has no
+identity concept at all today, unlike the CLI's simple self-declared flag)
+would work against that stated goal for a UI whose data was already
+reachable unauthenticated before this dashboard existed. If the dashboard is
+ever hardened into something closer to a real operator tool, this is the
+first gap to close — a session cookie capturing a self-declared operator
+name, mirroring the CLI's own `--operator` flag, would let these three
+handlers call `audit.Store.RecordAccess` exactly the way `pharos-cli`'s
+`recordAccess` helper already does.
 
 **Verified live, not assumed**: built the real binary, ran it against the
 live Cassandra cluster's genuine accumulated data from this session's
@@ -1559,12 +1671,21 @@ that writes to Kafka.
 **Resolved 2026-08-29 — retry/backoff formula:** Exponential Backoff with Full
 Jitter: `backoff = random_between(0, min(MaxBackoff, BaseBackoff * 2^attempts))`,
 with `BaseBackoff=500ms`, `MaxBackoff=30s`, `BatchSize=50`, `PollInterval=1s`
-(when the queue is empty), `RequestTimeout=5s`. On HTTP 429 the forwarder
-respects a `Retry-After` header if present (clamped 1s–60s); on timeouts,
-connection refused, or 5xx it backs off per the formula above. Full Jitter
-(not plain exponential backoff) specifically to avoid every site's retries
-synchronizing into a thundering herd when Central Ingestion recovers from an
-outage. Full detail in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+(when the queue is empty -- `internal/edge.DefaultForwarderConfig`'s own
+default is 500ms, but `pharos-edge`'s `--poll-interval` flag defaults to 1s
+and always overrides it, so 1s is what a real deployment actually runs with),
+`RequestTimeout=5s`. On HTTP 429 the forwarder respects a `Retry-After`
+header if present, clamped only to `MaxBackoff` (30s) as an upper bound -- a
+non-positive or unparseable header value is ignored outright and falls back
+to the normal jittered formula below, so there's no separate lower floor on
+the header path itself; on timeouts, connection refused, or 5xx it backs off
+per the formula above unconditionally. That formula's own jittered result is
+additionally floored at 100ms (never a literal zero-length sleep, which
+`rand(0, ceiling)` could otherwise produce for a small enough ceiling). Full
+Jitter (not plain exponential backoff) specifically to avoid every site's
+retries synchronizing into a thundering herd when Central Ingestion recovers
+from an outage. Full detail in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
 
 ### 2.2 Exactly-once processing semantics
 
@@ -1712,19 +1833,25 @@ treated as success.
 R4 `AdverseEvent` resource (large, mostly irrelevant regulatory sub-fields for
 this project's purpose), Pharos targets a deliberately scoped, named subset:
 `resourceType`, `identifier` (carrying the idempotency key), `actuality`,
-`subject`, `event` (MedDRA-coded), `date` (event time, zone-aware) /
-`recordedDate` (capture time), `seriousness`, `severity`, `study`, `location`,
-`suspectEntity`. Being an explicit, documented subset — not an ad hoc shape —
-means it reads as a deliberate scoping decision rather than an incomplete FHIR
-implementation in a technical walkthrough. Resolves former Open Question 4; full
-field list in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+`category`, `subject`, `event` (MedDRA-coded), `date` (event time, zone-aware) /
+`recordedDate` (capture time), `seriousness`, `severity`, `outcome`, `recorder`,
+`study`, `location`, `suspectEntity`. Being an explicit, documented subset — not
+an ad hoc shape — means it reads as a deliberate scoping decision rather than an
+incomplete FHIR implementation in a technical walkthrough. Resolves former Open
+Question 4; full field list in
+[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). (`schemaVersion` is a
+separate, later addition — see Slice 9 below.)
 
 **Resolved 2026-08-30 — DLQ inspection & query tooling:** Surfaced through
-`internal/query.Service` and `cmd/pharos-cli dlq list/get`. Migration
-`migrations/003_dlq_site_index.cql` adds a secondary index on
-`dead_letter_events (site_id)`, allowing site-scoped queries without table scans.
-Inspection displays the exact structured FHIR validation errors, wire payload,
-and Kafka DLQ lineage.
+`internal/query.Service` and `cmd/pharos-cli dlq list/get`. A dedicated
+`dead_letter_events_by_site` table (`migrations/003_dlq_site_table.cql`)
+allows site-scoped queries without table scans — a secondary index on
+`dead_letter_events(site_id)` was the originally planned approach here, but
+review rejected it in favor of this partition-key-first table, the same
+design already used for canonical events (`events_by_site`), avoiding the
+multi-node scatter-gather a secondary index would cause. Inspection displays
+the exact structured FHIR validation errors, wire payload, and Kafka DLQ
+lineage.
 
 ### 2.4 Multi-timezone event ordering and correctness
 

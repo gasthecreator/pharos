@@ -16,6 +16,7 @@ import (
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/kafka"
 	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/metrics/consumermetrics"
 	"github.com/gasthecreator/pharos/internal/tlsutil"
 )
 
@@ -147,15 +148,15 @@ func main() {
 					wm.Format(time.RFC3339))
 
 				if !wm.IsZero() {
-					metrics.ConsumerWatermarkSeconds.Set(float64(wm.Unix()))
+					consumermetrics.WatermarkSeconds.Set(float64(wm.Unix()))
 				}
-				metrics.ConsumerLag.Set(float64(reader.Stats().Lag))
+				consumermetrics.Lag.Set(float64(reader.Stats().Lag))
 				for _, ps := range tracker.PartitionStats(now) {
 					active := 0.0
 					if ps.IsActive {
 						active = 1.0
 					}
-					metrics.ConsumerPartitionActive.WithLabelValues(strconv.Itoa(ps.Partition)).Set(active)
+					consumermetrics.PartitionActive.WithLabelValues(strconv.Itoa(ps.Partition)).Set(active)
 				}
 			}
 		}

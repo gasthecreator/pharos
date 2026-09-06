@@ -13,6 +13,9 @@ servers:
   - url: http://localhost:8091
     description: Default local Central Ingestion instance (--port 8091; the README uses this port specifically to dodge a port-8081 conflict some machines have — see README.md)
 
+security:
+  - siteAuth: []
+
 paths:
   /api/v1/events:
     post:
@@ -22,7 +25,9 @@ paths:
         have a genuine mix of accepted, rejected, and transiently-failed
         events. 207 is returned whenever the batch has any mix of outcomes;
         a bare 503 is reserved for the case where every event in the batch
-        hit an infrastructure failure with nothing else to report.
+        hit an infrastructure failure with nothing else to report. Requires
+        `X-Site-ID`/`X-API-Key` unless Central Ingestion runs with
+        `--enable-auth=false` (PLAN.md §2.1, §2.2, Slice 15).
       requestBody:
         required: true
         content:
@@ -70,6 +75,65 @@ paths:
               schema:
                 $ref: "#/components/schemas/BatchResponse"
 
+  /api/v1/dlq/{key}/replay:
+    post:
+      summary: Resubmit a rejected event's stored payload (PLAN.md §2.3, Slice 10)
+      description: >
+        Resubmits a DLQ'd record's stored raw payload through the exact same
+        validation/claim/publish path a fresh submission uses — not a
+        trust-it-now backdoor. Requires `X-Site-ID`/`X-API-Key` unless
+        Central Ingestion runs with `--enable-auth=false`; the authenticated
+        site must be the record's own owning site, or the call is rejected
+        with 403 even if the credentials are otherwise valid (§2.1, §2.2,
+        Slice 15). Every attempt — success or failure — is recorded in the
+        durable access-audit trail (§2.4, Slice 20), surfaced via
+        `pharos-cli audit list`.
+      parameters:
+        - name: key
+          in: path
+          required: true
+          description: The rejected event's idempotency key (`<site_id>:<local_seq>`)
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Replay accepted and published to Kafka; the original DLQ record is marked REPLAYED
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventResult"
+        "207":
+          description: Replay was accepted and published, but marking the original DLQ record REPLAYED itself failed (bookkeeping gap, not a data-loss one)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    $ref: "#/components/schemas/EventResult"
+                  warning:
+                    type: string
+        "400":
+          description: Missing idempotency key in path
+        "403":
+          description: Authenticated site does not own this DLQ record
+        "404":
+          description: No DLQ record exists for this idempotency key
+        "409":
+          description: Record exists but is not in PUBLISHED status (already REPLAYED, or still mid-claim)
+        "422":
+          description: Replay still fails validation — the original DLQ record is left untouched and stays rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventResult"
+        "503":
+          description: Replay hit an infrastructure failure (Cassandra/Kafka unavailable) — safe to retry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventResult"
+
   /healthz:
     get:
       summary: Liveness check
@@ -89,6 +153,18 @@ paths:
                 type: string
 
 components:
+  securitySchemes:
+    siteAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: >
+        Paired with the X-Site-ID header (also required, but OpenAPI 3.0's
+        apiKey scheme only models one header per scheme entry). The
+        authenticated site must match X-Site-ID on every site-scoped route.
+        Not enforced when Central Ingestion runs with --enable-auth=false
+        (PLAN.md §2.1, §2.2, Slice 15).
+
   schemas:
     BatchRequest:
       type: object

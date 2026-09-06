@@ -52,6 +52,9 @@ Access Audit Commands (§2.4, Slice 20):
   audit list --operator <name> [--limit <n>]                Show a compliance operator's recorded access history
                                                              (query/dlq inspection actions and, for a site operator,
                                                              its own DLQ replay attempts)
+  audit late-arrivals [--group <id>] [--limit <n>]           Show the durable 21 CFR Part 11 late-arrival audit
+                                                              trail for a consumer group (§2.4, requires Cassandra,
+                                                              not --memory)
 
 Flags:
   --hosts        Comma-separated Cassandra hosts (default: 127.0.0.1)
@@ -207,7 +210,9 @@ func main() {
 	// to "demo-operator" here (the way query/dlq's self-identity default
 	// makes sense for offline demos) would instead just silently show an
 	// arbitrary, almost-certainly-empty trail and look like a real answer.
-	if command == "audit" && operatorFlag == "" {
+	// "audit late-arrivals" has no operator concept at all -- it's scoped by
+	// --group, not by who's asking -- so it's exempt from this check.
+	if command == "audit" && operatorFlag == "" && (len(remainingArgs) == 1 || remainingArgs[1] != "late-arrivals") {
 		fmt.Fprintf(os.Stderr, "--operator is required for audit list (names the operator whose access history to show)\n")
 		os.Exit(1)
 	}
@@ -274,7 +279,7 @@ func main() {
 		}
 		handleSite(ctx, remainingArgs[1:], hostsFlag, portFlag, keyspaceFlag, caCertFlag)
 	case "audit":
-		handleAudit(ctx, auditStore, operatorFlag, remainingArgs[1:], jsonOutput)
+		handleAudit(ctx, auditStore, operatorFlag, remainingArgs[1:], jsonOutput, useMemory, hostsFlag, portFlag, keyspaceFlag, caCertFlag)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
@@ -636,7 +641,9 @@ func replayDLQRecord(centralURL, idempotencyKey, siteID, apiKey, caCert string) 
 // the Cassandra canonical and outbox stores (not query.Service -- archival
 // is a Cassandra-specific operational concern the in-memory demo store has
 // no meaningful equivalent for) and moves rows older than the threshold to
-// the local cold-tier archive.
+// the local cold-tier archive. It also prunes event_outbox (§2.2, audit
+// remediation): those rows are operational bookkeeping, not data-of-record,
+// so they're deleted outright on the same cutoff rather than exported.
 func handleArchive(ctx context.Context, args []string, hosts string, port int, keyspace string, caCert string) {
 	if len(args) == 0 || args[0] != "run" {
 		fmt.Fprintf(os.Stderr, "Usage: pharos-cli archive run [--older-than 90d] [--archive-dir <path>] [--dry-run]\n")
@@ -699,10 +706,18 @@ func handleArchive(ctx context.Context, args []string, hosts string, port int, k
 		fmt.Fprintf(os.Stderr, "DLQ archival failed: %v\n", err)
 		os.Exit(1)
 	}
+	// event_outbox is operational bookkeeping, not data-of-record (§2.2,
+	// audit remediation) -- pruned outright on the same cutoff/dry-run,
+	// never exported to the cold-tier archive alongside the two calls above.
+	outboxPruned, outboxPruneFailed, err := archive.RunOutboxPrune(ctx, outboxStore, cutoff, *dryRun)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "outbox pruning failed: %v\n", err)
+		os.Exit(1)
+	}
 
-	fmt.Printf("\nCanonical: %d archived, %d failed\nDLQ:       %d archived, %d failed\n",
-		canonArchived, canonFailed, dlqArchived, dlqFailed)
-	if canonFailed > 0 || dlqFailed > 0 {
+	fmt.Printf("\nCanonical: %d archived, %d failed\nDLQ:       %d archived, %d failed\nOutbox:    %d pruned, %d failed\n",
+		canonArchived, canonFailed, dlqArchived, dlqFailed, outboxPruned, outboxPruneFailed)
+	if canonFailed > 0 || dlqFailed > 0 || outboxPruneFailed > 0 {
 		os.Exit(1)
 	}
 }
@@ -762,10 +777,16 @@ func handleSite(ctx context.Context, args []string, hosts string, port int, keys
 // dispatching here (see the command == "audit" check), since silently
 // defaulting "whose trail" the way query/dlq default their own self-identity
 // would just show an arbitrary, almost-certainly-empty trail.
-func handleAudit(ctx context.Context, auditStore audit.Store, operator string, args []string, jsonOutput bool) {
-	if len(args) == 0 || args[0] != "list" {
+func handleAudit(ctx context.Context, auditStore audit.Store, operator string, args []string, jsonOutput bool, useMemory bool, hosts string, port int, keyspace string, caCert string) {
+	if len(args) == 0 || (args[0] != "list" && args[0] != "late-arrivals") {
 		fmt.Fprintf(os.Stderr, "Usage: pharos-cli audit list --operator <name> [--limit <n>]\n")
+		fmt.Fprintf(os.Stderr, "       pharos-cli audit late-arrivals --group <consumer_group_id> [--limit <n>]\n")
 		os.Exit(1)
+	}
+
+	if args[0] == "late-arrivals" {
+		handleAuditLateArrivals(ctx, args[1:], jsonOutput, useMemory, hosts, port, keyspace, caCert)
+		return
 	}
 
 	auditFlags := flag.NewFlagSet("audit list", flag.ExitOnError)
@@ -794,6 +815,68 @@ func handleAudit(ctx context.Context, auditStore audit.Store, operator string, a
 	fmt.Fprintln(w, "----------------------------------------------------------------------")
 	for _, e := range entries {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.OccurredAt.Format(time.RFC3339), e.Action, e.Resource, e.Outcome)
+	}
+	w.Flush()
+	fmt.Printf("\nTotal: %d\n\n", len(entries))
+}
+
+// handleAuditLateArrivals reads the durable 21 CFR Part 11 late-arrival
+// audit trail (§2.4, audit remediation) -- connects directly to the
+// Cassandra canonical store, mirroring handleArchive's own direct-connection
+// style, since this is Cassandra-specific operational/compliance data
+// query.Service's hot/cold canonical-event merge logic has no reason to
+// wrap.
+func handleAuditLateArrivals(ctx context.Context, args []string, jsonOutput bool, useMemory bool, hosts string, port int, keyspace string, caCert string) {
+	if useMemory {
+		fmt.Fprintf(os.Stderr, "audit late-arrivals is not meaningful with --memory: there's no real Cassandra data to inspect\n")
+		os.Exit(1)
+	}
+
+	auditFlags := flag.NewFlagSet("audit late-arrivals", flag.ExitOnError)
+	group := auditFlags.String("group", "pharos-canonical-sink", "Consumer group ID whose late-arrival audit trail to show")
+	limit := auditFlags.Int("limit", 50, "Max entries to return")
+	auditFlags.Parse(args)
+
+	var tlsCfg *tlsutil.ClientConfig
+	if caCert != "" {
+		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}
+	}
+	cStoreCfg := consumer.DefaultCassandraStoreConfig()
+	cStoreCfg.Hosts = strings.Split(hosts, ",")
+	cStoreCfg.Port = port
+	cStoreCfg.Keyspace = keyspace
+	cStoreCfg.TLS = tlsCfg
+	canonicalStore, err := consumer.NewCassandraCanonicalStore(cStoreCfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to connect canonical store: %v\n", err)
+		os.Exit(1)
+	}
+	defer canonicalStore.Close()
+
+	entries, err := canonicalStore.ListLateArrivalAudits(ctx, *group, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "late-arrival audit query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if jsonOutput {
+		out, _ := json.MarshalIndent(entries, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
+
+	fmt.Printf("\n=== 21 CFR Part 11 Late-Arrival Audit Trail for Consumer Group: %s ===\n", *group)
+	if len(entries) == 0 {
+		fmt.Println("No late-arrival audit entries found.")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "WINDOW_ID\tIDEMPOTENCY_KEY\tPARTITION\tEVENT_TIME\tARRIVED_AT\tWATERMARK_AT_ARRIVAL")
+	fmt.Fprintln(w, "----------------------------------------------------------------------------------------------------")
+	for _, a := range entries {
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\t%s\t%s\n",
+			a.WindowID, a.IdempotencyKey, a.Partition,
+			a.EventTime.Format(time.RFC3339), a.ArrivedAt.Format(time.RFC3339), a.WatermarkAtArrival.Format(time.RFC3339))
 	}
 	w.Flush()
 	fmt.Printf("\nTotal: %d\n\n", len(entries))
