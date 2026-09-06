@@ -508,6 +508,44 @@ services:
     networks:
       - pharos-net
 
+  # Redis: backs the distributed rate limiter (§2.3, §2.4, PLAN.md Slice
+  # 19: Multi-instance scaling) shared across every pharos-ingestion
+  # instance -- TokenBucketLimiter's in-memory bucket is per-process, so
+  # with 2+ instances behind a load balancer each would enforce the
+  # configured limit independently, silently multiplying a site's real
+  # limit by the instance count. No auth/TLS here (unlike Cassandra/Kafka,
+  # Slice 15): Redis never leaves this private Docker network, and this
+  # project's own threat model (§2.1, ARCHITECTURE_PROPOSALS.md "Slice 15:
+  # Auth & TLS") is external/untrusted access, not intra-cluster traffic on
+  # an already-isolated bridge network.
+  redis:
+    image: redis:7.4-alpine
+    container_name: pharos-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pharos-net
+
+  # Load balances 2+ pharos-ingestion instances (§2.4, PLAN.md Slice 19:
+  # Multi-instance scaling) -- see nginx/nginx.conf for why this is TCP
+  # passthrough, not TLS-terminating HTTP proxying.
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: pharos-nginx
+    ports:
+      - "8500:8500"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - pharos-net
+
 networks:
   pharos-net:
     driver: bridge

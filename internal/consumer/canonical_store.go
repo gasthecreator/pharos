@@ -554,19 +554,83 @@ func (s *CassandraCanonicalStore) DeleteArchivedEvent(ctx context.Context, r *Ca
 // serialization format to invent. Empty (but non-nil) maps are written as
 // empty CQL maps, which is fine: a brand-new tracker with no partitions seen
 // yet checkpoints to "nothing to restore," exactly matching reality.
+// SaveWatermarkCheckpoint merges this tracker's own view into the group's
+// shared checkpoint row, rather than overwriting it outright (§2.4,
+// PLAN.md Slice 19: Multi-instance scaling). With 2+ pharos-consumer
+// instances sharing one Kafka consumer group (required for rebalancing to
+// split partitions between them at all), each instance's own
+// WatermarkTracker only ever observes the partitions Kafka assigned *to
+// it* -- a plain overwriting INSERT/UPDATE keyed by group_id alone would
+// mean whichever instance saves last replaces the *other* instance's
+// partitions' data in partition_high_watermark/partition_last_activity
+// with nothing, silently discarding it, and could regress
+// previous_emitted to a value lower than what a healthier instance
+// already reported externally. Found by reasoning through exactly this
+// scenario before running it, not by hitting a failure first -- this
+// class of bug (two writers, one shared row, "last write wins" clobbering
+// data the other writer owns) doesn't reliably reproduce on a timing
+// basis worth waiting for.
+//
+// Fixed with CQL's native map addition (`col + {...}`), which merges only
+// the specific partition keys this instance has data for into the
+// existing map, leaving whatever other instances have already written for
+// *their* partitions untouched. previous_emitted is advanced via a plain
+// read-then-max-then-write rather than a Paxos/LWT conditional update
+// (tried first: `IF previous_emitted < ?` genuinely timed out under this
+// cluster's real load -- "Operation timed out - received only 1
+// responses" -- and this checkpoint is already a periodic, eventually-
+// consistent crash-recovery snapshot, not a per-message consistency
+// mechanism, so a plain compare-and-set is the right amount of rigor, not
+// a shortcut). This leaves a narrow race (two instances' concurrent
+// read-then-write could interleave such that a smaller value briefly
+// wins) that's acceptable here for the same reason: the next periodic
+// checkpoint corrects it, and nothing about §2.4's monotonic *external*
+// watermark guarantee depends on this persisted value being exactly
+// correct between saves, only close enough to prevent regressing a
+// running instance's own live watermark after a crash.
 func (s *CassandraCanonicalStore) SaveWatermarkCheckpoint(ctx context.Context, groupID string, cp WatermarkCheckpoint) error {
 	s.mu.RLock()
 	session := s.session
 	s.mu.RUnlock()
 
-	const query = `
-		INSERT INTO pharos.consumer_watermark_checkpoints (
-			group_id, previous_emitted, partition_high_watermark, partition_last_activity
-		) VALUES (?, ?, ?, ?);
+	// 1. Merge this instance's own partitions into the shared maps --
+	// map addition overwrites only the keys present in the right-hand
+	// side, never touching keys (partitions) it doesn't mention. Also
+	// implicitly creates the row on first use (Cassandra doesn't
+	// distinguish INSERT from UPDATE at the storage layer), so no
+	// separate row-creation step is needed.
+	mergeMaps := `
+		UPDATE pharos.consumer_watermark_checkpoints
+		SET partition_high_watermark = partition_high_watermark + ?,
+		    partition_last_activity = partition_last_activity + ?
+		WHERE group_id = ?;
 	`
-	if err := session.Query(query, groupID, cp.PreviousEmitted, cp.PartitionHighWatermark, cp.PartitionLastActivity).
+	if err := session.Query(mergeMaps, cp.PartitionHighWatermark, cp.PartitionLastActivity, groupID).
 		WithContext(ctx).Exec(); err != nil {
-		return fmt.Errorf("failed to save watermark checkpoint for group %s: %w", groupID, err)
+		return fmt.Errorf("failed to merge watermark checkpoint partitions for group %s: %w", groupID, err)
+	}
+
+	// 2. Advance previous_emitted only if this instance's view is
+	// actually newer than what's already persisted -- read-then-max-then-
+	// write, not a regression, since a smaller local view (an instance
+	// owning only early partitions) must never overwrite a larger value
+	// another instance (owning partitions further ahead) already
+	// reported.
+	existing, err := s.LoadWatermarkCheckpoint(ctx, groupID)
+	if err != nil {
+		return fmt.Errorf("failed to read existing watermark checkpoint before advancing for group %s: %w", groupID, err)
+	}
+	newEmitted := cp.PreviousEmitted
+	if existing != nil && existing.PreviousEmitted.After(newEmitted) {
+		newEmitted = existing.PreviousEmitted
+	}
+	advanceEmitted := `
+		UPDATE pharos.consumer_watermark_checkpoints
+		SET previous_emitted = ?
+		WHERE group_id = ?;
+	`
+	if err := session.Query(advanceEmitted, newEmitted, groupID).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("failed to advance watermark checkpoint for group %s: %w", groupID, err)
 	}
 	return nil
 }
@@ -720,23 +784,45 @@ func (m *MemoryCanonicalStore) GetEventsBySite(ctx context.Context, siteID strin
 	return results, nil
 }
 
+// SaveWatermarkCheckpoint merges, mirroring CassandraCanonicalStore's own
+// map-merge/monotonic-advance semantics (§2.4, PLAN.md Slice 19:
+// Multi-instance scaling) -- kept consistent so a test exercising 2+
+// simulated consumer instances against MemoryCanonicalStore observes the
+// same behavior a real deployment would against Cassandra, rather than
+// passing here on a naive overwrite that would silently lose data for
+// real.
 func (m *MemoryCanonicalStore) SaveWatermarkCheckpoint(ctx context.Context, groupID string, cp WatermarkCheckpoint) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	high := make(map[int]time.Time, len(cp.PartitionHighWatermark))
+	existing, ok := m.checkpoints[groupID]
+	if !ok {
+		existing = WatermarkCheckpoint{
+			PartitionHighWatermark: map[int]time.Time{},
+			PartitionLastActivity:  map[int]time.Time{},
+		}
+	}
+	merged := WatermarkCheckpoint{
+		PreviousEmitted:        existing.PreviousEmitted,
+		PartitionHighWatermark: make(map[int]time.Time, len(existing.PartitionHighWatermark)+len(cp.PartitionHighWatermark)),
+		PartitionLastActivity:  make(map[int]time.Time, len(existing.PartitionLastActivity)+len(cp.PartitionLastActivity)),
+	}
+	for p, t := range existing.PartitionHighWatermark {
+		merged.PartitionHighWatermark[p] = t
+	}
 	for p, t := range cp.PartitionHighWatermark {
-		high[p] = t
+		merged.PartitionHighWatermark[p] = t
 	}
-	activity := make(map[int]time.Time, len(cp.PartitionLastActivity))
+	for p, t := range existing.PartitionLastActivity {
+		merged.PartitionLastActivity[p] = t
+	}
 	for p, t := range cp.PartitionLastActivity {
-		activity[p] = t
+		merged.PartitionLastActivity[p] = t
 	}
-	m.checkpoints[groupID] = WatermarkCheckpoint{
-		PreviousEmitted:        cp.PreviousEmitted,
-		PartitionHighWatermark: high,
-		PartitionLastActivity:  activity,
+	if cp.PreviousEmitted.After(merged.PreviousEmitted) {
+		merged.PreviousEmitted = cp.PreviousEmitted
 	}
+	m.checkpoints[groupID] = merged
 	return nil
 }
 

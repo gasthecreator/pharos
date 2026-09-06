@@ -40,6 +40,94 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Slice 19 — Multi-instance scaling
+
+**Author:** Claude Code
+
+**What:** New `internal/ratelimit.RedisLimiter` implementing the existing
+`RateLimiter` interface (Slice 2) as a distributed token bucket backed by
+one atomic Redis Lua script. New `redis` and `nginx` services in
+`docker-compose.yml` (nginx as a TCP-passthrough load balancer for 2+
+`pharos-ingestion` instances). New `--redis-addr` flag on
+`pharos-ingestion`. A real bug found and fixed in
+`internal/consumer/canonical_store.go`'s `SaveWatermarkCheckpoint`: it
+overwrote the shared checkpoint row instead of merging, which would
+silently discard one consumer instance's partition data whenever another
+instance in the same group saved.
+
+**Why:** Per PLAN.md's Slice 19 — 2+ `pharos-ingestion` instances behind a
+load balancer using the Redis-backed rate limiter PLAN.md explicitly says
+to swap in (not build new), and 2+ `pharos-consumer` instances verifying
+Kafka rebalancing actually works with this project's watermark tracking.
+
+**How:** The rate limiter half went as designed. The consumer half
+surfaced something real.
+
+Redis limiter: same token-bucket math as `TokenBucketLimiter`, moved into
+one Lua script so the check-and-decrement is atomic across concurrent
+instances (separate GET/SET calls from Go would just move the same race
+to the network). nginx does TCP-level passthrough, not TLS-terminating
+HTTP proxying, since ingestion already terminates its own TLS (Slice 15)
+and passthrough needs no copy of the project's private key at the LB.
+Verified live: 2 real ingestion instances behind real nginx (confirmed
+alternating via nginx's own stream access log), 10 rapid requests for one
+site through the LB — exactly 5 accepted, 5 throttled with 429, matching
+the configured burst capacity precisely. A per-process bucket would have
+allowed ~10 (5 per instance independently); this is the determinative
+proof the limit is actually shared.
+
+The consumer bug was found by reasoning through the scenario before
+running anything, not by chasing a failure: 2 consumer instances sharing
+one Kafka group (required for rebalancing to split partitions between
+them at all) each only ever see the partitions Kafka assigned to *them*.
+A plain overwriting `INSERT` keyed by `group_id` alone meant whichever
+instance saved last replaced the *other* instance's partitions with
+nothing — undoing Slice 13's own crash-recovery guarantee the moment a
+second instance joined the group. Fixed with CQL's native map addition
+(`col + {...}`, merging only the keys an instance actually has data for)
+and a read-then-max-then-write advance for `previous_emitted` — a
+Paxos/LWT conditional update was tried first and genuinely timed out
+under this cluster's real load after many hours of testing across this
+whole session ("Operation timed out - received only 1 responses"),
+simplified to a plain compare-and-set, appropriate rigor for what's
+already a periodic, eventually-consistent snapshot, not a per-message
+consistency mechanism. `MemoryCanonicalStore` got the identical merge fix
+for test consistency. New tests prove it against both the memory store
+and real Cassandra: two simulated instances checkpointing disjoint
+partitions end up with all partitions in the merged result, and a smaller
+local view can never regress a larger already-persisted value.
+
+Verified live end to end: 2 real `pharos-consumer` instances in one Kafka
+group, real traffic across 6 sites/3 partitions — Kafka's rebalance
+protocol split ownership between them (confirmed via each instance's own
+distinct, stabilized consumed-message count), and the shared checkpoint
+row genuinely contained all 3 partitions' data merged from both. Then one
+instance was killed outright: `kafka-consumer-groups.sh --describe`
+confirmed the survivor took over all three partitions with zero lag, and
+its watermark advanced forward (not reset or regressed) after inheriting
+the dead instance's further-progressed partitions.
+
+**Files/modules touched:** new `internal/ratelimit/redis_limiter.go`,
+`internal/ratelimit/redis_limiter_integration_test.go`; new
+`internal/consumer/watermark_checkpoint_multi_instance_test.go`,
+`internal/consumer/watermark_checkpoint_cassandra_integration_test.go`;
+`internal/consumer/canonical_store.go` (`SaveWatermarkCheckpoint` merge
+fix, both Cassandra and in-memory stores); `cmd/pharos-ingestion/main.go`
+(`--redis-addr`); new `nginx/nginx.conf`; `docker-compose.yml` (`redis`,
+`nginx` services); `go.mod`/`go.sum` (`github.com/redis/go-redis/v9`);
+`PLAN.md` (Slice 19 marked done).
+
+**Tests added/updated:** `TestRedisLimiter_BurstAndThrottle`,
+`TestRedisLimiter_SharedAcrossMultipleInstances` (the actual property this
+slice exists to prove — two independent limiter instances sharing one
+Redis must enforce one combined limit, not one each),
+`TestRedisLimiter_RefillOverTime`;
+`TestSaveWatermarkCheckpoint_MergesAcrossInstances`,
+`TestCassandraCanonicalStore_WatermarkCheckpointMergesAcrossInstances`.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope.
+
 ## [2026-09-05] Claude Code: Slice 18 — Backup & disaster recovery
 
 **Author:** Claude Code

@@ -19,12 +19,14 @@ import (
 	"github.com/gasthecreator/pharos/internal/metrics"
 	"github.com/gasthecreator/pharos/internal/ratelimit"
 	"github.com/gasthecreator/pharos/internal/tlsutil"
+	goredis "github.com/redis/go-redis/v9"
 )
 
 func main() {
 	port := flag.Int("port", 8081, "HTTP listen port")
 	rateLimitCap := flag.Float64("rate-limit-capacity", 100, "Per-site token bucket burst capacity")
 	rateLimitRefill := flag.Float64("rate-limit-refill", 10, "Per-site token refill rate (tokens/sec)")
+	redisAddr := flag.String("redis-addr", "", "Redis address (host:port) for a distributed rate limiter shared across instances (§2.3, §2.4, Slice 19); empty uses an in-process limiter, correct only for a single instance")
 	cassandraHosts := flag.String("cassandra-hosts", "127.0.0.1", "Comma-separated Cassandra host addresses")
 	cassandraPort := flag.Int("cassandra-port", 9042, "Cassandra port")
 	cassandraKeyspace := flag.String("cassandra-keyspace", "pharos", "Cassandra keyspace")
@@ -40,8 +42,25 @@ func main() {
 
 	log.Printf("[pharos-ingestion] Starting Central Ingestion Service on port %d...", *port)
 
-	// 1. Initialize per-site token bucket rate limiter (§2.3)
-	limiter := ratelimit.NewTokenBucketLimiter(*rateLimitCap, *rateLimitRefill)
+	// 1. Initialize per-site token bucket rate limiter (§2.3) -- Redis-backed
+	// and shared across every instance when --redis-addr is set (§2.4,
+	// Slice 19: Multi-instance scaling); an in-process bucket is only
+	// correct for exactly one instance, since each additional instance
+	// behind a load balancer would otherwise enforce the configured limit
+	// independently, silently multiplying a site's real limit.
+	var limiter ratelimit.RateLimiter
+	if *redisAddr != "" {
+		redisClient := goredis.NewClient(&goredis.Options{Addr: *redisAddr})
+		redisLimiter, err := ratelimit.NewRedisLimiter(context.Background(), redisClient, *rateLimitCap, *rateLimitRefill)
+		if err != nil {
+			log.Fatalf("[pharos-ingestion] Failed to initialize Redis rate limiter: %v", err)
+		}
+		limiter = redisLimiter
+		log.Printf("[pharos-ingestion] Distributed rate limiting via Redis at %s (shared across instances)", *redisAddr)
+	} else {
+		limiter = ratelimit.NewTokenBucketLimiter(*rateLimitCap, *rateLimitRefill)
+		log.Printf("[pharos-ingestion] WARNING: in-process rate limiting only (--redis-addr not set) -- correct for a single instance only")
+	}
 
 	// 2. Initialize Cassandra Outbox Store & Kafka Producer (§2.2, §2.3)
 	var outboxStore dedup.OutboxStore
