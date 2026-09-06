@@ -53,9 +53,10 @@ past its own 100-token bucket + 10/s refill.
   the burst; this is the rate limiter doing its job, not a failure.
 - `curl --cacert ./certs/ca-cert.pem https://localhost:8443/metrics` and
   `curl http://localhost:9091/metrics` before/after the run, diffing
-  `pharos_cassandra_write_duration_seconds` / `pharos_outbox_publish_duration_seconds`
-  histograms -- this is how to find the actual bottleneck rather than
-  assuming one (PLAN.md's own framing for this slice).
+  `pharos_ingestion_outbox_publish_duration_seconds` /
+  `pharos_consumer_cassandra_write_duration_seconds` histograms -- this is
+  how to find the actual bottleneck rather than assuming one (PLAN.md's own
+  framing for this slice).
 
 Real numbers from an actual run are recorded in WORKLOG.md and PLAN.md's
 Slice 16 entry, not reproduced here -- this file documents how to

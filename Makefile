@@ -14,8 +14,19 @@ build:
 	go build -buildvcs=false -o $(CLI_BIN) ./cmd/pharos-cli
 	go build -buildvcs=false -o $(DASHBOARD_BIN) ./cmd/pharos-dashboard
 
+# -p 1 (serialized packages) and running internal/chaos separately/last
+# both matter, not just style -- see .github/workflows/ci.yml's own test
+# steps for the full reasoning (concurrent packages' real Cassandra/Kafka
+# connections genuinely OOM-killed this project's dev topology once TLS was
+# added; internal/chaos's disruptive tests running immediately before
+# internal/consumer's in alphabetical order caused intermittent spurious
+# failures there too). `go test ./...` without both of these is not just
+# slower, it can flake or OOM a real cluster -- this target exists so
+# CONTRIBUTING.md's own "before opening a PR" instructions actually match
+# what CI safely does, not a shortcut CI itself doesn't take.
 test:
-	go test -buildvcs=false -v -race ./...
+	go test -buildvcs=false -v -race -count=1 -p 1 $$(go list ./... | grep -v '/internal/chaos$$')
+	go test -buildvcs=false -v -race -count=1 ./internal/chaos/...
 
 lint:
 	go vet -buildvcs=false ./...
