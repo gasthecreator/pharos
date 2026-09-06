@@ -24,8 +24,13 @@ build:
 # slower, it can flake or OOM a real cluster -- this target exists so
 # CONTRIBUTING.md's own "before opening a PR" instructions actually match
 # what CI safely does, not a shortcut CI itself doesn't take.
+#
+# RAPID_CHECKS raises pgregory.net/rapid's default 100 generated cases per
+# property test (Slice 22) -- without it, `make test` silently exercises
+# 50x fewer property-test cases than CI actually does, despite
+# CONTRIBUTING.md's own claim that CI runs the same checks as `make test`.
 test:
-	go test -buildvcs=false -v -race -count=1 -p 1 $$(go list ./... | grep -v '/internal/chaos$$')
+	RAPID_CHECKS=5000 go test -buildvcs=false -v -race -count=1 -p 1 $$(go list ./... | grep -v '/internal/chaos$$')
 	go test -buildvcs=false -v -race -count=1 ./internal/chaos/...
 
 lint:
@@ -43,8 +48,38 @@ fmt-check:
 clean:
 	rm -f $(EDGE_BIN) $(INGESTION_BIN) $(CONSUMER_BIN) $(CLI_BIN) $(DASHBOARD_BIN) *.db *.db-wal *.db-shm *.db-journal coverage.out
 
+# Bringing every container up at once with a bare `docker compose up -d`
+# starts MirrorMaker 2 before any Kafka topic exists, which makes it
+# busy-loop discovery/retry and has caused real OOM kills on this host
+# (docker-compose.yml's own Kafka section comment, ARCHITECTURE_PROPOSALS.md's
+# Slice 14 addendum #3, and .github/workflows/ci.yml's identical sequencing).
+# This target mirrors CI's/scripts/demo.sh's safe order instead: certs,
+# then Cassandra+Kafka+Redis+observability, then wait for healthy, then
+# topics, then MirrorMaker 2 last.
 up:
-	docker compose up -d
+	@if [ ! -f certs/ca-cert.pem ]; then \
+		./scripts/generate_certs.sh; \
+	else \
+		echo "certs/ already exists, skipping generation -- generate_certs.sh"; \
+		echo "unconditionally deletes and regenerates the CA, which would break"; \
+		echo "TLS trust for any already-running containers (confirmed live: this"; \
+		echo "broke a real running cluster during this fix's own verification --"; \
+		echo "see WORKLOG.md). Run ./scripts/generate_certs.sh directly, then"; \
+		echo "'docker compose down && make up', if you genuinely need fresh certs."; \
+	fi
+	docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana redis
+	@echo "Waiting for Cassandra + Kafka + Redis to report healthy..."
+	@for i in $$(seq 1 90); do \
+		healthy=true; \
+		for c in pharos-cassandra-1 pharos-cassandra-2 pharos-cassandra-3 pharos-cassandra-4 pharos-kafka-1 pharos-kafka-2 pharos-kafka-3 pharos-kafka-4 pharos-redis; do \
+			status=$$(docker inspect --format '{{.State.Health.Status}}' "$$c" 2>/dev/null || echo missing); \
+			if [ "$$status" != "healthy" ]; then healthy=false; fi; \
+		done; \
+		if [ "$$healthy" = true ]; then echo "Cluster healthy."; break; fi; \
+		sleep 3; \
+	done
+	./scripts/create_topics.sh
+	docker compose up -d mirrormaker
 
 down:
 	docker compose down

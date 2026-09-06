@@ -11,7 +11,7 @@ info:
     §2.3) before anything reaches Kafka.
 servers:
   - url: http://localhost:8091
-    description: Default local Central Ingestion instance (--port 8091; the README uses this port specifically to dodge a port-8081 conflict some machines have — see README.md)
+    description: Default local Central Ingestion instance (--port 8091; see WORKLOG.md for why this port was chosen over the flag's own 8081 default)
 
 security:
   - siteAuth: []
@@ -47,6 +47,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/BatchResponse"
+        "400":
+          description: Empty/unreadable request body, malformed JSON or an unparseable batch shape, or a missing site_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid X-Site-ID/X-API-Key (unless --enable-auth=false)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: The authenticated site does not match the batch's own site_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "405":
+          description: Method other than POST
         "422":
           description: Every event in the batch failed FHIR validation
           content:
@@ -68,6 +88,12 @@ paths:
             X-RateLimit-Reset:
               schema:
                 type: integer
+        "500":
+          description: Internal rate-limiter error, unrelated to the site actually being over its limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: Every event in the batch hit an infrastructure failure (Cassandra/Kafka unavailable) — safe to retry the whole batch
           content:
@@ -115,6 +141,12 @@ paths:
                     type: string
         "400":
           description: Missing idempotency key in path
+        "401":
+          description: Missing or invalid X-Site-ID/X-API-Key (unless --enable-auth=false)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "403":
           description: Authenticated site does not own this DLQ record
         "404":
@@ -137,6 +169,8 @@ paths:
   /healthz:
     get:
       summary: Liveness check
+      security: []
+      description: Unconditionally unauthenticated — registered outside the site-auth wrapper regardless of --enable-auth.
       responses:
         "200":
           description: Service is up
@@ -144,6 +178,8 @@ paths:
   /metrics:
     get:
       summary: Prometheus metrics (request/status counts, rate-limit rejections, dedup outcomes, DLQ writes, outbox publish latency)
+      security: []
+      description: Unconditionally unauthenticated — registered on its own mux entry, outside the handler's route/auth wiring entirely.
       responses:
         "200":
           description: Prometheus text exposition format
@@ -162,10 +198,18 @@ components:
         Paired with the X-Site-ID header (also required, but OpenAPI 3.0's
         apiKey scheme only models one header per scheme entry). The
         authenticated site must match X-Site-ID on every site-scoped route.
-        Not enforced when Central Ingestion runs with --enable-auth=false
+        Not enforced when Central Ingestion runs with --enable-auth=false,
+        or unconditionally when it runs with --use-memory-store (which
+        never constructs a key store regardless of --enable-auth's value)
         (PLAN.md §2.1, §2.2, Slice 15).
 
   schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+
     BatchRequest:
       type: object
       required: [events]

@@ -1,10 +1,11 @@
 # Pharos — Living Plan
 
-**Status:** pre-code. This file is the single source of truth for architecture and
+**Status:** all 23 scoped Slices built and verified against real infrastructure
+(§4 tracks each one). This file is the single source of truth for architecture and
 progress. Both Antigravity and Claude Code read this before touching code. Keep it
 updated as decisions change — do not let it go stale.
 
-Last updated: 2026-08-29
+Last updated: 2026-09-06
 
 ---
 
@@ -152,6 +153,18 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   their own dependency-free package (e.g. `internal/wire`), so `internal/edge` no
   longer transitively pulls in `internal/ingestion` (and by extension anything it
   imports) at all.
+
+  **Resolved (audit remediation, 2026-09-05).** `internal/wire` now holds
+  those dependency-free wire types; `internal/metrics` was split into
+  `internal/metrics/{edgemetrics,ingestionmetrics,consumermetrics}`, one per
+  service, with each binary importing only its own subpackage (confirmed:
+  `cmd/pharos-edge/main.go`, `cmd/pharos-consumer/main.go`, and
+  `internal/ingestion/handler.go` each import exactly one). A
+  `TestMetricsIsolation_*Only` test per service (added during the second
+  audit pass) scrapes a test binary whose only import is that one
+  subpackage and confirms no other service's metric names appear — the
+  exact cross-service-leak shape this limitation described, now a
+  regression test, not just a mitigation.
 
   Grafana OSS is
   AGPLv3 — free to self-host with no usage cap, same free-forever footing as
@@ -374,6 +387,16 @@ with no change to their own content or intent.
   accumulated from this session's own testing, confirmed one directly gone
   from Cassandra via `cqlsh`, and confirmed `pharos-cli query event` still
   returns it correctly through the archive fallback.
+
+  **Resolved (audit remediation, 2026-09-05).** The `event_outbox`/
+  `pending_outbox` exclusion noted above is now closed too: `internal/archive`
+  gained `RunOutboxPrune`, and migration `006_event_outbox_pruning.cql`
+  added `event_outbox_by_site` for the by-site scan. Unlike the canonical
+  data above, outbox rows are pruned outright (no export) once past their
+  claim/lease lifetime — they're operational bookkeeping, not the
+  data-of-record, so there's nothing worth archiving. `pharos-cli archive
+  run` now reports `"Outbox: %d pruned, %d failed"` alongside the existing
+  canonical-archive counts.
 
 - **Slice 12 — Edge collector durability hardening.** A site's entire local
   durability guarantee today is one un-replicated SQLite file (this is what
@@ -1108,6 +1131,13 @@ verified against real infrastructure the same way every earlier slice was.
   own "21 CFR Part 11" purpose, out of this slice's explicit scope to fix
   (the instruction was to follow its *pattern*, not extend a mechanism
   that isn't durable to begin with).
+
+  **Resolved (audit remediation).** `LateArrivalAudit` is now genuinely
+  durable: `internal/consumer/canonical_store.go` added table
+  `pharos.consumer_late_arrival_audits` plus `SaveLateArrivalAudit`/
+  `ListLateArrivalAudits`, and `pharos-cli audit late-arrivals --group
+  <group> [--limit <n>]` gives it a real inspection surface, closing the
+  exact gap this slice had deliberately left open.
 
   Wired into `pharos-cli`: a new `--operator` flag, required (and
   enforced, not just documented) for `query`/`dlq list`/`dlq get` against

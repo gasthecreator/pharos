@@ -124,6 +124,8 @@ spec:
             items:
               - key: cassandra-keystore.jks
                 path: cassandra-keystore.jks
+              - key: cassandra-truststore.jks
+                path: cassandra-truststore.jks
               - key: ca-cert.pem
                 path: ca-cert.pem
   volumeClaimTemplates:
@@ -234,6 +236,8 @@ spec:
             items:
               - key: cassandra-keystore.jks
                 path: cassandra-keystore.jks
+              - key: cassandra-truststore.jks
+                path: cassandra-truststore.jks
               - key: ca-cert.pem
                 path: ca-cert.pem
   volumeClaimTemplates:

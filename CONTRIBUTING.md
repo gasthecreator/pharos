@@ -49,11 +49,16 @@ after the fact.
 make fmt-check   # gofmt
 make lint        # go vet
 make build       # confirms everything compiles
-docker compose up -d && make test   # full suite against real Cassandra + Kafka
+make up          # brings up Cassandra/Kafka/Redis in the safe order CI uses -- see its own comment
+make test        # full suite against real Cassandra + Kafka
 ```
 
-CI runs the same checks — see `.github/workflows/ci.yml`. A green run there
-is the bar, not "it worked on my machine once."
+`make up` matters here, not just `docker compose up -d`: starting every
+container (including MirrorMaker 2) at once has caused real OOM kills on
+this host, so `up` brings services up in the same safe order
+`.github/workflows/ci.yml` uses. CI runs the same checks as `make test` —
+see `.github/workflows/ci.yml`. A green run there is the bar, not "it
+worked on my machine once."
 
 ## What "done" means for a slice
 

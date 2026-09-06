@@ -29,7 +29,7 @@ flowchart LR
     CI -->|outbox + DLQ tables| Cass1[(Cassandra<br/>event_outbox, dead_letter_events)]
     MainTopic --> Consumer[pharos-consumer<br/>watermark tracking]
     DLQTopic --> Cass1
-    Consumer --> Cass2[(Cassandra<br/>canonical_events,<br/>events_by_study,<br/>events_by_site)]
+    Consumer --> Cass2[(Cassandra<br/>canonical_events,<br/>events_by_study,<br/>events_by_site,<br/>events_recent)]
     CLI[pharos-cli<br/>query & DLQ inspection] --> Cass2
     CLI --> Cass1
 ```
@@ -38,7 +38,7 @@ Every trial site runs its own edge binary. Central Ingestion is the only thing t
 
 ## Tech stack
 
-Go, Apache Kafka (KRaft mode, no ZooKeeper), Apache Cassandra — all self-hosted via Docker Compose, zero cloud spend. `segmentio/kafka-go` and `gocql` are the only non-stdlib dependencies of note; both pure-Go, no cgo.
+Go, Apache Kafka (KRaft mode, no ZooKeeper), Apache Cassandra — all self-hosted via Docker Compose, zero cloud spend. Notable dependencies, all pure-Go (no cgo): `segmentio/kafka-go` and `gocql` (Kafka/Cassandra clients), `modernc.org/sqlite` (the edge collector's local WAL durability), `prometheus/client_golang` (metrics), `redis/go-redis` (the optional distributed rate limiter, Slice 19), and `pgregory.net/rapid` (property-based testing, Slice 22).
 
 ## Running it locally
 
@@ -64,12 +64,13 @@ submit anything.
 
 docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 \
   kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana   # Cassandra + Kafka + observability
-# wait for all eight to report healthy: docker compose ps
+# wait for the 4 Cassandra + 4 Kafka + prometheus nodes to report healthy:
+# docker compose ps (grafana has no healthcheck to wait on)
 
 ./scripts/create_topics.sh    # provisions topics with their real retention policies
 docker compose up -d mirrormaker   # bring this up last -- see note above
 
-make build                    # builds bin/pharos-edge, pharos-ingestion, pharos-consumer, pharos-cli
+make build                    # builds bin/pharos-edge, pharos-ingestion, pharos-consumer, pharos-cli, pharos-dashboard
 
 ./bin/pharos-cli site create-key SITE-DEMO-NG --ca-cert certs/ca-cert.pem
 # API key created for site SITE-DEMO-NG. Save this now -- it cannot be shown again:
@@ -173,6 +174,11 @@ cmd/pharos-dashboard    Server-rendered web dashboard + chaos control panel (Sli
 internal/               Implementation packages, one per concern above plus faultinjection
 migrations/             Cassandra schema (bootstrapped automatically at startup too)
 deploy/                 Dockerfiles and Kubernetes manifests for every service (Slice 17)
+scripts/                Cert generation, topic provisioning, demo, backup/restore, load-test setup
+loadtest/               k6 load-test script and its own README (Slice 16)
+observability/          Prometheus scrape config + Grafana datasource/dashboard provisioning
+nginx/                  TCP-passthrough load balancer in front of 2+ pharos-ingestion instances (Slice 19)
+kafka/                  MirrorMaker 2 config for the dc-us/dc-eu replication topology
 docs/api/               OpenAPI specs for the edge and Central Ingestion HTTP APIs
 docs/security-threat-model.md   Per-component trust boundaries and known gaps
 docs/benchmark-results.md       Real load-test numbers (Slice 16) and how to reproduce them
