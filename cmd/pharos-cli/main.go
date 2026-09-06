@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gasthecreator/pharos/internal/archive"
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/consumer"
 	"github.com/gasthecreator/pharos/internal/dedup"
@@ -47,23 +48,35 @@ Site API Key Commands (§2.1, §2.2, Slice 15 -- requires Cassandra, not --memor
   site create-key <site_id>                                 Issue a new API key for a site (prints plaintext once)
   site revoke-key <site_id>                                 Immediately invalidate a site's current key
 
+Access Audit Commands (§2.4, Slice 20):
+  audit list --operator <name> [--limit <n>]                Show a compliance operator's recorded access history
+                                                             (query/dlq inspection actions and, for a site operator,
+                                                             its own DLQ replay attempts)
+
 Flags:
   --hosts        Comma-separated Cassandra hosts (default: 127.0.0.1)
   --port         Cassandra port (default: 9042)
   --keyspace     Cassandra keyspace (default: pharos)
   --central-url  Central Ingestion base URL, for dlq replay only (default: http://localhost:8091)
-  --ca-cert      CA certificate file for verifying TLS connections to Cassandra (§2.4, Slice 15)
+  --ca-cert      CA certificate file for verifying TLS connections to Cassandra and,
+                 for dlq replay, to Central Ingestion itself (§2.4, Slice 15)
   --json         Output results in JSON format (default: false)
   --memory       Run with in-memory sample store for offline demo (default: false)
+  --operator     Identity recorded in the access-audit trail for query/dlq inspection
+                 commands (§2.4, Slice 20). Required unless --memory.
+  --site-id      Site ID to authenticate as for dlq replay (§2.1, §2.2, Slice 15)
+  --api-key      API key to authenticate with for dlq replay (§2.1, §2.2, Slice 15)
 
 Examples:
-  pharos-cli query study STUDY-001 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z
-  pharos-cli query site SITE-US-01 --min-seq 1
-  pharos-cli query event SITE-US-01:1
-  pharos-cli dlq list --site SITE-US-01
-  pharos-cli dlq get SITE-US-01:99
-  pharos-cli dlq replay SITE-US-01:99
-  pharos-cli dlq replay --all --site SITE-US-01
+  pharos-cli --operator alice@sponsor.example query study STUDY-001 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z
+  pharos-cli --operator alice@sponsor.example query site SITE-US-01 --min-seq 1
+  pharos-cli --operator alice@sponsor.example query event SITE-US-01:1
+  pharos-cli --operator alice@sponsor.example dlq list --site SITE-US-01
+  pharos-cli --operator alice@sponsor.example dlq get SITE-US-01:99
+  pharos-cli dlq replay SITE-US-01:99 --site-id SITE-US-01 --api-key <key>
+  pharos-cli dlq replay --all --site SITE-US-01 --site-id SITE-US-01 --api-key <key>
+  pharos-cli audit list --operator alice@sponsor.example
+  pharos-cli audit list --operator SITE-US-01 --limit 20
 `)
 }
 
@@ -80,6 +93,9 @@ func main() {
 		keyspaceFlag   string
 		centralURLFlag string
 		caCertFlag     string
+		operatorFlag   string
+		siteIDFlag     string
+		apiKeyFlag     string
 		jsonOutput     bool
 		useMemory      bool
 	)
@@ -130,6 +146,9 @@ func main() {
 			{"keyspace", &keyspaceFlag},
 			{"central-url", &centralURLFlag},
 			{"ca-cert", &caCertFlag},
+			{"operator", &operatorFlag},
+			{"site-id", &siteIDFlag},
+			{"api-key", &apiKeyFlag},
 		} {
 			if val, matched := valueFlag(arg, f.name); matched {
 				consumed = true
@@ -169,12 +188,41 @@ func main() {
 
 	ctx := context.Background()
 
+	// query/dlq-list/dlq-get commands have no authentication concept of
+	// their own (query.Service takes no identity parameter -- confirmed by
+	// inspection, unlike the site-authenticated ingestion path) but still
+	// touch real patient adverse-event data, so §2.4/Slice 20 requires a
+	// self-declared --operator before they're allowed to run for real.
+	// --memory is exempted: it's sample data seeded by this same process,
+	// not a compliance-relevant access.
+	command := remainingArgs[0]
+	needsOperator := command == "query" || command == "dlq" && len(remainingArgs) > 1 && (remainingArgs[1] == "list" || remainingArgs[1] == "get")
+	if needsOperator && operatorFlag == "" && !useMemory {
+		fmt.Fprintf(os.Stderr, "--operator is required for %s (§2.4, Slice 20: every access to real adverse-event data must be attributable to an operator)\n", command)
+		os.Exit(1)
+	}
+	// "audit list" uses --operator differently (the trail being inspected,
+	// not the inspector's own identity -- see handleAudit) so it's checked
+	// separately, unconditionally: silently defaulting an unset --operator
+	// to "demo-operator" here (the way query/dlq's self-identity default
+	// makes sense for offline demos) would instead just silently show an
+	// arbitrary, almost-certainly-empty trail and look like a real answer.
+	if command == "audit" && operatorFlag == "" {
+		fmt.Fprintf(os.Stderr, "--operator is required for audit list (names the operator whose access history to show)\n")
+		os.Exit(1)
+	}
+	if operatorFlag == "" {
+		operatorFlag = "demo-operator"
+	}
+
 	// Initialize service
 	var svc query.Service
+	var auditStore audit.Store
 	if useMemory {
 		memSvc := query.NewMemoryService()
 		seedSampleData(memSvc)
 		svc = memSvc
+		auditStore = audit.NewMemoryStore()
 	} else {
 		cfg := query.DefaultCassandraServiceConfig()
 		cfg.Hosts = strings.Split(hostsFlag, ",")
@@ -191,14 +239,28 @@ func main() {
 		}
 		defer cSvc.Close()
 		svc = cSvc
+
+		auditCfg := audit.DefaultCassandraConfig()
+		auditCfg.Hosts = strings.Split(hostsFlag, ",")
+		auditCfg.Port = portFlag
+		auditCfg.Keyspace = keyspaceFlag
+		if caCertFlag != "" {
+			auditCfg.TLS = &tlsutil.ClientConfig{CACertPath: caCertFlag, ServerName: "localhost"}
+		}
+		aStore, err := audit.NewCassandraStore(auditCfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error connecting to access-audit store: %v\n", err)
+			os.Exit(1)
+		}
+		defer aStore.Close()
+		auditStore = aStore
 	}
 
-	command := remainingArgs[0]
 	switch command {
 	case "query":
-		handleQuery(ctx, svc, remainingArgs[1:], jsonOutput)
+		handleQuery(ctx, svc, auditStore, operatorFlag, remainingArgs[1:], jsonOutput)
 	case "dlq":
-		handleDLQ(ctx, svc, remainingArgs[1:], jsonOutput, centralURLFlag)
+		handleDLQ(ctx, svc, auditStore, operatorFlag, remainingArgs[1:], jsonOutput, centralURLFlag, siteIDFlag, apiKeyFlag, caCertFlag)
 	case "archive":
 		if useMemory {
 			fmt.Fprintf(os.Stderr, "archive is not meaningful with --memory: there's no real Cassandra data to archive\n")
@@ -211,6 +273,8 @@ func main() {
 			os.Exit(1)
 		}
 		handleSite(ctx, remainingArgs[1:], hostsFlag, portFlag, keyspaceFlag, caCertFlag)
+	case "audit":
+		handleAudit(ctx, auditStore, operatorFlag, remainingArgs[1:], jsonOutput)
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		printUsage()
@@ -218,7 +282,30 @@ func main() {
 	}
 }
 
-func handleQuery(ctx context.Context, svc query.Service, args []string, jsonOutput bool) {
+// recordAccess writes one entry to the access-audit trail (§2.4, Slice 20)
+// for a query/dlq-inspection action. Outcome is derived from err so callers
+// never have to remember to stringify it consistently. A failure to record
+// the audit entry itself is reported to stderr but does not fail the
+// underlying command -- an operator who successfully queried real data
+// should see that data even if the audit write itself had a transient
+// problem, since refusing to show already-fetched results wouldn't undo the
+// access, it would just also lose the operator's own visibility into it.
+func recordAccess(ctx context.Context, store audit.Store, operator, action, resource string, err error) {
+	outcome := "SUCCESS"
+	if err != nil {
+		outcome = "ERROR: " + err.Error()
+	}
+	if auditErr := store.RecordAccess(ctx, audit.AccessAudit{
+		Operator: operator,
+		Action:   action,
+		Resource: resource,
+		Outcome:  outcome,
+	}); auditErr != nil {
+		fmt.Fprintf(os.Stderr, "WARNING: failed to record access-audit entry for %s %s: %v\n", action, resource, auditErr)
+	}
+}
+
+func handleQuery(ctx context.Context, svc query.Service, auditStore audit.Store, operator string, args []string, jsonOutput bool) {
 	if len(args) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -260,6 +347,7 @@ func handleQuery(ctx context.Context, svc query.Service, args []string, jsonOutp
 		}
 
 		records, err := svc.GetEventsByStudy(ctx, studyID, startTime, endTime)
+		recordAccess(ctx, auditStore, operator, "QUERY_STUDY", studyID, err)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 			os.Exit(1)
@@ -285,6 +373,7 @@ func handleQuery(ctx context.Context, svc query.Service, args []string, jsonOutp
 		siteFlags.Parse(args[2:])
 
 		records, err := svc.GetEventsBySite(ctx, siteID, *minSeq)
+		recordAccess(ctx, auditStore, operator, "QUERY_SITE", siteID, err)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Query failed: %v\n", err)
 			os.Exit(1)
@@ -306,6 +395,7 @@ func handleQuery(ctx context.Context, svc query.Service, args []string, jsonOutp
 		idKey := args[1]
 
 		rec, err := svc.GetEvent(ctx, idKey)
+		recordAccess(ctx, auditStore, operator, "QUERY_EVENT", idKey, err)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Event not found: %v\n", err)
 			os.Exit(1)
@@ -326,7 +416,7 @@ func handleQuery(ctx context.Context, svc query.Service, args []string, jsonOutp
 	}
 }
 
-func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput bool, centralURL string) {
+func handleDLQ(ctx context.Context, svc query.Service, auditStore audit.Store, operator string, args []string, jsonOutput bool, centralURL, authSiteID, authAPIKey, caCert string) {
 	if len(args) == 0 {
 		printUsage()
 		os.Exit(1)
@@ -348,6 +438,11 @@ func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput
 		} else {
 			records, err = svc.ListAllDLQEvents(ctx, *limit)
 		}
+		listResource := *siteID
+		if listResource == "" {
+			listResource = "ALL_SITES"
+		}
+		recordAccess(ctx, auditStore, operator, "DLQ_LIST", listResource, err)
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "DLQ query failed: %v\n", err)
@@ -374,6 +469,7 @@ func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput
 		idKey := args[1]
 
 		rec, err := svc.GetDLQEvent(ctx, idKey)
+		recordAccess(ctx, auditStore, operator, "DLQ_GET", idKey, err)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "DLQ event not found: %v\n", err)
 			os.Exit(1)
@@ -394,6 +490,19 @@ func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput
 		limit := replayFlags.Int("limit", 500, "Max records to consider with --all")
 		replayFlags.Parse(args[1:])
 
+		// Replay authenticates against Central Ingestion as a real site
+		// (§2.1, §2.2, Slice 15) -- unlike query/dlq-list/get, this isn't
+		// pharos-cli's own local self-declared --operator, it's the actual
+		// site credential HandleDLQReplay checks against rec.SiteID. This
+		// was previously a silent gap: replayDLQRecord sent no auth headers
+		// at all, so dlq replay has been broken (401) against any
+		// ingestion deployment with auth enabled (the default since Slice
+		// 15) since the day Slice 15 shipped.
+		if authSiteID == "" || authAPIKey == "" {
+			fmt.Fprintf(os.Stderr, "dlq replay requires --site-id and --api-key to authenticate with Central Ingestion (§2.1, §2.2, Slice 15)\n")
+			os.Exit(1)
+		}
+
 		if *all {
 			if *siteID == "" {
 				fmt.Fprintf(os.Stderr, "Usage: pharos-cli dlq replay --all --site <site_id>\n")
@@ -410,7 +519,7 @@ func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput
 					skipped++
 					continue
 				}
-				result, statusCode, err := replayDLQRecord(centralURL, rec.IdempotencyKey)
+				result, statusCode, err := replayDLQRecord(centralURL, rec.IdempotencyKey, authSiteID, authAPIKey, caCert)
 				if err != nil {
 					fmt.Printf("%s: ERROR (%v)\n", rec.IdempotencyKey, err)
 					failed++
@@ -434,7 +543,7 @@ func handleDLQ(ctx context.Context, svc query.Service, args []string, jsonOutput
 		}
 		idKey := replayFlags.Args()[0]
 
-		result, statusCode, err := replayDLQRecord(centralURL, idKey)
+		result, statusCode, err := replayDLQRecord(centralURL, idKey, authSiteID, authAPIKey, caCert)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Replay request failed: %v\n", err)
 			os.Exit(1)
@@ -483,15 +592,33 @@ type dlqReplayResponse struct {
 // replayDLQRecord POSTs to Central Ingestion's DLQ replay endpoint (§2.3,
 // Slice 10) and returns the parsed response body alongside the raw HTTP
 // status code, since the caller needs to distinguish 200/404/409/422/503
-// rather than just success-or-not.
-func replayDLQRecord(centralURL, idempotencyKey string) (*dlqReplayResponse, int, error) {
+// rather than just success-or-not. Sends X-Site-ID/X-API-Key (§2.1, §2.2,
+// Slice 15) -- HandleDLQReplay's auth middleware requires both, and checks
+// the authenticated site matches the DLQ record's own site_id, rejecting
+// with 403 otherwise; without these headers every request here previously
+// got a bare 401 with an empty body. Also trusts this project's own CA via
+// --ca-cert: every real deployment (per README) runs Central Ingestion over
+// HTTPS with a cert issued by scripts/generate_certs.sh's project CA, not a
+// publicly trusted one, so a plain http.Client{} here would fail every
+// single HTTPS replay with "certificate signed by unknown authority" --
+// this was a second, previously-undiscovered gap in this same function.
+func replayDLQRecord(centralURL, idempotencyKey, siteID, apiKey, caCert string) (*dlqReplayResponse, int, error) {
 	url := strings.TrimRight(centralURL, "/") + "/api/v1/dlq/" + idempotencyKey + "/replay"
 	req, err := http.NewRequest(http.MethodPost, url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
+	req.Header.Set("X-Site-ID", siteID)
+	req.Header.Set("X-API-Key", apiKey)
 
 	client := &http.Client{Timeout: 10 * time.Second}
+	if caCert != "" {
+		tlsCfg, err := (tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}).StdTLSConfig()
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to load --ca-cert: %w", err)
+		}
+		client.Transport = &http.Transport{TLSClientConfig: tlsCfg}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, fmt.Errorf("could not reach Central Ingestion at %s: %w (hint: pass --central-url, default http://localhost:8091)", centralURL, err)
@@ -623,6 +750,53 @@ func handleSite(ctx context.Context, args []string, hosts string, port int, keys
 		fmt.Fprintf(os.Stderr, "Unknown site subcommand: %s\n", subcommand)
 		os.Exit(1)
 	}
+}
+
+// handleAudit implements the "audit" command family (§2.4, Slice 20):
+// reading back the access-audit trail that query/dlq-inspection commands
+// and Central Ingestion's DLQ replay path both write to. Unlike every other
+// command family, the global --operator flag here names the trail being
+// *inspected*, not the identity doing the inspecting -- a compliance
+// officer reviewing what operator X accessed is exactly the audit trail's
+// reason to exist. main() already validated --operator is non-empty before
+// dispatching here (see the command == "audit" check), since silently
+// defaulting "whose trail" the way query/dlq default their own self-identity
+// would just show an arbitrary, almost-certainly-empty trail.
+func handleAudit(ctx context.Context, auditStore audit.Store, operator string, args []string, jsonOutput bool) {
+	if len(args) == 0 || args[0] != "list" {
+		fmt.Fprintf(os.Stderr, "Usage: pharos-cli audit list --operator <name> [--limit <n>]\n")
+		os.Exit(1)
+	}
+
+	auditFlags := flag.NewFlagSet("audit list", flag.ExitOnError)
+	limit := auditFlags.Int("limit", 50, "Max entries to return")
+	auditFlags.Parse(args[1:])
+
+	entries, err := auditStore.ListByOperator(ctx, operator, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Audit query failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if jsonOutput {
+		out, _ := json.MarshalIndent(entries, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
+
+	fmt.Printf("\n=== Access Audit Trail for Operator: %s ===\n", operator)
+	if len(entries) == 0 {
+		fmt.Println("No access-audit entries found.")
+		return
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "OCCURRED_AT\tACTION\tRESOURCE\tOUTCOME")
+	fmt.Fprintln(w, "----------------------------------------------------------------------")
+	for _, e := range entries {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", e.OccurredAt.Format(time.RFC3339), e.Action, e.Resource, e.Outcome)
+	}
+	w.Flush()
+	fmt.Printf("\nTotal: %d\n\n", len(entries))
 }
 
 func printCanonicalRecordsTable(title string, records []*consumer.CanonicalRecord) {

@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/ingestion"
@@ -66,11 +67,13 @@ func main() {
 	var outboxStore dedup.OutboxStore
 	var producer kafka.Producer
 	var keyStore auth.KeyStore
+	var auditStore audit.Store
 
 	if *useMemoryStore {
 		log.Println("[pharos-ingestion] Running with MemoryOutboxStore and MockProducer (standalone mode)")
 		outboxStore = dedup.NewMemoryOutboxStore()
 		producer = kafka.NewMockProducer()
+		auditStore = audit.NewMemoryStore()
 	} else {
 		hosts := strings.Split(*cassandraHosts, ",")
 		cCfg := dedup.DefaultCassandraConfig()
@@ -112,6 +115,31 @@ func main() {
 			log.Println("[pharos-ingestion] WARNING: --enable-auth=false -- any caller can submit events or replay DLQ records as any site.")
 		}
 
+		// DLQ replay access-audit trail (§2.4, Slice 20: "who replayed what,"
+		// same trail pharos-cli's query/dlq-inspection commands write to).
+		// Falls back to a process-local MemoryStore on connection failure
+		// rather than failing closed like the API key store above: this is a
+		// compliance record for an already-guarded action (the actual
+		// security check is the auth middleware's site-ownership match),
+		// not the security control itself, so refusing to serve any
+		// ingestion traffic over an unreachable audit backend would be a
+		// disproportionate outage for what it protects.
+		auditCfg := audit.DefaultCassandraConfig()
+		auditCfg.Hosts = hosts
+		auditCfg.Port = *cassandraPort
+		auditCfg.Keyspace = *cassandraKeyspace
+		if *caCert != "" {
+			auditCfg.TLS = &tlsutil.ClientConfig{CACertPath: *caCert, ServerName: "localhost"}
+		}
+		aStore, err := audit.NewCassandraStore(auditCfg)
+		if err != nil {
+			log.Printf("[pharos-ingestion] WARNING: access-audit store connection failed: %v. Falling back to a process-local MemoryStore (DLQ replay audit entries will not survive a restart).", err)
+			auditStore = audit.NewMemoryStore()
+		} else {
+			auditStore = aStore
+			log.Println("[pharos-ingestion] DLQ replay access-audit trail connected (§2.4, Slice 20).")
+		}
+
 		brokers := strings.Split(*kafkaBrokers, ",")
 		var kafkaTLS *tlsutil.ClientConfig
 		if *caCert != "" {
@@ -138,6 +166,9 @@ func main() {
 	handler := ingestion.NewHandlerWithOutbox(limiter, outboxStore, producer, *leaseTimeout)
 	if keyStore != nil {
 		handler.SetKeyStore(keyStore)
+	}
+	if auditStore != nil {
+		handler.SetAuditStore(auditStore)
 	}
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
@@ -191,6 +222,9 @@ func main() {
 	}
 	if keyStore != nil {
 		_ = keyStore.Close()
+	}
+	if auditStore != nil {
+		_ = auditStore.Close()
 	}
 
 	accepted, rejected, throttled, dedupHits, dlqCount := handler.ExtendedStats()

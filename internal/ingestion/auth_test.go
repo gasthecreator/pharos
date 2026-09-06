@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gasthecreator/pharos/internal/audit"
 	"github.com/gasthecreator/pharos/internal/auth"
 	"github.com/gasthecreator/pharos/internal/dedup"
 	"github.com/gasthecreator/pharos/internal/kafka"
@@ -28,6 +30,23 @@ func newAuthedMux(t *testing.T, keyStore auth.KeyStore) (*http.ServeMux, dedup.O
 	producer := kafka.NewMockProducer()
 	h := NewHandlerWithOutbox(limiter, outbox, producer, dedup.DefaultLeaseTimeout)
 	h.SetKeyStore(keyStore)
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	return mux, outbox
+}
+
+// newAuthedMuxWithAudit is newAuthedMux plus a real audit.Store wired via
+// SetAuditStore, for tests proving §2.4/Slice 20's "who replayed what"
+// actually gets recorded through the genuine RequireAPIKey middleware path
+// (not by directly poking the unexported context key).
+func newAuthedMuxWithAudit(t *testing.T, keyStore auth.KeyStore, auditStore audit.Store) (*http.ServeMux, dedup.OutboxStore) {
+	t.Helper()
+	limiter := ratelimit.NewTokenBucketLimiter(1000, 1000)
+	outbox := dedup.NewMemoryOutboxStore()
+	producer := kafka.NewMockProducer()
+	h := NewHandlerWithOutbox(limiter, outbox, producer, dedup.DefaultLeaseTimeout)
+	h.SetKeyStore(keyStore)
+	h.SetAuditStore(auditStore)
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
 	return mux, outbox
@@ -148,5 +167,117 @@ func TestHandleDLQReplay_OnlyOwningSiteMayReplay(t *testing.T) {
 
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 when SITE-A tries to replay SITE-B's DLQ record, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestHandleDLQReplay_RecordsAccessAuditOnSuccess proves §2.4/Slice 20's
+// "who replayed what" actually lands in the access-audit trail, keyed by the
+// real authenticated site identity (not a self-declared one) -- through the
+// genuine RequireAPIKey middleware, not a direct HandleDLQReplay call, so
+// auth.SiteIDFromContext resolves for real.
+func TestHandleDLQReplay_RecordsAccessAuditOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	keyStore := auth.NewMemoryKeyStore()
+	plaintextA, err := keyStore.CreateKey(ctx, "SITE-A")
+	if err != nil {
+		t.Fatalf("CreateKey failed: %v", err)
+	}
+	auditStore := audit.NewMemoryStore()
+	mux, outbox := newAuthedMuxWithAudit(t, keyStore, auditStore)
+
+	dlqKey := "SITE-A:1"
+	claim, err := outbox.InsertDLQClaim(ctx, dedup.DLQRecord{
+		IdempotencyKey:  dlqKey,
+		SiteID:          "SITE-A",
+		Payload:         createValidTestEventJSON("SITE-A", 1, ""),
+		RejectionReason: "seeded for audit test",
+	}, dedup.DefaultLeaseTimeout)
+	if err != nil || !claim.Acquired {
+		t.Fatalf("failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
+	}
+	if err := outbox.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 0); err != nil {
+		t.Fatalf("failed to mark seeded DLQ record published: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/dlq/"+dlqKey+"/replay", nil)
+	req.Header.Set("X-Site-ID", "SITE-A")
+	req.Header.Set("X-API-Key", plaintextA)
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a valid self-replay, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	entries, err := auditStore.ListByOperator(ctx, "SITE-A", 10)
+	if err != nil {
+		t.Fatalf("ListByOperator failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 access-audit entry for SITE-A, got %d", len(entries))
+	}
+	if entries[0].Action != "DLQ_REPLAY" {
+		t.Errorf("expected Action DLQ_REPLAY, got %s", entries[0].Action)
+	}
+	if entries[0].Resource != dlqKey {
+		t.Errorf("expected Resource %s, got %s", dlqKey, entries[0].Resource)
+	}
+	if entries[0].Outcome != "SUCCESS" {
+		t.Errorf("expected Outcome SUCCESS, got %s", entries[0].Outcome)
+	}
+}
+
+// TestHandleDLQReplay_RecordsAccessAuditOnForbidden proves a rejected replay
+// attempt (a site trying to replay another site's record) is still recorded
+// in the audit trail -- "who *tried* to replay what" matters for compliance
+// just as much as successful replays do, arguably more so.
+func TestHandleDLQReplay_RecordsAccessAuditOnForbidden(t *testing.T) {
+	ctx := context.Background()
+	keyStore := auth.NewMemoryKeyStore()
+	plaintextA, err := keyStore.CreateKey(ctx, "SITE-A")
+	if err != nil {
+		t.Fatalf("CreateKey failed: %v", err)
+	}
+	auditStore := audit.NewMemoryStore()
+	mux, outbox := newAuthedMuxWithAudit(t, keyStore, auditStore)
+
+	dlqKey := "SITE-B:99"
+	claim, err := outbox.InsertDLQClaim(ctx, dedup.DLQRecord{
+		IdempotencyKey:  dlqKey,
+		SiteID:          "SITE-B",
+		Payload:         []byte(`{"malformed":true}`),
+		RejectionReason: "seeded for audit test",
+	}, dedup.DefaultLeaseTimeout)
+	if err != nil || !claim.Acquired {
+		t.Fatalf("failed to seed DLQ claim: %v (acquired=%v)", err, claim.Acquired)
+	}
+	if err := outbox.MarkDLQPublished(ctx, dlqKey, "pharos.events.dlq", 0, 0); err != nil {
+		t.Fatalf("failed to mark seeded DLQ record published: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/dlq/"+dlqKey+"/replay", nil)
+	req.Header.Set("X-Site-ID", "SITE-A")
+	req.Header.Set("X-API-Key", plaintextA)
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+
+	entries, err := auditStore.ListByOperator(ctx, "SITE-A", 10)
+	if err != nil {
+		t.Fatalf("ListByOperator failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 access-audit entry for SITE-A (the attempted, forbidden replay), got %d", len(entries))
+	}
+	if entries[0].Action != "DLQ_REPLAY" {
+		t.Errorf("expected Action DLQ_REPLAY, got %s", entries[0].Action)
+	}
+	if !strings.Contains(entries[0].Outcome, "forbidden") {
+		t.Errorf("expected Outcome to mention forbidden, got %q", entries[0].Outcome)
 	}
 }
