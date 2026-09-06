@@ -181,6 +181,15 @@ services:
     container_name: pharos-cassandra-4
     cap_add:
       - NET_ADMIN
+    ports:
+      # 9043, not 9042 (already taken by cassandra-1) -- published so a
+      # host-side Go client can connect directly to dc-eu as its initial
+      # contact point (§2.4, PLAN.md Slice 18: Backup & disaster
+      # recovery's cross-region failover test needs to actually coordinate
+      # through dc-eu, not just have cassandra-1/dc-us discover it as a
+      # peer -- Docker Desktop for Mac's networking doesn't let the host
+      # reach a container's internal bridge IP without a published port).
+      - "9043:9042"
     environment:
       CASSANDRA_CLUSTER_NAME: "PharosCluster"
       CASSANDRA_DC: "dc-eu"

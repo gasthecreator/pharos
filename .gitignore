@@ -53,3 +53,7 @@ data/
 # Slice 17 K8s-targeted TLS materials (generated fresh per deploy by
 # deploy/k8s/generate_k8s_certs.sh; private keys, same reasoning as /certs/)
 /deploy/k8s/certs/
+
+# Slice 18 Cassandra backup output (local, per-deployment, not project
+# content -- same reasoning as /archive/ above)
+/backup/

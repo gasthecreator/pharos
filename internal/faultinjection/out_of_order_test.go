@@ -125,14 +125,21 @@ func TestOutOfOrderDelivery_QueryLayerOrdersCorrectlyRegardlessOfArrival(t *test
 	engine := consumer.NewEngine(reader, canonicalStore, tracker, engineCfg)
 
 	// Drain until every expected key has been seen, bounded by a wall-clock
-	// timeout so an unexpectedly large backlog fails loudly instead of hanging.
+	// timeout so an unexpectedly large backlog fails loudly instead of
+	// hanging. 60s/5s, not 30s/3s (§2.4, PLAN.md Slice 18: Backup &
+	// disaster recovery) -- bumped after this test started failing
+	// intermittently specifically when run as part of the full suite
+	// (never alone) once two new long-running fault-injection tests
+	// extended the suite's total duration; confirmed via docker stats as
+	// genuine host CPU saturation (~750% across containers), not a
+	// correctness regression.
 	seen := make(map[string]bool, len(expectedKeys))
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(60 * time.Second)
 	for len(seen) < len(expectedKeys) {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out draining Kafka before seeing all expected keys; saw %d of %d", len(seen), len(expectedKeys))
 		}
-		stepCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		stepCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		err := engine.Step(stepCtx)
 		cancel()
 		if err != nil {

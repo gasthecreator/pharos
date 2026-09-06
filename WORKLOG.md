@@ -40,6 +40,103 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-05] Claude Code: Slice 18 — Backup & disaster recovery
+
+**Author:** Claude Code
+
+**What:** `scripts/backup_cassandra.sh` (`nodetool snapshot` on every node,
+copied out via `docker cp`, then `nodetool clearsnapshot`) and
+`scripts/restore_cassandra.sh` (restores a backup's SSTables into each
+node's current live table directory, looked up via `system_schema.tables`,
+then `nodetool refresh`). New
+`internal/faultinjection/cross_region_failover_test.go` proving `dc-eu` is
+a genuine failover target, not just a replication sink. A new published
+port for `cassandra-4` (`9043:9042` in `docker-compose.yml`) so a host-side
+client can reach `dc-eu` directly. A new opt-in `RestrictToLocalDC` field
+on `consumer.CassandraStoreConfig`.
+
+**Why:** Per PLAN.md's Slice 18 — a real, tested restore drill (not a
+documented-but-never-run procedure), a stated RPO/RTO backed by actual
+measurements, and a tested cross-region failover now that Slice 14's 2-DC
+topology exists.
+
+**How:** Every real bug here was found by actually running the drill
+against live infrastructure with the user's explicit approval for the one
+genuinely destructive step (`DROP TABLE`), not by writing scripts and
+assuming they'd work.
+
+Backup/restore drill: 3 real events flowed through the actual
+edge→ingestion→Kafka→consumer pipeline, backed up, `canonical_events` was
+dropped, recreated via migration, restored, and the original rows
+confirmed back via direct query. Two real bugs found: (1) the backup
+script stored each table's full `table-uuid` directory name, so restore's
+`<table>-*` glob could never match after a drop+recreate regenerates a new
+UUID — fixed by stripping the UUID at backup time. (2) `DROP TABLE`
+doesn't delete the old on-disk directory immediately (Cassandra leaves it
+orphaned pending background cleanup), so a dropped-and-recreated table has
+*two* `<table>-<uuid>` directories on disk and a first-match glob has no
+way to know which is current — restore silently wrote into the stale one.
+Fixed by querying `system_schema.tables` for the table's actual current
+id instead of touching the filesystem to find it.
+
+Measured, not guessed: backup takes ~60s across 4 nodes/11 tables, a full
+restore ~125s, and the complete timed drill (drop → recreate → restore →
+verify) finished in well under 3 minutes. RPO for tables with no
+alternate reconstruction path (`event_outbox`, `dead_letter_events`,
+`site_api_keys`, etc.) is bounded by however often the backup script runs
+— every 15-30 minutes is a reasonable default. `canonical_events`,
+`events_by_study`, and `events_by_site` have a much better effective RPO
+bounded by Kafka's own 7-day retention, since the consumer can always
+replay to rebuild them independent of snapshot frequency — a real
+property of this project's event-sourced design, recognized here rather
+than needing new work.
+
+Cross-region failover test: connects a store with `LocalDC: "dc-eu"`
+directly to `cassandra-4`'s own CQL port (newly published as 9043, since
+nothing needed to reach dc-eu directly before this), applies the same real
+`tc`-induced partition Slice 14's own test uses, and proves LOCAL_QUORUM
+reads/writes succeed against dc-eu alone while dc-us is completely
+unreachable — confirmed via dc-eu's *own* gossip view, the direction the
+existing test doesn't check. Found only by running this as part of the
+full suite (passed cleanly alone): the test hung for the full 10-minute Go
+test timeout inside `store.Close()`. Root cause: even with
+`DisableInitialHostLookup` already set, gocql still applies its
+`HostFilter` to hosts learned via topology events, so a `LocalDC`-scoped
+session still tries to background-reconnect to the other region's nodes
+at their container-internal addresses — unreachable from the host, and,
+during a genuine regional outage, unreachable in reality too, so this
+isn't just a local networking quirk; a real production failover would hit
+the identical hang. Fixed with a new opt-in `RestrictToLocalDC` field on
+`CassandraStoreConfig` (default false, no behavior change for existing
+callers). First attempt used `gocql.DataCentreHostFilter`, which rejects
+even the explicitly-given initial contact host (its DC isn't known yet
+when the filter first runs) — switched to `gocql.WhiteListHostFilter`
+(matches by address, sidestepping that ordering problem).
+
+**Files/modules touched:** new `scripts/backup_cassandra.sh`,
+`scripts/restore_cassandra.sh`; new
+`internal/faultinjection/cross_region_failover_test.go`;
+`internal/consumer/canonical_store.go` (`RestrictToLocalDC` field);
+`docker-compose.yml` (`cassandra-4` port 9043); `.gitignore` (`/backup/`);
+`internal/consumer/consumer_integration_test.go`,
+`internal/faultinjection/out_of_order_test.go` (bumped pre-existing
+timeouts after they started failing intermittently specifically once this
+slice's longer-running tests extended total suite duration under real
+host CPU contention — confirmed via `docker stats`, not assumed); `PLAN.md`
+(Slice 18 marked done).
+
+**Tests added/updated:** new
+`TestCrossRegionFailover_DcEuServesLocalQuorumWhenDcUsUnreachable`.
+
+**Follow-ups / left open:** none deliberately deferred for this slice's
+stated scope. Also worth recording: Docker Desktop's VM degraded twice
+more during this slice's verification (docker system df taking 50s+,
+containers stuck "health: starting" for minutes) — the same recurring
+pattern from Slice 14/15's own addenda after many hours of heavy
+compose/kind cycling across this whole session, fixed both times with a
+full Docker Desktop restart (done with the user's explicit go-ahead each
+time).
+
 ## [2026-09-05] Claude Code: Slice 17 — Deployment automation
 
 **Author:** Claude Code

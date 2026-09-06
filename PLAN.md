@@ -780,6 +780,103 @@ verified against real infrastructure the same way every earlier slice was.
   been run), a stated RPO/RTO, and — now that Slice 14 exists — a tested
   cross-region failover, not just a single-region restore.
 
+  **Done 2026-09-05.** `scripts/backup_cassandra.sh` (`nodetool snapshot`
+  on every node, copied out via `docker cp` into a timestamped host
+  directory, then `nodetool clearsnapshot` so live nodes don't accumulate
+  pinned SSTables) and `scripts/restore_cassandra.sh` (copies a backup's
+  SSTables into each node's *current* live table directory, looked up via
+  `system_schema.tables` -- not a filesystem glob, see below -- then
+  `nodetool refresh`, no restart needed).
+
+  Deliberately scoped to "the keyspace's data was lost or corrupted, node
+  identity/tokens intact" (an accidental `DROP KEYSPACE`, a bad migration,
+  on-disk corruption limited to this keyspace) -- restoring a *fully
+  destroyed node* from snapshot alone is a different problem this doesn't
+  solve: Cassandra 5.0's default vnodes assign random tokens to a genuinely
+  fresh node, so it generally won't own the same ranges the original did,
+  and blindly copying old SSTables in would misplace data. That case is
+  what RF>1 and this project's multi-node topology (Slice 7/14) already
+  solve via streaming from surviving replicas, not something a backup
+  restores you from.
+
+  **A real, live drill, not a documented-but-never-run procedure**: with
+  the user's explicit approval for the destructive step, real pipeline
+  data (3 events through the actual edge→ingestion→Kafka→consumer
+  pipeline) was backed up, `canonical_events` was genuinely `DROP`ped,
+  recreated via migration, and restored -- verified by querying the
+  actual rows back, not by trusting script output. Two real bugs found
+  along the way: (1) the backup script stored each table's *full*
+  `table-uuid` directory name rather than the plain table name, so
+  restore's `<table>-*` glob could never match after a drop+recreate
+  regenerates a new UUID -- fixed by stripping the UUID suffix at backup
+  time. (2) `DROP TABLE` doesn't delete the old on-disk directory
+  immediately (Cassandra leaves it as an orphan pending background
+  cleanup), so after a drop+recreate there are *two* `<table>-<uuid>`
+  directories on disk and a "first match" glob has no way to know which
+  is current -- restore silently wrote into the stale, orphaned one.
+  Fixed by querying `system_schema.tables` for the table's actual current
+  `id` instead of globbing the filesystem at all.
+
+  **Measured, not guessed, RTO/RPO**: backup takes ~60s across all 4
+  nodes/11 tables; a full keyspace-wide restore takes ~125s. A real,
+  timed drill (`DROP TABLE` → recreate → restore → verify) completed in
+  well under 3 minutes end to end. RPO for `event_outbox`,
+  `dead_letter_events`, `site_api_keys`, `known_sites`, `known_studies`,
+  `consumer_watermark_checkpoints`, and `pending_outbox` is bounded by
+  however often `backup_cassandra.sh` runs (a periodic schedule --
+  every 15-30 minutes is a reasonable operational default -- is the
+  actual RPO commitment for these tables, since they have no other
+  reconstruction path). `canonical_events`, `events_by_study`, and
+  `events_by_site`, by contrast, have a much better *effective* RPO
+  bounded by Kafka's own 7-day topic retention: since the downstream
+  consumer can always replay from Kafka to fully rebuild these
+  derived/query-layer tables, their real recovery point is however far
+  back Kafka itself still has the data, independent of snapshot
+  frequency -- a genuine architectural property of this project's
+  event-sourced design, not something that needed building for this
+  slice, just recognized and stated.
+
+  **A tested cross-region failover, not just a single-region restore**:
+  new `internal/faultinjection/cross_region_failover_test.go` proves the
+  property Slice 14's own `regional_partition_test.go` doesn't -- that
+  `dc-eu` is a genuine failover target, not just a passive replication
+  sink. A store configured with `LocalDC: "dc-eu"` (exactly what an
+  operator would reconfigure Central Ingestion/consumer to during a real
+  `dc-us` outage), connected directly through `cassandra-4`'s own CQL
+  port (newly published as `9043:9042` in `docker-compose.yml` -- it
+  wasn't exposed to the host before, since nothing needed to reach `dc-eu`
+  directly until this test), genuinely coordinates `LOCAL_QUORUM` reads
+  and writes against `dc-eu` alone while a real `tc`-induced partition
+  makes `dc-us` completely unreachable -- confirmed via `dc-eu`'s *own*
+  gossip view (not `dc-us`'s, which is all the existing test checks).
+
+  A real, subtle bug found only by running this against the full test
+  suite (not in isolation, where it passed cleanly): the test hung for
+  the full 10-minute Go test timeout on `store.Close()`. Root cause:
+  even with `DisableInitialHostLookup` already set, gocql still applies
+  its per-connection `HostFilter` to hosts discovered via topology
+  events -- meaning a `LocalDC`-scoped session still learns about (and
+  keeps trying to background-reconnect to) the *other* region's nodes at
+  their container-internal addresses, which the host can never reach
+  (Docker Desktop for Mac doesn't route host→container-IP without a
+  published port) -- and during a real regional outage, those addresses
+  are genuinely dead too, so this isn't just a host-networking quirk: an
+  actual production failover would hit the identical hang. Fixed with a
+  new opt-in `RestrictToLocalDC` field on `CassandraStoreConfig`
+  (default `false`, no behavior change for any existing caller) that
+  scopes gocql's host awareness to `LocalDC` only. First attempt used
+  `gocql.DataCentreHostFilter`, which rejects even the explicitly-given
+  initial contact host (its DC isn't known yet at the point the filter
+  first runs, before any connection exists) -- switched to
+  `gocql.WhiteListHostFilter` (matches by address, sidestepping the
+  DC-population ordering problem entirely).
+
+  Verified for real: the full suite (`go test -race -count=1 -p 1 ./...`)
+  passed cleanly twice in a row against the live 4-node/2-DC Cassandra +
+  4-broker/2-cluster Kafka + MirrorMaker2 topology, including both the
+  existing regional-partition test and the new cross-region-failover
+  test.
+
 - **Slice 19 — Multi-instance scaling** *(was Slice 12)*. Run 2+
   `pharos-ingestion` instances behind a load balancer (this is what the
   rate limiter's already-pluggable interface from §2.3 exists for — swap in
