@@ -124,17 +124,25 @@ func TestCassandraCanonicalStore_RealIntegration(t *testing.T) {
 }
 
 func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {
-	// 30s, not 15s (§2.4, PLAN.md Slice 18: Backup & disaster recovery) --
-	// this ctx's own deadline is also the budget stepCtx below carves its
-	// own window out of, so real setup time (Cassandra connect, Kafka
-	// publish) already spends part of a tight budget before Step() ever
-	// runs. Bumped after this test started failing intermittently
-	// specifically when run as part of the full suite (never alone) once
-	// two new long-running fault-injection tests extended the suite's
-	// total duration -- confirmed via docker stats as genuine host CPU
-	// saturation (~750% across containers on a machine with far fewer
-	// cores), not a correctness regression.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 60s, not 30s (§2.4, audit remediation: Cassandra internode +
+	// Kafka inter-broker TLS) -- this ctx's own deadline is also the budget
+	// stepCtx below carves its own window out of, so real setup time
+	// (Cassandra connect, Kafka publish) already spends part of a tight
+	// budget before Step() ever runs. Previously bumped from 15s to 30s
+	// after this test started failing intermittently specifically when run
+	// as part of the full suite (never alone) once two new long-running
+	// fault-injection tests extended the suite's total duration -- confirmed
+	// via docker stats as genuine host CPU saturation (~750% across
+	// containers on a machine with far fewer cores), not a correctness
+	// regression. Bumped again here after enabling internode/inter-broker
+	// TLS reproduced the identical failure shape even running this test
+	// alone (each internode hop and inter-broker replication ack now pays a
+	// real, measured TLS/crypto cost) -- confirmed the operations themselves
+	// were still correct, not hanging, by rerunning with a 180s/170s budget
+	// and observing a clean pass in ~15s; this is the same class of "real
+	// infrastructure cost eating into a tight test budget" as the original
+	// bump, not a new problem.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	// 1. Connect to Cassandra
@@ -210,7 +218,7 @@ func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {
 	engine := NewEngine(reader, store, tracker, engineCfg)
 
 	// 5. Consume until our published message is processed
-	stepCtx, stepCancel := context.WithTimeout(ctx, 20*time.Second)
+	stepCtx, stepCancel := context.WithTimeout(ctx, 50*time.Second)
 	defer stepCancel()
 
 	var rec *CanonicalRecord

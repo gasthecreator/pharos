@@ -18,8 +18,8 @@ func TestWatermarkTracker_MonotonicityOnPartitionReawakening(t *testing.T) {
 	t0 := baseTime
 
 	// 1. Both partitions active initially at T=10m
-	_, w1 := tracker.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), t0)
-	_, w2 := tracker.ProcessEvent(1, "SITE-02:1", baseTime.Add(10*time.Minute), t0)
+	_, w1, _ := tracker.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), t0)
+	_, w2, _ := tracker.ProcessEvent(1, "SITE-02:1", baseTime.Add(10*time.Minute), t0)
 
 	expectedInitial := baseTime.Add(10 * time.Minute).Add(-latenessTolerance)
 	if !w2.Equal(expectedInitial) {
@@ -30,7 +30,7 @@ func TestWatermarkTracker_MonotonicityOnPartitionReawakening(t *testing.T) {
 	t1 := t0.Add(40 * time.Second)
 
 	// Partition 0 advances significantly: event time is baseTime + 100m
-	_, w3 := tracker.ProcessEvent(0, "SITE-01:2", baseTime.Add(100*time.Minute), t1)
+	_, w3, _ := tracker.ProcessEvent(0, "SITE-01:2", baseTime.Add(100*time.Minute), t1)
 
 	// Partition 1 is idle (>30s since t0), so candidate is based on Partition 0 only: 100m - 10m = 90m
 	expectedAdvanced := baseTime.Add(100 * time.Minute).Add(-latenessTolerance)
@@ -40,7 +40,7 @@ func TestWatermarkTracker_MonotonicityOnPartitionReawakening(t *testing.T) {
 
 	// 3. Partition 1 reawakens at t2 = t1 + 10s with backlog from baseTime + 20m (< 90m)
 	t2 := t1.Add(10 * time.Second)
-	isLate, w4 := tracker.ProcessEvent(1, "SITE-02:2", baseTime.Add(20*time.Minute), t2)
+	isLate, w4, _ := tracker.ProcessEvent(1, "SITE-02:2", baseTime.Add(20*time.Minute), t2)
 
 	// CRITICAL ASSERTION: The watermark must NEVER regress below w3 (baseTime + 90m)
 	if w4.Before(w3) {
@@ -70,7 +70,7 @@ func TestWatermarkTracker_IdlePartitionExclusion(t *testing.T) {
 	now = now.Add(15 * time.Second)
 
 	// Partition 0 produces at baseTime + 30m
-	_, w := tracker.ProcessEvent(0, "P0:2", baseTime.Add(30*time.Minute), now)
+	_, w, _ := tracker.ProcessEvent(0, "P0:2", baseTime.Add(30*time.Minute), now)
 
 	expected := baseTime.Add(30 * time.Minute).Add(-5 * time.Minute) // 25m
 	if !w.Equal(expected) {
@@ -108,7 +108,7 @@ func TestWatermarkTracker_CompleteToRevisedLifecycle(t *testing.T) {
 
 	// 2. Late event arrives with event_time 12:45 (< 13:00)
 	now = now.Add(5 * time.Minute)
-	isLate, _ := tracker.ProcessEvent(0, "LATE-1", baseTime.Add(45*time.Minute), now)
+	isLate, _, _ := tracker.ProcessEvent(0, "LATE-1", baseTime.Add(45*time.Minute), now)
 	if !isLate {
 		t.Errorf("expected isLate=true for 12:45 event arriving after watermark passed 13:00")
 	}
@@ -146,7 +146,7 @@ func TestWatermarkTracker_RestoreFromCheckpointPreventsRegression(t *testing.T) 
 	// 1. "Before the crash": a tracker processes events and advances well past
 	// baseTime.
 	before := NewWatermarkTracker(latenessTolerance, idleTimeout)
-	_, preCrashWatermark := before.ProcessEvent(0, "SITE-01:1", baseTime.Add(60*time.Minute), baseTime)
+	_, preCrashWatermark, _ := before.ProcessEvent(0, "SITE-01:1", baseTime.Add(60*time.Minute), baseTime)
 	if preCrashWatermark.IsZero() {
 		t.Fatalf("expected a non-zero watermark before the simulated crash")
 	}
@@ -173,7 +173,7 @@ func TestWatermarkTracker_RestoreFromCheckpointPreventsRegression(t *testing.T) 
 	// high point -- entirely plausible, since Kafka resumes from the last
 	// committed offset, not from "wherever the in-memory watermark had
 	// gotten to." The monotonic guard must hold even here.
-	isLate, w := after.ProcessEvent(0, "SITE-01:2", baseTime.Add(30*time.Minute), baseTime.Add(61*time.Minute))
+	isLate, w, _ := after.ProcessEvent(0, "SITE-01:2", baseTime.Add(30*time.Minute), baseTime.Add(61*time.Minute))
 	if w.Before(preCrashWatermark) {
 		t.Fatalf("CRITICAL REGRESSION: watermark dropped to %v after replaying an earlier-event-time message, below pre-crash floor %v", w, preCrashWatermark)
 	}
@@ -199,7 +199,7 @@ func TestWatermarkTracker_RestoreOfEmptyCheckpointIsNoOp(t *testing.T) {
 		t.Fatalf("expected zero watermark after restoring an empty checkpoint, got %v", wm)
 	}
 
-	_, w := restored.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), baseTime)
+	_, w, _ := restored.ProcessEvent(0, "SITE-01:1", baseTime.Add(10*time.Minute), baseTime)
 	expected := baseTime.Add(10 * time.Minute).Add(-5 * time.Minute)
 	if !w.Equal(expected) {
 		t.Errorf("expected first event after empty restore to advance watermark to %v, got %v", expected, w)

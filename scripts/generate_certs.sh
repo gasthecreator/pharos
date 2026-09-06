@@ -133,7 +133,7 @@ chmod 600 ./*-key.pem
 echo "Building TLS-enabled cassandra.yaml from the stock image config..."
 docker run --rm --entrypoint sh cassandra:5.0 -c "cat /etc/cassandra/cassandra.yaml" > cassandra.yaml
 
-python3 - "cassandra.yaml" "/tls/cassandra-keystore.jks" "${STORE_PASS}" <<'PYEOF'
+python3 - "cassandra.yaml" "/tls/cassandra-keystore.jks" "${STORE_PASS}" "/tls/cassandra-truststore.jks" <<'PYEOF'
 import sys
 
 def patch(lines, block_header, keystore_path, keystore_pass, set_enabled=None, set_internode=None, truststore_path=None):
@@ -174,30 +174,23 @@ def patch(lines, block_header, keystore_path, keystore_pass, set_enabled=None, s
             lines[i] = f"{indent}truststore_password: {keystore_pass}\n"
     return lines
 
-path, keystore_path, keystore_pass = sys.argv[1], sys.argv[2], sys.argv[3]
+path, keystore_path, keystore_pass, truststore_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(path) as f:
     lines = f.readlines()
 
-# Client-to-server encryption only (client_encryption_options.enabled=true)
-# -- NOT internode_encryption. TLS was tried on both, and both genuinely
-# worked (verified: TLS connections succeeded, plaintext ones were
-# correctly refused, inter-node gossip across both simulated DCs worked
-# over TLS) -- but the *combined* memory overhead of TLS on Cassandra's
-# internode listener *and* Kafka's inter-broker listener, on top of
-# Slice 14's already-tight budget, produced repeated real OOM kills
-# (docker inspect: OOMKilled=true, hitting different nodes on different
-# runs) that heap bumps alone couldn't close -- Kafka brokers alone nearly
-# doubled their RSS under TLS (~300MB -> ~550-650MB each). This is the same
-# shape of hard, empirically-confirmed ceiling Slice 14 hit with node count;
-# here the fix is scope, not node count: client_encryption_options (the CQL
-# port genuinely reachable by "any process," the actual exposure this slice
-# exists to close) stays fully enabled and verified; internode_encryption
-# stays at its default `none`, since Cassandra's storage port is never
-# exposed to the host at all -- already fully contained within the private
-# Docker network, so TLS there is defense-in-depth on top of network
-# isolation that already exists, not the primary boundary. See Kafka's
-# mirrored decision in docker-compose.yml's Kafka section comment.
+# Client-to-server encryption (client_encryption_options.enabled=true).
 lines = patch(lines, "client_encryption_options:", keystore_path, keystore_pass, set_enabled="true")
+
+# Internode encryption (audit remediation, revisiting the "client-only"
+# narrowing this file previously documented here): internode_encryption=all,
+# reusing the exact same already-issued keystore/truststore -- the SANs
+# already cover every pharos-cassandra-N container name, no new certs
+# needed. require_client_auth stays false (mirrors client_encryption_options'
+# own choice not to require mTLS); the truststore is still required on this
+# block regardless, since the *outbound* side of an internode connection
+# validates the peer's presented certificate against it even without
+# demanding one back.
+lines = patch(lines, "server_encryption_options:", keystore_path, keystore_pass, set_internode="all", truststore_path=truststore_path)
 
 with open(path, "w") as f:
     f.writelines(lines)

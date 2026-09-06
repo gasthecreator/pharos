@@ -63,7 +63,7 @@ func TestWatermarkProperty_MonotonicAndAuditDedup(t *testing.T) {
 				// PLAN.md's Stage A calls out by name.
 				offsetSec := rapid.IntRange(-180, 30).Draw(t, "event_offset_seconds")
 				eventTime := simClock.Now().Add(time.Duration(offsetSec) * time.Second)
-				_, wm := tracker.ProcessEvent(partition, key, eventTime, simClock.Now())
+				_, wm, _ := tracker.ProcessEvent(partition, key, eventTime, simClock.Now())
 				checkNotRegressed(t, wm, "ProcessEvent")
 			},
 			"query_watermark": func(t *rapid.T) {

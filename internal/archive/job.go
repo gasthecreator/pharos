@@ -102,3 +102,40 @@ func RunDLQ(ctx context.Context, outboxStore *dedup.CassandraOutboxStore, cfg Co
 	}
 	return archived, failed, nil
 }
+
+// RunOutboxPrune deletes PUBLISHED event_outbox rows published before cutoff
+// (§2.2, audit remediation) -- unlike RunCanonical/RunDLQ, this never writes
+// to the cold-tier archive: event_outbox is operational bookkeeping, not
+// data-of-record (see internal/archive package doc and
+// migrations/006_event_outbox_pruning.cql for why outright deletion, rather
+// than export-then-delete, is the correct and safe fix here), so there is
+// nothing to export.
+//
+// dryRun deletes nothing -- it only reports what would be pruned, for
+// operators to check before actually running it.
+func RunOutboxPrune(ctx context.Context, outboxStore *dedup.CassandraOutboxStore, cutoff time.Time, dryRun bool) (int, int, error) {
+	sites, err := outboxStore.ListKnownSites(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to list known sites: %w", err)
+	}
+
+	var pruned, failed int
+	for _, siteID := range sites {
+		records, err := outboxStore.ListOutboxBySiteOlderThan(ctx, siteID, cutoff)
+		if err != nil {
+			return pruned, failed, fmt.Errorf("failed to scan site %s outbox for pruning: %w", siteID, err)
+		}
+		for _, rec := range records {
+			if dryRun {
+				pruned++
+				continue
+			}
+			if err := outboxStore.DeletePrunedOutboxRecord(ctx, rec); err != nil {
+				failed++
+				continue
+			}
+			pruned++
+		}
+	}
+	return pruned, failed, nil
+}

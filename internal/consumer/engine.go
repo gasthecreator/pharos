@@ -10,7 +10,7 @@ import (
 
 	"github.com/gasthecreator/pharos/internal/clock"
 	"github.com/gasthecreator/pharos/internal/kafka"
-	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/metrics/consumermetrics"
 	"github.com/gasthecreator/pharos/internal/model"
 	"github.com/gasthecreator/pharos/internal/tlsutil"
 	kafkaGo "github.com/segmentio/kafka-go"
@@ -154,7 +154,7 @@ func (e *Engine) Step(ctx context.Context) error {
 			return ctx.Err()
 		}
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
-		metrics.ConsumerErrorsTotal.Inc()
+		consumermetrics.ErrorsTotal.Inc()
 		return fmt.Errorf("failed to fetch message from kafka: %w", err)
 	}
 
@@ -162,7 +162,7 @@ func (e *Engine) Step(ctx context.Context) error {
 	var event model.AdverseEvent
 	if err := json.Unmarshal(msg.Value, &event); err != nil {
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
-		metrics.ConsumerErrorsTotal.Inc()
+		consumermetrics.ErrorsTotal.Inc()
 		return fmt.Errorf("failed to unmarshal message payload: %w", err)
 	}
 
@@ -203,10 +203,28 @@ func (e *Engine) Step(ctx context.Context) error {
 	now := e.clock.Now()
 
 	// 3. Process event through watermark tracker
-	isLate, _ := e.tracker.ProcessEvent(msg.Partition, keyStr, eventTime, now)
+	isLate, _, lateAudit := e.tracker.ProcessEvent(msg.Partition, keyStr, eventTime, now)
 	if isLate {
 		atomic.AddUint64(&e.stats.LateEventsCount, 1)
-		metrics.ConsumerLateArrivalsTotal.Inc()
+		consumermetrics.LateArrivalsTotal.Inc()
+	}
+
+	// 3b. Durably persist the 21 CFR Part 11 late-arrival audit entry, if
+	// this event touched one (§2.4, audit remediation) -- previously this
+	// lived only in the tracker's in-memory state, lost on every restart
+	// despite the compliance purpose its own name states. Persisted before
+	// the canonical write and fenced the same way SaveEvent already is:
+	// on failure, the offset is left uncommitted so Kafka redelivers and
+	// this retries -- safe because appendLateAuditIfNotExistsLocked always
+	// returns the same entry for the same (window, idempotency_key) pair, so
+	// persisting it again on redelivery is a harmless idempotent upsert, not
+	// a duplicate.
+	if lateAudit != nil {
+		if err := e.store.SaveLateArrivalAudit(ctx, e.cfg.GroupID, *lateAudit); err != nil {
+			atomic.AddUint64(&e.stats.ErrorCount, 1)
+			consumermetrics.ErrorsTotal.Inc()
+			return fmt.Errorf("failed to persist late arrival audit (offset uncommitted): %w", err)
+		}
 	}
 
 	// 4. Construct canonical record
@@ -233,23 +251,23 @@ func (e *Engine) Step(ctx context.Context) error {
 	saveStart := time.Now()
 	if err := e.store.SaveEvent(ctx, record); err != nil {
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
-		metrics.ConsumerErrorsTotal.Inc()
-		metrics.CassandraWriteDuration.WithLabelValues("error").Observe(time.Since(saveStart).Seconds())
+		consumermetrics.ErrorsTotal.Inc()
+		consumermetrics.CassandraWriteDuration.WithLabelValues("error").Observe(time.Since(saveStart).Seconds())
 		// DO NOT COMMIT: uncommitted offset ensures Kafka redelivers on retry (§2.4)
 		return fmt.Errorf("failed to save canonical event (offset uncommitted): %w", err)
 	}
-	metrics.CassandraWriteDuration.WithLabelValues("success").Observe(time.Since(saveStart).Seconds())
+	consumermetrics.CassandraWriteDuration.WithLabelValues("success").Observe(time.Since(saveStart).Seconds())
 
 	// 6. Explicit manual offset commit after successful Cassandra write
 	if err := e.reader.CommitMessages(ctx, msg); err != nil {
 		atomic.AddUint64(&e.stats.ErrorCount, 1)
-		metrics.ConsumerErrorsTotal.Inc()
+		consumermetrics.ErrorsTotal.Inc()
 		return fmt.Errorf("failed to commit kafka offset: %w", err)
 	}
 
 	atomic.AddUint64(&e.stats.ConsumedCount, 1)
 	atomic.AddUint64(&e.stats.CommittedCount, 1)
-	metrics.ConsumerEventsConsumedTotal.Inc()
+	consumermetrics.EventsConsumedTotal.Inc()
 	return nil
 }
 

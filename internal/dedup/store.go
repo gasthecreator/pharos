@@ -72,6 +72,17 @@ type DLQRecord struct {
 	ReplayedAt       time.Time    `json:"replayed_at,omitempty"` // Set only when Status == StatusReplayed (§2.3, Slice 10)
 }
 
+// OutboxPruneRecord identifies one event_outbox row eligible for pruning
+// (§2.2, audit remediation) -- just enough to delete it from both
+// event_outbox and event_outbox_by_site; unlike DLQRecord, no payload is
+// carried since pruned rows are deleted outright, never archived (see
+// migrations/006_event_outbox_pruning.cql's docs for why that's safe).
+type OutboxPruneRecord struct {
+	IdempotencyKey string
+	SiteID         string
+	PublishedAt    time.Time
+}
+
 // ClaimResult describes the outcome of an atomic outbox claim attempt.
 type ClaimResult struct {
 	Acquired       bool          `json:"acquired"`

@@ -175,7 +175,7 @@ log "Waiting for it to flow edge -> Central Ingestion -> Kafka -> consumer -> Ca
 # this run's own event -- a few seconds is not a safe assumption.
 FOUND=false
 for i in $(seq 1 90); do
-  if ./bin/pharos-cli query event "$IDKEY" --ca-cert certs/ca-cert.pem >/dev/null 2>&1; then
+  if ./bin/pharos-cli query event "$IDKEY" --ca-cert certs/ca-cert.pem --operator "$SITE_ID" >/dev/null 2>&1; then
     FOUND=true
     break
   fi
@@ -191,13 +191,13 @@ if [ "$FOUND" != true ]; then
 fi
 
 log "Querying it back by idempotency key"
-./bin/pharos-cli query event "$IDKEY" --ca-cert certs/ca-cert.pem
+./bin/pharos-cli query event "$IDKEY" --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
 
 log "Querying by site (answers: all events from site Z)"
-./bin/pharos-cli query site "$SITE_ID" --ca-cert certs/ca-cert.pem
+./bin/pharos-cli query site "$SITE_ID" --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
 
 log "Querying by study and date range (answers: all events for trial X in range Y)"
-./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem
+./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
 
 log "Submitting a malformed event (missing subject and event fields)"
 info "The edge buffers it durably anyway — it never validates, by design (PLAN.md §2.3)."
@@ -217,7 +217,7 @@ log "Waiting for Central Ingestion to reject it and route it to the dead-letter 
 # this should be fast -- but give it a real budget rather than assuming so.
 FOUND=false
 for i in $(seq 1 30); do
-  if ./bin/pharos-cli dlq list --site "$SITE_ID" --ca-cert certs/ca-cert.pem 2>/dev/null | grep -q "$IDKEY2"; then
+  if ./bin/pharos-cli dlq list --site "$SITE_ID" --ca-cert certs/ca-cert.pem --operator "$SITE_ID" 2>/dev/null | grep -q "$IDKEY2"; then
     FOUND=true
     break
   fi
@@ -230,7 +230,29 @@ if [ "$FOUND" != true ]; then
 fi
 
 log "Inspecting the dead-letter queue for this site"
-./bin/pharos-cli dlq list --site "$SITE_ID" --ca-cert certs/ca-cert.pem
+./bin/pharos-cli dlq list --site "$SITE_ID" --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
+
+log "Confirming the access-audit trail recorded this session's own CLI queries (§2.4, Slice 20)"
+info "Every query/dlq command above required --operator $SITE_ID -- this is that same trail, not seeded fixtures."
+./bin/pharos-cli audit list --operator "$SITE_ID" --ca-cert certs/ca-cert.pem
+
+DASHBOARD_PORT=$(find_free_port 8092)
+log "Starting pharos-dashboard on :$DASHBOARD_PORT (§2.4, Slices 21 & 23 -- web dashboard + chaos control panel)"
+info "--enable-chaos is deliberately left off here, matching its own off-by-default safety guard (Slice 23) -- this demo only proves the dashboard and its chaos panel route are alive, it doesn't mutate the live cluster."
+./bin/pharos-dashboard --port "$DASHBOARD_PORT" --ca-cert certs/ca-cert.pem \
+  --central-url "https://localhost:$INGESTION_PORT" \
+  > "$LOG_DIR/dashboard.log" 2>&1 &
+PIDS+=($!)
+wait_for_log "$LOG_DIR/dashboard.log" "Ready on http" 30
+
+info "Dashboard health check:"
+curl -sf "http://localhost:$DASHBOARD_PORT/healthz" && echo
+info "Dashboard query view for this run's own site (same query.Service pharos-cli uses):"
+curl -s "http://localhost:$DASHBOARD_PORT/query?type=site&value=$SITE_ID" | grep -o "$IDKEY" | head -1 \
+  && info "  -> found $IDKEY rendered on the dashboard's own query page." \
+  || info "  -> (didn't spot $IDKEY in the rendered page -- non-fatal, the CLI already proved this data is queryable above)"
+info "Chaos control panel route (present but inert without --enable-chaos):"
+curl -s -o /dev/null -w "  GET /chaos -> HTTP %{http_code}\n" "http://localhost:$DASHBOARD_PORT/chaos"
 
 log "Demo complete."
 info "Nothing was lost, nothing was duplicated, and the rejection is fully inspectable."

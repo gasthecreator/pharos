@@ -20,6 +20,14 @@ type CanonicalStore interface {
 	GetEventsBySite(ctx context.Context, siteID string, minSeq int64) ([]*CanonicalRecord, error)
 	SaveWatermarkCheckpoint(ctx context.Context, groupID string, cp WatermarkCheckpoint) error
 	LoadWatermarkCheckpoint(ctx context.Context, groupID string) (*WatermarkCheckpoint, error)
+	// SaveLateArrivalAudit durably records one LateArrivalAudit entry (§2.4,
+	// audit remediation) -- an idempotent upsert keyed by (groupID, WindowID,
+	// IdempotencyKey), safe to call again with the identical entry on a
+	// redelivered message (see Engine.Step's caller docs).
+	SaveLateArrivalAudit(ctx context.Context, groupID string, audit LateArrivalAudit) error
+	// ListLateArrivalAudits returns up to limit of groupID's most recently
+	// recorded late-arrival audit entries.
+	ListLateArrivalAudits(ctx context.Context, groupID string, limit int) ([]LateArrivalAudit, error)
 	EnsureSchema() error
 	Close() error
 }
@@ -289,6 +297,24 @@ func (s *CassandraCanonicalStore) EnsureSchema() error {
 			partition_high_watermark map<int, timestamp>,
 			partition_last_activity map<int, timestamp>,
 			PRIMARY KEY (group_id)
+		);`,
+		// consumer_late_arrival_audits (§2.4, audit remediation) durably
+		// records LateArrivalAudit entries -- previously in-memory only in
+		// WatermarkTracker, despite its stated 21 CFR Part 11 purpose.
+		// Partitioned by group_id (mirroring consumer_watermark_checkpoints)
+		// and clustered by (window_id, idempotency_key), the exact same
+		// composite key WatermarkTracker already uses in-memory for
+		// deduplication -- an INSERT here is a plain upsert on that key, so
+		// retried persistence after a redelivered message is idempotent.
+		`CREATE TABLE IF NOT EXISTS pharos.consumer_late_arrival_audits (
+			group_id text,
+			window_id text,
+			idempotency_key text,
+			partition int,
+			event_time timestamp,
+			arrived_at timestamp,
+			watermark_at_arrival timestamp,
+			PRIMARY KEY ((group_id), window_id, idempotency_key)
 		);`,
 	}
 
@@ -766,6 +792,63 @@ func (s *CassandraCanonicalStore) LoadWatermarkCheckpoint(ctx context.Context, g
 	return &cp, nil
 }
 
+// SaveLateArrivalAudit upserts one LateArrivalAudit entry (§2.4, audit
+// remediation) -- a plain INSERT keyed by (group_id, window_id,
+// idempotency_key), the same composite key WatermarkTracker's own in-memory
+// dedup already enforces, so writing the identical entry again (a
+// redelivered message retrying a previously failed persist) is a harmless
+// no-op overwrite, never a duplicate row.
+func (s *CassandraCanonicalStore) SaveLateArrivalAudit(ctx context.Context, groupID string, audit LateArrivalAudit) error {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	const query = `
+		INSERT INTO pharos.consumer_late_arrival_audits (
+			group_id, window_id, idempotency_key, partition,
+			event_time, arrived_at, watermark_at_arrival
+		) VALUES (?, ?, ?, ?, ?, ?, ?);
+	`
+	if err := session.Query(query,
+		groupID, audit.WindowID, audit.IdempotencyKey, audit.Partition,
+		audit.EventTime, audit.ArrivedAt, audit.WatermarkAtArrival,
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("failed to save late arrival audit for group %s (window %s, key %s): %w", groupID, audit.WindowID, audit.IdempotencyKey, err)
+	}
+	return nil
+}
+
+// ListLateArrivalAudits returns up to limit of groupID's recorded
+// late-arrival audit entries (§2.4, audit remediation). limit <= 0 means no
+// limit.
+func (s *CassandraCanonicalStore) ListLateArrivalAudits(ctx context.Context, groupID string, limit int) ([]LateArrivalAudit, error) {
+	s.mu.RLock()
+	session := s.session
+	s.mu.RUnlock()
+
+	query := `
+		SELECT window_id, idempotency_key, partition, event_time, arrived_at, watermark_at_arrival
+		FROM pharos.consumer_late_arrival_audits
+		WHERE group_id = ?
+	`
+	args := []interface{}{groupID}
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+	iter := session.Query(query+";", args...).WithContext(ctx).Iter()
+
+	var results []LateArrivalAudit
+	var a LateArrivalAudit
+	for iter.Scan(&a.WindowID, &a.IdempotencyKey, &a.Partition, &a.EventTime, &a.ArrivedAt, &a.WatermarkAtArrival) {
+		results = append(results, a)
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list late arrival audits for group %s: %w", groupID, err)
+	}
+	return results, nil
+}
+
 // Close closes the underlying Cassandra session.
 func (s *CassandraCanonicalStore) Close() error {
 	s.mu.Lock()
@@ -785,6 +868,7 @@ type MemoryCanonicalStore struct {
 	bySite      map[string][]*CanonicalRecord
 	recent      []*CanonicalRecord // mirrors events_recent (§2.4, Slice 21); sorted at read time, not write time
 	checkpoints map[string]WatermarkCheckpoint
+	lateAudits  map[string][]LateArrivalAudit // keyed by groupID, mirrors consumer_late_arrival_audits
 	saveHook    func(r *CanonicalRecord) error
 	saveCalls   int
 }
@@ -795,6 +879,7 @@ func NewMemoryCanonicalStore() *MemoryCanonicalStore {
 		byStudy:     make(map[string][]*CanonicalRecord),
 		bySite:      make(map[string][]*CanonicalRecord),
 		checkpoints: make(map[string]WatermarkCheckpoint),
+		lateAudits:  make(map[string][]LateArrivalAudit),
 	}
 }
 
@@ -997,6 +1082,38 @@ func (m *MemoryCanonicalStore) LoadWatermarkCheckpoint(ctx context.Context, grou
 		PartitionHighWatermark: high,
 		PartitionLastActivity:  activity,
 	}, nil
+}
+
+// SaveLateArrivalAudit mirrors CassandraCanonicalStore's own upsert-by-key
+// semantics: overwrite the existing entry for (groupID, WindowID,
+// IdempotencyKey) if one exists, append otherwise -- so a redelivered
+// message retrying a persist is a no-op here too, not a duplicate.
+func (m *MemoryCanonicalStore) SaveLateArrivalAudit(ctx context.Context, groupID string, audit LateArrivalAudit) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entries := m.lateAudits[groupID]
+	for i, existing := range entries {
+		if existing.WindowID == audit.WindowID && existing.IdempotencyKey == audit.IdempotencyKey {
+			entries[i] = audit
+			return nil
+		}
+	}
+	m.lateAudits[groupID] = append(entries, audit)
+	return nil
+}
+
+func (m *MemoryCanonicalStore) ListLateArrivalAudits(ctx context.Context, groupID string, limit int) ([]LateArrivalAudit, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	entries := m.lateAudits[groupID]
+	if limit > 0 && len(entries) > limit {
+		entries = entries[:limit]
+	}
+	result := make([]LateArrivalAudit, len(entries))
+	copy(result, entries)
+	return result, nil
 }
 
 func (m *MemoryCanonicalStore) EnsureSchema() error {

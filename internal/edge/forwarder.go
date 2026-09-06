@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/gasthecreator/pharos/internal/ingestion"
-	"github.com/gasthecreator/pharos/internal/metrics"
+	"github.com/gasthecreator/pharos/internal/metrics/edgemetrics"
+	"github.com/gasthecreator/pharos/internal/wire"
 )
 
 // HTTPClient interface allows mocking the network layer in tests.
@@ -113,7 +113,7 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	}
 
 	// 2. Assemble batch request directly with raw payload bytes (zero round-trip data loss)
-	batchReq := ingestion.BatchRequest{
+	batchReq := wire.BatchRequest{
 		SiteID: f.cfg.SiteID,
 		Events: rawEvents,
 	}
@@ -137,11 +137,11 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	}
 
 	// 3. Send HTTP request to Central Ingestion
-	metrics.ForwarderAttemptsTotal.Inc()
+	edgemetrics.ForwarderAttemptsTotal.Inc()
 	resp, err := f.client.Do(httpReq)
 	if err != nil {
 		// Network error (timeout, connection refused, unreachable network)
-		metrics.ForwarderOutcomesTotal.WithLabelValues("network_error").Inc()
+		edgemetrics.ForwarderOutcomesTotal.WithLabelValues("network_error").Inc()
 		f.handleFailure(ctx, records, fmt.Sprintf("network error: %v", err), 0)
 		return 0, err
 	}
@@ -152,12 +152,12 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 	// 4. Handle response status codes
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusCreated, http.StatusMultiStatus, http.StatusUnprocessableEntity:
-		metrics.ForwarderOutcomesTotal.WithLabelValues("success").Inc()
-		var batchResp ingestion.BatchResponse
+		edgemetrics.ForwarderOutcomesTotal.WithLabelValues("success").Inc()
+		var batchResp wire.BatchResponse
 		_ = json.Unmarshal(respBytes, &batchResp)
 
 		// Map results by idempotency_key to correlate per-event outcomes (§2.2, §2.3)
-		resultsByKey := make(map[string]ingestion.EventResult, len(batchResp.Results))
+		resultsByKey := make(map[string]wire.EventResult, len(batchResp.Results))
 		for _, res := range batchResp.Results {
 			if res.IdempotencyKey != "" {
 				resultsByKey[res.IdempotencyKey] = res
@@ -175,15 +175,15 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 		for _, r := range records {
 			res, found := resultsByKey[r.IdempotencyKey]
-			if found && res.Status == ingestion.StatusRejected {
+			if found && res.Status == wire.StatusRejected {
 				reason := res.Error
 				if reason == "" {
 					reason = "rejected by central ingestion"
 				}
 				rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
-			} else if found && res.Status == ingestion.StatusAccepted {
+			} else if found && res.Status == wire.StatusAccepted {
 				ackIDs = append(ackIDs, r.ID)
-			} else if found && res.Status == ingestion.StatusFailed {
+			} else if found && res.Status == wire.StatusFailed {
 				reason := res.Error
 				if reason == "" {
 					reason = "infrastructure failure during ingestion"
@@ -234,14 +234,14 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 	case http.StatusTooManyRequests:
 		// Rate limited by Central Ingestion token bucket (§2.3)
-		metrics.ForwarderOutcomesTotal.WithLabelValues("rate_limited").Inc()
+		edgemetrics.ForwarderOutcomesTotal.WithLabelValues("rate_limited").Inc()
 		retryAfter := f.parseRetryAfter(resp.Header.Get("Retry-After"))
 		f.handleFailure(ctx, records, fmt.Sprintf("rate limited (HTTP 429): %s", string(respBytes)), retryAfter)
 		return 0, fmt.Errorf("rate limited (HTTP 429)")
 
 	default:
 		// 5xx Server Error or unexpected error
-		metrics.ForwarderOutcomesTotal.WithLabelValues("server_error").Inc()
+		edgemetrics.ForwarderOutcomesTotal.WithLabelValues("server_error").Inc()
 		errMsg := fmt.Sprintf("server error (HTTP %d): %s", resp.StatusCode, string(respBytes))
 		f.handleFailure(ctx, records, errMsg, 0)
 		return 0, fmt.Errorf("%s", errMsg)
@@ -296,7 +296,7 @@ func (f *Forwarder) CalculateBackoff(attempts int) time.Duration {
 	}
 
 	result := time.Duration(jittered)
-	metrics.ForwarderLastBackoffSeconds.Set(result.Seconds())
+	edgemetrics.ForwarderLastBackoffSeconds.Set(result.Seconds())
 	return result
 }
 

@@ -235,6 +235,12 @@ func (s *CassandraOutboxStore) EnsureSchema() error {
 			site_id text,
 			PRIMARY KEY (site_id)
 		);`,
+		`CREATE TABLE IF NOT EXISTS event_outbox_by_site (
+			site_id text,
+			published_at timestamp,
+			idempotency_key text,
+			PRIMARY KEY ((site_id), published_at, idempotency_key)
+		) WITH CLUSTERING ORDER BY (published_at ASC, idempotency_key ASC);`,
 	}
 
 	for _, q := range queries {
@@ -318,6 +324,15 @@ func (s *CassandraOutboxStore) InsertClaim(ctx context.Context, rec OutboxRecord
 		_ = s.session.Query(
 			`INSERT INTO pending_outbox (bucket, idempotency_key, created_at) VALUES (?, ?, ?);`,
 			bucket, rec.IdempotencyKey, now,
+		).WithContext(ctx).Exec()
+
+		// Pruning-discovery (§2.2, audit remediation): reuses known_sites --
+		// already a plain site_id set with no DLQ-specific meaning (see its
+		// own docs) -- so the outbox pruning job can discover which sites'
+		// event_outbox_by_site partitions to scan, mirroring how
+		// InsertDLQClaim already populates it for DLQ archival.
+		_ = s.session.Query(
+			`INSERT INTO known_sites (site_id) VALUES (?);`, rec.SiteID,
 		).WithContext(ctx).Exec()
 
 		return ClaimResult{
@@ -438,6 +453,22 @@ func (s *CassandraOutboxStore) MarkPublished(ctx context.Context, idempotencyKey
 		currentBucket(now), idempotencyKey,
 	).WithContext(ctx).Exec()
 
+	// Populate the pruning index (§2.2, audit remediation) -- published_at is
+	// only known now, so unlike pending_outbox this can't be written at claim
+	// time; mirrors MarkDLQPublished's own post-CAS SELECT for the fields its
+	// dead_letter_events_by_site insert needs.
+	var siteID string
+	_ = s.session.Query(
+		`SELECT site_id FROM event_outbox WHERE idempotency_key = ?;`,
+		idempotencyKey,
+	).WithContext(ctx).Scan(&siteID)
+	if siteID != "" {
+		_ = s.session.Query(
+			`INSERT INTO event_outbox_by_site (site_id, published_at, idempotency_key) VALUES (?, ?, ?);`,
+			siteID, now, idempotencyKey,
+		).WithContext(ctx).Exec()
+	}
+
 	return nil
 }
 
@@ -538,6 +569,31 @@ func (s *CassandraOutboxStore) InsertDLQClaim(ctx context.Context, rec DLQRecord
 	}
 
 	if casApplied {
+		// Mirror the steal into dead_letter_events_by_site (§2.3, audit
+		// remediation): previously only dead_letter_events itself was
+		// updated here, leaving the by_site index showing the stale
+		// pre-steal status/claimed_at until MarkDLQPublished eventually
+		// overwrote it -- a query against dead_letter_events_by_site in
+		// between (e.g. an operator inspecting DLQ state, or the archival
+		// job's own status filter) could see a record as still owned by the
+		// worker whose lease just expired and was stolen. Best-effort,
+		// mirroring every other by_site index write in this file: this is a
+		// secondary query index, not the record of truth (dead_letter_events
+		// itself already committed via the CAS above).
+		var siteID string
+		var rejectedAt time.Time
+		_ = s.session.Query(
+			`SELECT site_id, rejected_at FROM dead_letter_events WHERE idempotency_key = ?;`,
+			rec.IdempotencyKey,
+		).WithContext(ctx).Scan(&siteID, &rejectedAt)
+		if siteID != "" && !rejectedAt.IsZero() {
+			_ = s.session.Query(`
+				UPDATE dead_letter_events_by_site
+				SET status = 'PUBLISHING', claimed_at = ?
+				WHERE site_id = ? AND rejected_at = ? AND idempotency_key = ?;
+			`, now, siteID, rejectedAt, rec.IdempotencyKey).WithContext(ctx).Exec()
+		}
+
 		return ClaimResult{
 			Acquired:  true,
 			Status:    StatusPublishing,
@@ -813,10 +869,60 @@ func (s *CassandraOutboxStore) ListDLQBySiteOlderThan(ctx context.Context, siteI
 	return records, nil
 }
 
-// ListKnownSites returns every site_id ever seen in a DLQ rejection (§2.3,
-// Slice 11) -- mirrors CassandraCanonicalStore.ListKnownStudies for the same
-// reason: an efficient way for the archival job to discover which
-// dead_letter_events_by_site partitions to scan.
+// ListOutboxBySiteOlderThan returns PUBLISHED event_outbox rows for siteID
+// published before cutoff (§2.2, audit remediation) -- an efficient range
+// query against event_outbox_by_site's clustering key, mirroring
+// ListDLQBySiteOlderThan exactly except that no full record is carried:
+// these rows get deleted outright, never archived (see
+// migrations/006_event_outbox_pruning.cql's docs for why that's safe).
+func (s *CassandraOutboxStore) ListOutboxBySiteOlderThan(ctx context.Context, siteID string, cutoff time.Time) ([]OutboxPruneRecord, error) {
+	query := `
+		SELECT idempotency_key, published_at FROM event_outbox_by_site
+		WHERE site_id = ? AND published_at < ?;
+	`
+	iter := s.session.Query(query, siteID, cutoff).WithContext(ctx).Iter()
+
+	var records []OutboxPruneRecord
+	var idKey string
+	var publishedAt time.Time
+	for iter.Scan(&idKey, &publishedAt) {
+		records = append(records, OutboxPruneRecord{
+			IdempotencyKey: idKey,
+			SiteID:         siteID,
+			PublishedAt:    publishedAt,
+		})
+	}
+	if err := iter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to list outbox records for %s older than %s: %w", siteID, cutoff, err)
+	}
+	return records, nil
+}
+
+// DeletePrunedOutboxRecord removes one row from both event_outbox and
+// event_outbox_by_site (§2.2, audit remediation) -- called only for rows
+// ListOutboxBySiteOlderThan already confirmed are PUBLISHED (that table is
+// only ever populated at MarkPublished time), so this never touches a still
+// in-flight claim.
+func (s *CassandraOutboxStore) DeletePrunedOutboxRecord(ctx context.Context, rec OutboxPruneRecord) error {
+	if err := s.session.Query(
+		`DELETE FROM event_outbox WHERE idempotency_key = ?;`, rec.IdempotencyKey,
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("delete event_outbox failed: %w", err)
+	}
+	if err := s.session.Query(
+		`DELETE FROM event_outbox_by_site WHERE site_id = ? AND published_at = ? AND idempotency_key = ?;`,
+		rec.SiteID, rec.PublishedAt, rec.IdempotencyKey,
+	).WithContext(ctx).Exec(); err != nil {
+		return fmt.Errorf("delete event_outbox_by_site failed: %w", err)
+	}
+	return nil
+}
+
+// ListKnownSites returns every site_id ever seen in a DLQ rejection or an
+// accepted outbox claim (§2.3 Slice 11; §2.2 audit remediation) -- mirrors
+// CassandraCanonicalStore.ListKnownStudies for the same reason: an efficient
+// way for the archival/pruning jobs to discover which
+// dead_letter_events_by_site and event_outbox_by_site partitions to scan.
 func (s *CassandraOutboxStore) ListKnownSites(ctx context.Context) ([]string, error) {
 	iter := s.session.Query(`SELECT site_id FROM known_sites;`).WithContext(ctx).Iter()
 	var sites []string

@@ -1,0 +1,20 @@
+# Pharos web dashboard container image (PLAN.md Slice 21: web dashboard;
+# audit remediation -- this Dockerfile was missing even though every other
+# service already had one). See Dockerfile.ingestion for why scratch +
+# CGO_ENABLED=0 is genuinely sufficient here, not just convenient; the
+# dashboard's HTML templates are compiled into the binary via go:embed
+# (internal/dashboard/templates), so scratch needs no template files copied
+# in separately.
+FROM golang:1.25-alpine AS builder
+RUN apk add --no-cache ca-certificates
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /out/pharos-dashboard ./cmd/pharos-dashboard
+
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/pharos-dashboard /pharos-dashboard
+EXPOSE 8092
+ENTRYPOINT ["/pharos-dashboard"]

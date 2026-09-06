@@ -1,0 +1,93 @@
+# Web Dashboard Deployment (§2.4, PLAN.md Slice 21: web dashboard; audit
+# remediation -- this manifest was missing even though every other service
+# already had one, since Slice 17 (deployment automation) predates Slice 21
+# and nobody revisited deploy/k8s/ after the dashboard shipped). Only 1
+# replica: this is a stateless read/proxy layer over query.Service and
+# Central Ingestion, no partition-assignment or leader-election concerns to
+# prove out here.
+#
+# --enable-chaos is deliberately NOT set here: the Chaos Control Panel can
+# stop/restart real Cassandra nodes and partition dc-us/dc-eu (Slice 23's own
+# safety guard, off by default) -- enabling it against this cluster is an
+# explicit, separate operator action, not a default deployment property.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pharos-dashboard
+  namespace: pharos
+spec:
+  selector:
+    app: pharos-dashboard
+  ports:
+    - name: http
+      port: 8092
+      targetPort: 8092
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pharos-dashboard
+  namespace: pharos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pharos-dashboard
+  template:
+    metadata:
+      labels:
+        app: pharos-dashboard
+    spec:
+      containers:
+        - name: pharos-dashboard
+          image: pharos-dashboard:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--port=8092"
+            - "--cassandra-hosts=cassandra-us-0.cassandra.pharos.svc.cluster.local"
+            - "--ca-cert=/tls/ca-cert.pem"
+            - "--central-url=https://pharos-ingestion.pharos.svc.cluster.local:8443"
+            # Grafana isn't part of this K8s deployment (08-observability.yaml
+            # only deploys Prometheus) -- an explicit empty override hides the
+            # dashboard's Grafana link rather than leaving the flag's own
+            # http://localhost:3000 default pointing at nothing reachable.
+            - "--grafana-url="
+            - "--ingestion-metrics-url=https://pharos-ingestion.pharos.svc.cluster.local:8443/metrics"
+            - "--consumer-metrics-url=http://pharos-consumer.pharos.svc.cluster.local:9091/metrics"
+          ports:
+            - containerPort: 8092
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8092
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8092
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: tls
+              mountPath: /tls
+              readOnly: true
+      volumes:
+        - name: tls
+          secret:
+            secretName: pharos-tls
+            items:
+              - key: ca-cert.pem
+                path: ca-cert.pem

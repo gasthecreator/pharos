@@ -224,6 +224,77 @@ directly, not by trusting the HTTP response alone. The full suite
 against this final topology (4 Cassandra nodes, 4 Kafka brokers,
 MirrorMaker2, all TLS-enabled on their client-facing listeners).
 
+**Addendum [2026-09-06], audit remediation -- internode/inter-broker TLS
+re-enabled:** the client-only narrowing above was correct when it shipped,
+but it was measured against the *5-Cassandra-node* topology that predated
+this same slice's own later `dc-eu` reduction to 1 node (see above) -- by
+the time that reduction landed, nobody went back and retried the internode
+TLS question against the topology that actually ships. Retried today: a
+full `docker compose down` then a from-scratch `up` of all 4 Cassandra
+nodes + 4 Kafka brokers + MirrorMaker 2, with Cassandra's
+`internode_encryption` set to `all` and Kafka's `INTERNAL` listener set to
+`SSL` (both reusing the exact keystore/truststore already issued for
+client-facing TLS -- no new certs). Result: zero OOM kills, zero container
+restarts, steady-state memory ~4.6-5.1GB against the same 6.275GB Docker VM
+ceiling that OOM-killed nodes before. Confirmed genuinely encrypted, not
+just configured and silently ignored, by reading the connection-established
+log lines themselves: every Cassandra internode link (including the
+cross-DC `dc-us`<->`dc-eu` one) logs
+`encryption = encrypted(factory=openssl;protocol=TLSv1.3;cipher=...)`, and
+`kafka-topics.sh --describe` showed every partition's in-sync-replica set
+fully caught up over the now-SSL `INTERNAL` listener. The full non-chaos
+and chaos test suites both pass; one integration test
+(`TestConsumerEngine_RealEndToEndKafkaAndCassandra`) needed its own timeout
+bumped again (60s/50s, from 30s/20s) after reproducing the identical
+"ran out of budget" failure shape running alone, not just under full-suite
+contention -- confirmed the underlying operations were still correct and
+not hanging by rerunning once with a 180s/170s budget and observing a clean
+pass in ~15s, so this is the same class of "real infrastructure cost eating
+a tight budget" as every earlier bump on this test, not a new correctness
+problem.
+
+One real bug this surfaced: MirrorMaker 2's `bootstrap.servers`
+(`kafka/mm2.properties`) point at the `INTERNAL` listener, and its
+AdminClient had no SSL properties configured for either cluster alias --
+against a newly-SSL `INTERNAL` port, a plaintext client doesn't fail with a
+clean connection-refused; it reads the TLS ClientHello's raw bytes as a
+Kafka response length prefix, tries to allocate a buffer for that
+garbage-interpreted size, and dies with `OutOfMemoryError: Java heap space`
+-- a textbook plaintext-vs-TLS protocol mismatch that presents as a memory
+problem. Root-caused by reading the stack trace down to
+`NetworkReceive.readFrom`, not by assuming the heap really was undersized.
+Fixed by adding `security.protocol = SSL` +
+`ssl.truststore.location`/`password` for both `dc-us.` and `dc-eu.` cluster
+aliases, pointed at the truststore MirrorMaker 2's container already had
+mounted (defensively, unused until now).
+
+Not carried into `deploy/k8s/` -- `deploy/k8s/mm2.properties` and the K8s
+Kafka manifests keep their original client-only TLS scope for now. This
+re-enablement was verified specifically against the Docker Compose cluster;
+extending it to Slice 17's K8s topology is a separate exercise with its own
+resource ceiling to re-check, not implied by this one.
+
+**Second follow-on fix, same day:** the verification above (idle cluster,
+one non-chaos suite pass) reported zero issues, but a heavier pass shortly
+after -- full non-chaos + chaos suites, run right after this same host had
+just been under severe CPU contention from the Slice 17 full-scale `kind`
+attempt above -- surfaced a genuine broker crash: `kafka-1`'s own JVM heap
+(192M, untouched by this re-enablement) ran out once `INTERNAL` carried
+real SSL traffic too, not just `EXTERNAL` -- dozens of internal threads
+died with `OutOfMemoryError: Java heap space`, while the container itself
+kept reporting `healthy` the whole time, since this was the JVM's own heap
+ceiling, not something Docker's container-level OOM killer would ever
+catch. `docker inspect`'s `OOMKilled` field stayed `false` throughout,
+which is exactly why this needed reading the broker's own logs to catch,
+not just checking the usual container-level signal every earlier addendum
+in this file relied on. Fixed by bumping `KAFKA_HEAP_OPTS` 192M -> 320M for
+all 4 brokers; a subsequent full non-chaos + chaos suite run produced zero
+further `OutOfMemoryError`s and zero container restarts. Generalizable
+lesson: an idle-cluster or single-pass verification is not sufficient
+evidence a memory/heap change actually holds under real load -- and
+container-level RSS/OOM monitoring alone can miss a JVM-internal heap
+ceiling entirely.
+
 ---
 
 #### [2026-09-05] Slice 14: Multi-Region Cassandra + Kafka (Simulated)
@@ -1764,15 +1835,20 @@ No changes required.
 - `resourceType`: `"AdverseEvent"`
 - `identifier`: Array containing an entry with `system: "urn:pharos:idempotency-key"` and `value: "<site_id>:<local_sequence_number>"`
 - `actuality`: `"actual"`
+- `category`: Array of CodeableConcept classifying the event (e.g. `"product-problem"`, `"medication-mishap"`)
 - `subject`: Reference to trial participant (e.g., `{"reference": "Patient/SUBJ-10492"}`)
 - `event`: CodeableConcept containing MedDRA coding or text (e.g., `"Anaphylaxis"`)
 - `date`: ISO 8601 string with site timezone offset representing observation event-time
 - `recordedDate`: ISO 8601 string representing capture time at the site
 - `seriousness`: Serious adverse event flag/code (e.g. hospitalization, life-threatening)
 - `severity`: CodeableConcept (`"mild"`, `"moderate"`, `"severe"`)
+- `outcome`: CodeableConcept describing the event's resolution (e.g. `"resolved"`, `"ongoing"`, `"fatal"`)
+- `recorder`: Reference to who recorded the event (e.g., `{"reference": "Practitioner/DR-04821"}`)
 - `study`: Reference to clinical trial (e.g., `{"reference": "ResearchStudy/LILLY-401"}`)
 - `location`: Reference to trial site (e.g., `{"reference": "Location/SITE-NG-01"}`)
 - `suspectEntity`: Array of suspected medicinal products (drug code, name)
+
+`schemaVersion` is a later, separate addition to this profile (§2.3, Slice 9's own proposal covers it) — not part of this original scoping decision.
 
 **Why:** Open Question 4 identified that the full FHIR `AdverseEvent` specification is vast, with dozens of complex optional nested fields. A clearly documented, interview-grounded profile allows strict structural and domain validation (and realistic DLQ routing for malformed events) without getting bogged down in arbitrary regulatory sub-fields.
 

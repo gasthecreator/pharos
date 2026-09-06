@@ -38,7 +38,12 @@ type WatermarkTracker struct {
 	previousEmitted        time.Time
 	windows                map[string]*Window
 	lateAudits             []LateArrivalAudit
-	lateAuditKeys          map[string]bool // key: windowID + ":" + idempotencyKey for 21 CFR Part 11 audit deduplication
+	// lateAuditKeys maps windowID+":"+idempotencyKey to that entry's index in
+	// lateAudits, both for 21 CFR Part 11 audit deduplication and so a
+	// redelivered message can look its own entry back up in O(1) -- needed
+	// so Engine.Step can retry persisting it to Cassandra (§2.4, audit
+	// remediation) idempotently on every delivery, not just the first.
+	lateAuditKeys map[string]int
 }
 
 // NewWatermarkTracker constructs a WatermarkTracker with specified lateness and idle timeout thresholds.
@@ -55,13 +60,21 @@ func NewWatermarkTracker(latenessTolerance, idleTimeout time.Duration) *Watermar
 		partitionHighWatermark: make(map[int]time.Time),
 		partitionLastActivity:  make(map[int]time.Time),
 		windows:                make(map[string]*Window),
-		lateAuditKeys:          make(map[string]bool),
+		lateAuditKeys:          make(map[string]int),
 	}
 }
 
 // ProcessEvent records event arrival, updates partition high-watermark & activity,
 // and computes the monotonically non-decreasing stream watermark (§2.4).
-func (wt *WatermarkTracker) ProcessEvent(partition int, idempotencyKey string, eventTime time.Time, now time.Time) (isLate bool, currentWatermark time.Time) {
+// touchedAudit, when non-nil, is the LateArrivalAudit entry this call's event
+// belongs to (whether just created or already recorded on a prior delivery
+// of the same message) -- Engine.Step persists it to Cassandra on every
+// call, not just the first, since that persistence is an idempotent upsert
+// keyed the same way as lateAuditKeys (§2.4, audit remediation): a
+// redelivered message must be able to retry a persist that failed last time,
+// and returning the existing entry again (instead of nil) is what makes that
+// retry possible.
+func (wt *WatermarkTracker) ProcessEvent(partition int, idempotencyKey string, eventTime time.Time, now time.Time) (isLate bool, currentWatermark time.Time, touchedAudit *LateArrivalAudit) {
 	wt.mu.Lock()
 	defer wt.mu.Unlock()
 
@@ -89,31 +102,38 @@ func (wt *WatermarkTracker) ProcessEvent(partition int, idempotencyKey string, e
 			case WindowStatusComplete:
 				w.Status = WindowStatusRevised
 				w.RevisedAt = now
-				wt.appendLateAuditIfNotExistsLocked(w.ID, idempotencyKey, partition, eventTime, now, currentWatermark)
+				audit := wt.appendLateAuditIfNotExistsLocked(w.ID, idempotencyKey, partition, eventTime, now, currentWatermark)
+				touchedAudit = &audit
 			case WindowStatusRevised:
-				wt.appendLateAuditIfNotExistsLocked(w.ID, idempotencyKey, partition, eventTime, now, currentWatermark)
+				audit := wt.appendLateAuditIfNotExistsLocked(w.ID, idempotencyKey, partition, eventTime, now, currentWatermark)
+				touchedAudit = &audit
 			}
 		}
 	}
 
-	return isLate, currentWatermark
+	return isLate, currentWatermark, touchedAudit
 }
 
-// appendLateAuditIfNotExistsLocked ensures exactly one LateArrivalAudit exists per (window, idempotencyKey) pair.
-func (wt *WatermarkTracker) appendLateAuditIfNotExistsLocked(windowID, idempotencyKey string, partition int, eventTime, arrivedAt, watermark time.Time) {
+// appendLateAuditIfNotExistsLocked ensures exactly one LateArrivalAudit
+// exists per (window, idempotencyKey) pair, and always returns that entry --
+// freshly created, or the one already recorded from an earlier delivery of
+// the same message -- so a caller can retry persisting it idempotently.
+func (wt *WatermarkTracker) appendLateAuditIfNotExistsLocked(windowID, idempotencyKey string, partition int, eventTime, arrivedAt, watermark time.Time) LateArrivalAudit {
 	dedupKey := windowID + ":" + idempotencyKey
-	if wt.lateAuditKeys[dedupKey] {
-		return
+	if idx, ok := wt.lateAuditKeys[dedupKey]; ok {
+		return wt.lateAudits[idx]
 	}
-	wt.lateAuditKeys[dedupKey] = true
-	wt.lateAudits = append(wt.lateAudits, LateArrivalAudit{
+	audit := LateArrivalAudit{
 		WindowID:           windowID,
 		IdempotencyKey:     idempotencyKey,
 		Partition:          partition,
 		EventTime:          eventTime,
 		ArrivedAt:          arrivedAt,
 		WatermarkAtArrival: watermark,
-	})
+	}
+	wt.lateAuditKeys[dedupKey] = len(wt.lateAudits)
+	wt.lateAudits = append(wt.lateAudits, audit)
+	return audit
 }
 
 // CurrentWatermark recalculates and returns the latest watermark (e.g. on timer or query).
