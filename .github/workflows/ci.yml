@@ -74,11 +74,11 @@ jobs:
       # which lets RSS balloon before it can be reclaimed. mirrormaker starts
       # in its own step below, only after topics genuinely exist.
       - name: Bring up Cassandra + Kafka (without MirrorMaker 2)
-        run: docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana
+        run: docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana redis
 
       - name: Wait for Cassandra + Kafka to report healthy
         run: |
-          containers="pharos-cassandra-1 pharos-cassandra-2 pharos-cassandra-3 pharos-cassandra-4 pharos-kafka-1 pharos-kafka-2 pharos-kafka-3 pharos-kafka-4"
+          containers="pharos-cassandra-1 pharos-cassandra-2 pharos-cassandra-3 pharos-cassandra-4 pharos-kafka-1 pharos-kafka-2 pharos-kafka-3 pharos-kafka-4 pharos-redis"
           for i in $(seq 1 60); do
             all_healthy=true
             for c in $containers; do
