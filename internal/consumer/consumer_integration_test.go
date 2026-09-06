@@ -254,3 +254,68 @@ func TestConsumerEngine_RealEndToEndKafkaAndCassandra(t *testing.T) {
 		t.Errorf("unexpected stats: %+v", stats)
 	}
 }
+
+// TestCassandraCanonicalStore_LateArrivalAuditPersistence proves the §2.4,
+// audit remediation fix against real Cassandra: LateArrivalAudit entries
+// are genuinely durable (not just held in WatermarkTracker's in-memory
+// state, which is all Slice 13 originally provided despite this type's own
+// stated 21 CFR Part 11 purpose), and SaveLateArrivalAudit is a true
+// idempotent upsert keyed by (groupID, WindowID, IdempotencyKey) -- the
+// exact property Engine.Step depends on to safely retry a persist that
+// failed on a prior delivery of the same redelivered Kafka message.
+func TestCassandraCanonicalStore_LateArrivalAuditPersistence(t *testing.T) {
+	ctx := context.Background()
+	cfg := DefaultCassandraStoreConfig()
+
+	store, err := NewCassandraCanonicalStore(cfg)
+	if err != nil {
+		t.Fatalf("failed to connect to live Cassandra container: %v", err)
+	}
+	defer store.Close()
+
+	uniqueID := uuid.New().String()[:8]
+	group := "test-late-audit-group-" + uniqueID
+	audit := LateArrivalAudit{
+		WindowID:           "WINDOW-" + uniqueID,
+		IdempotencyKey:     "SITE-LATE-" + uniqueID + ":1",
+		Partition:          0,
+		EventTime:          time.Date(2026, 8, 30, 12, 30, 0, 0, time.UTC),
+		ArrivedAt:          time.Date(2026, 8, 30, 13, 10, 0, 0, time.UTC),
+		WatermarkAtArrival: time.Date(2026, 8, 30, 13, 5, 0, 0, time.UTC),
+	}
+
+	if err := store.SaveLateArrivalAudit(ctx, group, audit); err != nil {
+		t.Fatalf("SaveLateArrivalAudit (1st write) failed: %v", err)
+	}
+	// Simulates a redelivered Kafka message retrying a persist that
+	// previously failed after this same entry was already written once --
+	// must be a harmless overwrite, never a second row.
+	if err := store.SaveLateArrivalAudit(ctx, group, audit); err != nil {
+		t.Fatalf("SaveLateArrivalAudit (idempotent retry) failed: %v", err)
+	}
+
+	entries, err := store.ListLateArrivalAudits(ctx, group, 50)
+	if err != nil {
+		t.Fatalf("ListLateArrivalAudits failed: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly 1 durably persisted entry after 2 identical writes, got %d: %+v", len(entries), entries)
+	}
+	got := entries[0]
+	if got.WindowID != audit.WindowID || got.IdempotencyKey != audit.IdempotencyKey || got.Partition != audit.Partition {
+		t.Fatalf("persisted entry doesn't match what was saved: got %+v, want %+v", got, audit)
+	}
+	if !got.EventTime.Equal(audit.EventTime) || !got.ArrivedAt.Equal(audit.ArrivedAt) || !got.WatermarkAtArrival.Equal(audit.WatermarkAtArrival) {
+		t.Fatalf("persisted timestamps don't round-trip: got %+v, want %+v", got, audit)
+	}
+
+	// A different consumer group must never see another group's entries --
+	// this table is partitioned by group_id specifically so that holds.
+	otherGroupEntries, err := store.ListLateArrivalAudits(ctx, "unrelated-group-"+uniqueID, 50)
+	if err != nil {
+		t.Fatalf("ListLateArrivalAudits (unrelated group) failed: %v", err)
+	}
+	if len(otherGroupEntries) != 0 {
+		t.Fatalf("expected 0 entries for an unrelated group, got %d", len(otherGroupEntries))
+	}
+}

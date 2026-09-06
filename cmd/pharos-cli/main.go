@@ -42,7 +42,10 @@ DLQ Replay Commands (§2.3, Slice 10 -- requires Central Ingestion, not --memory
 
 Archive Commands (§2.4, Slice 11 -- requires Cassandra, not --memory):
   archive run [--older-than 90d] [--archive-dir <path>] [--dry-run]
-                                                             Move records older than the threshold to cold storage
+                                                             Move canonical/DLQ records older than the threshold to
+                                                             cold storage, and prune event_outbox rows past the same
+                                                             threshold outright (operational bookkeeping, not
+                                                             data-of-record -- see PLAN.md §2.2)
 
 Site API Key Commands (§2.1, §2.2, Slice 15 -- requires Cassandra, not --memory):
   site create-key <site_id>                                 Issue a new API key for a site (prints plaintext once)
@@ -80,6 +83,7 @@ Examples:
   pharos-cli dlq replay --all --site SITE-US-01 --site-id SITE-US-01 --api-key <key>
   pharos-cli audit list --operator alice@sponsor.example
   pharos-cli audit list --operator SITE-US-01 --limit 20
+  pharos-cli audit late-arrivals --group pharos-canonical-sink
 `)
 }
 

@@ -248,7 +248,7 @@ wait_for_log "$LOG_DIR/dashboard.log" "Ready on http" 30
 info "Dashboard health check:"
 curl -sf "http://localhost:$DASHBOARD_PORT/healthz" && echo
 info "Dashboard query view for this run's own site (same query.Service pharos-cli uses):"
-curl -s "http://localhost:$DASHBOARD_PORT/query?type=site&value=$SITE_ID" | grep -o "$IDKEY" | head -1 \
+curl -s "http://localhost:$DASHBOARD_PORT/query?type=site&id=$SITE_ID" | grep -o "$IDKEY" | head -1 \
   && info "  -> found $IDKEY rendered on the dashboard's own query page." \
   || info "  -> (didn't spot $IDKEY in the rendered page -- non-fatal, the CLI already proved this data is queryable above)"
 info "Chaos control panel route (present but inert without --enable-chaos):"
