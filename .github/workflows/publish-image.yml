@@ -6,8 +6,8 @@
 # covered too, not just the signature.
 #
 # workflow_dispatch exists specifically so this can be exercised and
-# verified on demand (this project has no tagged release yet) -- the tag
-# trigger is what a real release would use. Manual runs publish to
+# verified on demand without waiting for the next tagged release -- the
+# tag trigger is what a real release actually uses. Manual runs publish to
 # ghcr.io/<owner>/pharos-<service>:<short-sha>; tag pushes additionally
 # publish :<tag> and :latest.
 name: Publish images

@@ -60,12 +60,10 @@ up:
 	@if [ ! -f certs/ca-cert.pem ]; then \
 		./scripts/generate_certs.sh; \
 	else \
-		echo "certs/ already exists, skipping generation -- generate_certs.sh"; \
-		echo "unconditionally deletes and regenerates the CA, which would break"; \
-		echo "TLS trust for any already-running containers (confirmed live: this"; \
-		echo "broke a real running cluster during this fix's own verification --"; \
-		echo "see WORKLOG.md). Run ./scripts/generate_certs.sh directly, then"; \
-		echo "'docker compose down && make up', if you genuinely need fresh certs."; \
+		echo "certs/ already exists, skipping generation."; \
+		echo "Regenerating breaks TLS trust for already-running containers --"; \
+		echo "run 'docker compose down && ./scripts/generate_certs.sh && make up'"; \
+		echo "if you need fresh certs."; \
 	fi
 	docker compose up -d cassandra-1 cassandra-2 cassandra-3 cassandra-4 kafka-1 kafka-2 kafka-3 kafka-4 prometheus grafana redis
 	@echo "Waiting for Cassandra + Kafka + Redis to report healthy..."

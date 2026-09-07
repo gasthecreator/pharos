@@ -40,6 +40,91 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Independent review of PR #39/#40 — real factual error found and fixed, plus polish
+
+**Author:** Claude Code
+
+**What:** Gideon asked for the two most recently merged PRs (#39, #40) to
+be reviewed for "big tech org" cleanliness, not just correctness. Ran an
+independent review agent (fresh context, no involvement in authoring
+either PR) against both full diffs. Real findings, fixed:
+
+1. **A real, confirmed factual error**: `.github/workflows/publish-image.yml`'s
+   own comment and `CHANGELOG.md`'s framing both claimed "this project has
+   no tagged release yet." Checked directly: `git tag -l` shows `v0.1.0`
+   and `v0.2.0` already existed, both dated 2026-08-30 — a week before
+   this session's work. This is exactly the kind of claim a reviewer
+   catches with one command. Fixed the workflow comment, and restructured
+   `CHANGELOG.md` to properly reflect the real version history: `[0.1.0]`
+   (Slices 1-5, the core pipeline), `[0.2.0]` (Slices 6-7, observability +
+   multi-node), and `[Unreleased]` for everything since (Slices 8-23 plus
+   this session's product/hardening work) — rather than dumping the whole
+   23-slice history into one `[Unreleased]` block as the first draft did.
+2. **A second factual error, in this session's own earlier WORKLOG entry**:
+   claimed `CODE_OF_CONDUCT.md`'s enforcement contact was "the same
+   contact `SECURITY.md` already uses." Checked: `SECURITY.md` names no
+   contact at all. Corrected that entry directly (not left as "historical
+   record" — it's a same-day factual error in this session's own writing,
+   not a past decision worth preserving as-is).
+3. `govulncheck.yml` installed the scanner via `go install
+   .../govulncheck@latest` — an unpinned dependency inside a
+   security-scanning job, sitting oddly next to the same session's own
+   image-signing/SBOM/provenance work. Pinned to `@v1.7.0` (confirmed it
+   installs and runs clean against the current tree first).
+4. `govulncheck.yml`'s job was still named "Run on Ubuntu" (unedited
+   copy-paste from cascade-operator) and triggered on every branch push
+   (no branch filter), producing duplicate-looking check names in PR
+   check lists. Renamed to `govulncheck` and scoped triggers to `main`,
+   matching `ci.yml`/`codeql.yml`'s own convention.
+5. The `Makefile`'s `up` target printed a multi-line, first-person
+   incident-report message ("this fix's own verification -- see
+   WORKLOG.md") on every normal run when `certs/` already exists — audit
+   narration leaking into user-facing CLI output. Trimmed to a terse
+   operational message.
+6. `ci.yml` was the only one of the four workflow files with no top-level
+   `permissions:` block, an inconsistent security posture next to the
+   three new ones. Added `permissions: contents: read` (confirmed nothing
+   in `ci.yml` needs a broader grant).
+
+The review also confirmed several things were genuinely clean: no
+cascade-operator copy-paste residue (Istio/CascadePolicy/Kubebuilder
+references) anywhere in the new files, all new doc cross-references
+resolve to real files with matching content, and PR #40's actual bug
+fixes were independently re-confirmed correct.
+
+**Why:** Direct ask — review the 2 most recent PRs specifically for
+"clean and standard like an actual big tech org," not just correctness
+(which the fourth-pass audit had already covered for PR #40's content).
+
+**How:** Saved both PRs' full diffs (`gh pr diff 39/40 --patch`) and had
+an independent agent review them fresh, specifically instructed to check
+factual claims against the actual current repo state rather than trust
+the diff's own narration — this is what caught the tagged-release claim,
+a genuine embarrassing-if-uncaught error that "looks right" on the page
+but is wrong the moment someone runs `git tag -l`.
+
+**Files/modules touched:** `.github/workflows/{ci,govulncheck,publish-image}.yml`,
+`CHANGELOG.md`, `Makefile`, this file (correcting its own prior entry).
+
+**Tests added/updated:** None (docs/CI config) — `govulncheck@v1.7.0`
+installed and run locally against the current tree to confirm the pin
+works before committing it.
+
+**Follow-ups / left open:** The review also recommended flattening the
+narrative "confirmed by reading X directly" voice in
+`docs/security-threat-model.md`/`docs/benchmark-results.md` into a
+terser, more neutral register. Deliberately not done: that voice matches
+cascade-operator's own equivalent docs, which this session explicitly
+adopted as the reference pattern, and the evidence-citing detail is a
+real asset for a security-conscious technical evaluator reading those two
+specific documents — CHANGELOG.md was the one genuine genre mismatch
+(Keep a Changelog has a well-known terse convention this repo wasn't
+following), which is why only that one got rewritten. Also left open:
+branch protection on `main` (currently none at all — no required status
+checks, no protection against force-push/direct-push) was proposed
+separately and is pending Gideon's decision on granting the additional
+permission it needs.
+
 ## [2026-09-06] Claude Code: Fourth-pass audit — 3 parallel deep-dive agents, real bugs found, one self-inflicted incident during verification
 
 **Author:** Claude Code
@@ -218,7 +303,13 @@ product" pass) for anything genuinely applicable here, and brought over
 what pharos was actually missing:
 
 1. **`CODE_OF_CONDUCT.md`** — standard Contributor Covenant v2.1, unmodified
-   text, same enforcement contact pharos's own `SECURITY.md` already uses.
+   text, with cascade-operator's own enforcement contact
+   (`gideonsanni2023@gmail.com`) carried over as-is since it's the same
+   maintainer. Correction from this entry's first draft: `SECURITY.md`
+   itself names no contact at all ("reach out to the maintainer directly"
+   with no address) — checked directly after an independent review caught
+   the original claim of "same contact SECURITY.md already uses" as
+   unverifiable against the actual file.
 2. **`CODEOWNERS`** — single-maintainer default (`* @gasthecreator`).
 3. **`.github/ISSUE_TEMPLATE/{bug_report,feature_request}.yml`** — adapted
    from cascade's own templates, reworded for pharos's actual services and
