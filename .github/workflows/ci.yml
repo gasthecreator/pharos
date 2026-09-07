@@ -54,7 +54,7 @@ jobs:
       # generate_certs.sh needs `keytool` (to build Cassandra/Kafka's JKS
       # keystores/truststores) -- ubuntu-latest doesn't guarantee a JDK on
       # PATH without this.
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
