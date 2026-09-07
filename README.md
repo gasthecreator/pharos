@@ -141,6 +141,31 @@ curl -X POST http://localhost:8080/api/v1/adverse-events \
 
 Add `--memory` to any `pharos-cli` command to try it with built-in sample data, no Docker (and no `--ca-cert`) required.
 
+### Or run the published image, no local build needed
+
+Every service publishes a signed image to GHCR
+(`.github/workflows/publish-image.yml`, triggered by a `v*` tag push or
+manually via `workflow_dispatch`) — `ghcr.io/gasthecreator/pharos-{ingestion,consumer,edge,cli,dashboard}`,
+tagged `:<short-sha>` per build and additionally `:<version>`/`:latest` on
+a tagged release. Each image is keylessly signed (cosign + GitHub Actions
+OIDC, no private key material) with SBOM and SLSA provenance attached:
+
+```bash
+docker run --rm ghcr.io/gasthecreator/pharos-cli:b499794 \
+  query event SITE-DEMO-NG:1758... --memory
+
+# Verify the signature before trusting it, the same way you'd verify any
+# supply-chain-sensitive image:
+cosign verify ghcr.io/gasthecreator/pharos-cli:b499794 \
+  --certificate-identity-regexp 'https://github.com/gasthecreator/pharos/.github/workflows/publish-image.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+`:b499794` is one real, currently-published tag — check the
+[Packages page](https://github.com/gasthecreator/pharos/pkgs/container/pharos-cli)
+for the current one rather than assuming this tag stays live forever, since
+per-commit tags accumulate rather than move.
+
 ## How this was actually verified
 
 Every one of the four core challenges is tested against real Cassandra and real Kafka — not mocks — including dedicated fault-injection tests (`internal/faultinjection`) for a total network partition, a partition healing *asymmetrically* (Central Ingestion finishes a write but the edge never sees the response, forcing a retry of an already-completed write), and out-of-order delivery.
