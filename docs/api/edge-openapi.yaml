@@ -200,7 +200,7 @@ components:
           enum: [AdverseEvent]
         identifier:
           type: array
-          description: Populated by Central Ingestion with the idempotency key on ingest — omit when submitting.
+          description: Populated by the edge collector with the idempotency key at capture time (see CaptureResponse.idempotency_key) — omit when submitting.
           items:
             type: object
             properties:
@@ -210,6 +210,8 @@ components:
                 type: string
         actuality:
           type: string
+          enum: [actual]
+          description: Central Ingestion's validation rejects any value other than "actual" (no other FHIR AdverseEvent.actuality value is in scope for this project).
           example: actual
         event:
           $ref: "#/components/schemas/CodeableConcept"
@@ -226,7 +228,9 @@ components:
         seriousness:
           $ref: "#/components/schemas/CodeableConcept"
         severity:
-          $ref: "#/components/schemas/CodeableConcept"
+          allOf:
+            - $ref: "#/components/schemas/CodeableConcept"
+          description: 'Central Ingestion validates `coding[].code` (or `text`, as a fallback) case-insensitively against exactly one of "mild", "moderate", "severe" — any other value is rejected.'
         outcome:
           $ref: "#/components/schemas/CodeableConcept"
         study:

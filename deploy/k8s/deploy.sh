@@ -52,6 +52,7 @@ log "Creating pharos-tls Secret from generated certs"
 kubectl create secret generic pharos-tls -n "${NAMESPACE}" \
   --from-file=ca-cert.pem="${CERT_DIR}/ca-cert.pem" \
   --from-file=cassandra-keystore.jks="${CERT_DIR}/cassandra-keystore.jks" \
+  --from-file=cassandra-truststore.jks="${CERT_DIR}/cassandra-truststore.jks" \
   --from-file=kafka-keystore.jks="${CERT_DIR}/kafka-keystore.jks" \
   --from-file=kafka-truststore.jks="${CERT_DIR}/kafka-truststore.jks" \
   --from-file=kafka-client-ssl.properties="${CERT_DIR}/kafka-client-ssl.properties" \

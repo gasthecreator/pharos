@@ -40,6 +40,174 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-09-06] Claude Code: Fourth-pass audit — 3 parallel deep-dive agents, real bugs found, one self-inflicted incident during verification
+
+**Author:** Claude Code
+
+**What:** Gideon asked for a genuinely more thorough audit than the first
+three passes, specifically because each prior pass had found things the
+previous one missed. Rather than repeat the same single-pass-by-me
+methodology, ran three parallel, independent research agents, each with a
+narrow, non-overlapping mandate and instructed to verify every specific
+claim against actual current code rather than trust any doc. Real findings,
+grouped by area:
+
+**OpenAPI specs (`docs/api/*.yaml`) vs. actual routes:**
+1. `edge-openapi.yaml`'s `AdverseEvent.identifier` field said Central
+   Ingestion populates the idempotency key — wrong, it's the edge
+   collector, at capture time (`internal/edge/sqlite_store.go`'s
+   `SetIdempotencyKey` is the only call site), and this directly
+   contradicted the same file's own correct `CaptureResponse.idempotency_key`
+   description 60 lines earlier. Fixed.
+2. `ingestion-openapi.yaml`'s `POST /api/v1/events` documented only 5 of
+   ~8 real response codes — missing 3 distinct 400 cases, 401 (the route
+   is behind `auth.RequireAPIKey` but this was never documented), 403
+   (site-ID mismatch), 405 (wrong method), and 500 (rate-limiter internal
+   error). `POST /api/v1/dlq/{key}/replay` was missing 401 for the same
+   reason. Fixed both, added an `ErrorResponse` schema for the new codes.
+3. The spec's global `security: siteAuth` requirement was never scoped
+   away from `/healthz`/`/metrics`, which are unconditionally
+   unauthenticated in actual code — per OpenAPI 3.0 semantics this made
+   the spec wrong about those two paths. Added `security: []` overrides.
+4. `actuality` had no `enum:` despite code rejecting anything but
+   `"actual"`; `severity`'s `CodeableConcept` carried no note that
+   `internal/model.isValidSeverity` only accepts mild/moderate/severe.
+   Fixed both.
+5. The auth-disable description named only `--enable-auth=false`, missing
+   that `--use-memory-store` disables it unconditionally too. Fixed.
+6. A dangling citation ("see README.md" for why port 8091 was chosen) —
+   README.md never explains this; the real reasoning is in WORKLOG.md.
+   Fixed the citation.
+
+**`PLAN.md`/`README.md` factual claims vs. actual code:**
+7. `PLAN.md`'s own header said `**Status:** pre-code` and
+   `Last updated: 2026-08-29`, despite dozens of "Done 2026-09-06" entries
+   below it — a direct violation of the file's own stated rule ("do not
+   let it go stale"). Fixed.
+8. Three separate places in `PLAN.md` described gaps as currently open
+   that later "audit remediation" work had already closed, with no
+   follow-up note added at the time: Slice 6's metrics cross-service-leak
+   limitation (closed by the `internal/wire`/`internal/metrics/*metrics`
+   split), Slice 11's `event_outbox` exclusion from archival (closed by
+   `RunOutboxPrune`), and Slice 20's claim that `LateArrivalAudit` has no
+   Cassandra persistence (closed by `consumer_late_arrival_audits` +
+   `SaveLateArrivalAudit`/`ListLateArrivalAudits`). All three are
+   genuinely fixed in code and now say so in `PLAN.md` too — this was the
+   single most consequential category of finding, since it made the
+   product look less finished than it actually is to anyone reading
+   `PLAN.md` as the source of truth.
+9. `README.md`'s Tech Stack section said `segmentio/kafka-go` and `gocql`
+   were the only dependencies "of note," omitting `modernc.org/sqlite`
+   (the edge collector's entire durability model), `prometheus/client_golang`,
+   `redis/go-redis` (Slice 19), and `pgregory.net/rapid` (Slice 22). Fixed.
+10. README's "Repo layout" omitted `scripts/`, `loadtest/`, `observability/`,
+    `nginx/`, and `kafka/` — all real, substantial, and referenced
+    elsewhere in the same README. Added all five (confirmed `nginx/`
+    actually fronts `pharos-ingestion`, not `pharos-consumer`, before
+    writing its description).
+11. README's `make build` comment omitted `pharos-dashboard`; its
+    architecture diagram's Cassandra table list omitted `events_recent`
+    (added Slice 21). Both fixed.
+12. README's docker-compose walkthrough said "wait for all eight to
+    report healthy" after a command listing 10 services — clarified
+    which are the 8 with healthchecks (confirmed live: prometheus has
+    one, grafana doesn't).
+
+**`deploy/`/`scripts/`/`docker-compose.yml` vs. actual code:**
+13. **Real, deploy-breaking bug**: `scripts/generate_certs.sh` now
+    unconditionally sets `internode_encryption: all` +
+    `truststore: /tls/cassandra-truststore.jks` in every generated
+    `cassandra-N.yaml` (confirmed live by regenerating into a scratch
+    dir). `deploy/k8s/generate_k8s_certs.sh` calls this same script, but
+    `deploy/k8s/deploy.sh`'s `pharos-tls` Secret creation and
+    `deploy/k8s/01-cassandra.yaml`'s two `tls` volume mounts (cassandra-us
+    and cassandra-eu) never included `cassandra-truststore.jks` —
+    Cassandra's own SSL context init would fail to find it at startup on
+    a genuinely fresh `deploy/k8s/deploy.sh` run. `PLAN.md`/
+    `ARCHITECTURE_PROPOSALS.md` only ever named Kafka's K8s manifests as
+    exempted from the internode-TLS re-enablement; Cassandra's K8s config
+    silently inherited the new requirement because it's generated by the
+    same script, and nobody had updated the Secret. This went undetected
+    because the actual on-disk `deploy/k8s/certs/` on this machine was a
+    stale pre-remediation artifact that `deploy.sh` skips regenerating
+    when it already exists — verification against cached certs never
+    exercised the new requirement. Fixed: added `cassandra-truststore.jks`
+    to both the Secret and both volume mounts, and verified the generated
+    `cassandra-N.yaml`'s truststore path (`/tls/cassandra-truststore.jks`)
+    matches the mount path exactly.
+14. `CONTRIBUTING.md`'s "before opening a PR" snippet and the `Makefile`'s
+    `up` target both used a bare `docker compose up -d`, starting
+    MirrorMaker 2 concurrently with everything else — the exact ordering
+    that `docker-compose.yml`'s own comments and
+    `.github/workflows/ci.yml` document as having caused real OOM kills
+    (MM2 busy-loops against nonexistent topics, piling CPU contention on
+    top of 10 JVMs' own startup). `CONTRIBUTING.md` also never mentioned
+    running `./scripts/generate_certs.sh` first, despite every
+    healthcheck depending on it. Fixed both to match the safe order
+    `scripts/demo.sh`/CI already use (certs → core services → wait
+    healthy → topics → MirrorMaker 2 last).
+
+**How:** Three `Explore` agents ran in parallel and in the background, each
+briefed with the same context (this is a fourth pass after three prior
+ones each missed real things, be exhaustive and skeptical, verify every
+claim against actual code, report "no discrepancy found" explicitly for
+what was checked and clean) and a disjoint scope: OpenAPI specs + CLI docs,
+deploy/scripts/docker-compose, and PLAN.md/README.md's own factual claims.
+Splitting by area rather than doing one more single pass gave each agent
+enough budget to actually read full files end-to-end rather than
+sampling — this is what surfaced the K8s truststore bug and the three
+stale-PLAN.md-gap-claims, none of which three prior single-pass audits had
+caught.
+
+**A real mistake made and fixed during this same pass's own verification,
+recorded here rather than quietly corrected — the whole reason this
+project's worklog exists**: verifying the new `make up` target for real
+(not just `make -n up`) against the actual running dev cluster ran
+`./scripts/generate_certs.sh` unconditionally as `up`'s first step. That
+script unconditionally does `rm -rf "${CERT_DIR}"` and regenerates a brand
+new CA — while `pharos-cassandra-1..4`/`pharos-kafka-1..4` were live and
+had loaded the *old* CA into memory at their own boot two hours earlier.
+Confirmed live: `openssl s_client -connect localhost:9042 -CAfile
+certs/ca-cert.pem` returned `verify error:num=19:self-signed certificate
+in certificate chain` against the still-running `pharos-cassandra-1` right
+after — the fresh CA on disk no longer trusted what the live cluster was
+actually presenting. Fixed two ways: (1) `make up` now only runs
+`generate_certs.sh` when `certs/ca-cert.pem` doesn't already exist,
+printing an explicit warning pointing at this incident if a caller wants
+to force regeneration against a live cluster instead of silently doing the
+unsafe thing; (2) recovered the actual disrupted local cluster with
+`docker compose down -v` (this session's cluster only ever held synthetic
+demo data, confirmed before wiping) and a fresh `make up`, then
+re-confirmed `Verify return code: 0` against the rebuilt, self-consistent
+cluster. The `up`→`down -v`→`up` cycle also surfaced a separate, unrelated
+Cassandra restart quirk (`cassandra-2` failed to rejoin with "node already
+exists" after a `down` without `-v`, a known IP/gossip-state collision on
+container recreation, not a certs issue) — resolved by the same `-v` wipe,
+not investigated further since it's an orthogonal, known category of
+issue with restarting a multi-node Cassandra cluster's containers without
+also clearing their persisted state.
+
+**Files/modules touched:** `docs/api/{edge,ingestion}-openapi.yaml`,
+`PLAN.md`, `README.md`, `deploy/k8s/{01-cassandra.yaml,deploy.sh}`,
+`Makefile`, `CONTRIBUTING.md`.
+
+**Tests added/updated:** None (docs/config/spec accuracy, not behavior) —
+verified via live checks instead: a scratch cert regeneration confirming
+the truststore path match, `make -n up`/`make -n test` dry-runs plus an
+actual full `make up` run to a healthy cluster, `yaml.safe_load` on both
+edited OpenAPI specs, and the TLS-trust `openssl s_client` check described
+above both before and after the cluster recovery.
+
+**Follow-ups / left open:** The K8s truststore fix has not been verified
+against a real `kind` cluster end-to-end (this project's own prior
+attempts at full-scale K8s runs into this host's CPU ceiling, per Slice
+17's addendum) — it's verified by matching the generated file's expected
+path against the manifest's mount path exactly, not by a live
+`kubectl apply`. The Cassandra container-recreation "node already exists"
+quirk noted above is a known category of issue with this topology and
+wasn't itself fixed (worked around via a full data wipe, appropriate for
+this session's synthetic data but not a real remediation).
+
 ## [2026-09-06] Claude Code: Product-hardening patterns adopted from cascade-operator
 
 **Author:** Claude Code
