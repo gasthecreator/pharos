@@ -54,6 +54,12 @@ statically validated only.
   workflow; per-package coverage summary and `go mod tidy` drift check in CI.
 - Kubernetes `NetworkPolicy` (default-deny plus explicit allows) and
   `PodDisruptionBudget` manifests.
+- Go fuzz tests for the idempotency-key parser/constructor, event validation,
+  schema-version dispatch, the batch envelope, the HTTP intake handler and the
+  watermark tracker (with seed corpora); micro-benchmarks for validation,
+  idempotency keys, the rate limiter, the in-memory outbox and the intake path;
+  table-driven failure-path tests for the sweeper, consumer engine, edge
+  forwarder loop and in-memory outbox.
 
 ### Changed
 
