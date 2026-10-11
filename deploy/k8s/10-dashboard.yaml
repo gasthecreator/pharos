@@ -39,10 +39,25 @@ spec:
       labels:
         app: pharos-dashboard
     spec:
+      securityContext:
+        # Non-root, matching the image's numeric USER 65532 (deploy/docker/).
+        # fsGroup makes mounted volumes (PVC, TLS Secret) group-readable by
+        # that user without opening them to world.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: pharos-dashboard
           image: pharos-dashboard:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - "--port=8092"
             - "--cassandra-hosts=cassandra-us-0.cassandra.pharos.svc.cluster.local"
@@ -88,6 +103,9 @@ spec:
         - name: tls
           secret:
             secretName: pharos-tls
+            # Group-readable only (via fsGroup); the ingestion private key
+            # must not be world-readable inside the pod.
+            defaultMode: 0440
             items:
               - key: ca-cert.pem
                 path: ca-cert.pem

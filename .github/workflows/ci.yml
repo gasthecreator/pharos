@@ -45,6 +45,51 @@ jobs:
       - name: go build
         run: go build ./...
 
+  # Static + build-time checks for the hardening in deploy/ (non-root images,
+  # schema-valid manifests). Runs on the GitHub runner because these need a
+  # Docker daemon; scratch images have no shell, so `docker run` cannot
+  # inspect them from the inside -- the image config is asserted instead.
+  container-hardening:
+    name: Container hardening
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.25"
+
+      - name: Dockerfile base images are digest-pinned
+        run: |
+          if grep -n '^FROM ' deploy/docker/Dockerfile.* | grep -v 'scratch' | grep -v '@sha256:'; then
+            echo "FROM line above is not pinned by digest"; exit 1
+          fi
+
+      - name: Build every image and assert it runs as non-root
+        run: |
+          for svc in ingestion consumer edge cli dashboard; do
+            docker build -q -f "deploy/docker/Dockerfile.${svc}" -t "pharos-${svc}:ci" .
+            user=$(docker inspect --format '{{.Config.User}}' "pharos-${svc}:ci")
+            echo "pharos-${svc}: USER=${user}"
+            if [ "$user" != "65532:65532" ]; then
+              echo "pharos-${svc} does not run as 65532:65532"; exit 1
+            fi
+          done
+
+      - name: Validate Kubernetes manifests (kubeconform)
+        run: |
+          go install github.com/yannh/kubeconform/cmd/kubeconform@v0.7.0
+          "$(go env GOPATH)/bin/kubeconform" -strict -summary -kubernetes-version 1.30.0 deploy/k8s/*.yaml
+
+      - name: Pod securityContext is set on every Go-service workload
+        run: |
+          for f in 05-ingestion 06-consumer 07-edge 09-provision-demo-key-job 10-dashboard; do
+            for k in "runAsNonRoot: true" "allowPrivilegeEscalation: false" "readOnlyRootFilesystem: true" "RuntimeDefault"; do
+              grep -q "$k" "deploy/k8s/${f}.yaml" || { echo "deploy/k8s/${f}.yaml missing: $k"; exit 1; }
+            done
+          done
+
   test:
     name: Test against real Cassandra + Kafka
     runs-on: ubuntu-latest

@@ -119,5 +119,13 @@ log "Deploying pharos-dashboard"
 kubectl apply -f "${K8S_DIR}/10-dashboard.yaml"
 kubectl rollout status deployment/pharos-dashboard -n "${NAMESPACE}" --timeout=120s
 
+log "Applying NetworkPolicies and PodDisruptionBudgets"
+# Applied last, after every Job and rollout: each allow-rule below was
+# derived from these workloads' actual connections, but a default-deny that
+# lands mid-deploy would make a mistake look like a flaky startup. On a CNI
+# that does not enforce NetworkPolicy these are accepted and inert (see
+# deploy/k8s/README.md "NetworkPolicy").
+kubectl apply -f "${K8S_DIR}/11-network-policies.yaml" -f "${K8S_DIR}/12-pod-disruption-budgets.yaml"
+
 log "Done. kubectl get pods -n ${NAMESPACE}"
 kubectl get pods -n "${NAMESPACE}"

@@ -48,10 +48,25 @@ spec:
       labels:
         app: pharos-edge-site-k8s-demo
     spec:
+      securityContext:
+        # Non-root, matching the image's numeric USER 65532 (deploy/docker/).
+        # fsGroup makes mounted volumes (PVC, TLS Secret) group-readable by
+        # that user without opening them to world.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: pharos-edge
           image: pharos-edge:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - "--site-id=SITE-K8S-DEMO"
             - "--port=8080"
@@ -99,6 +114,9 @@ spec:
         - name: tls
           secret:
             secretName: pharos-tls
+            # Group-readable only (via fsGroup); the ingestion private key
+            # must not be world-readable inside the pod.
+            defaultMode: 0440
             items:
               - key: ca-cert.pem
                 path: ca-cert.pem

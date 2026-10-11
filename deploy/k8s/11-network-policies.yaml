@@ -1,0 +1,419 @@
+# Network isolation for the pharos namespace (hardening pass).
+#
+# Default-deny ingress AND egress for every pod, then explicit allows
+# derived from the actual connections each manifest in this directory makes
+# (flags/args in 05-07,09,10; mm2.properties; the Cassandra/Kafka listener
+# ports in 01/02; the scrape targets in 08).
+#
+# REQUIRES A CNI THAT ENFORCES NetworkPolicy. On a CNI that does not, these
+# objects are accepted by the API server and silently do nothing. This
+# repo's own earlier K8s work used a stock kind cluster; whether that
+# cluster's default CNI enforces policy has NOT been verified here (see
+# deploy/k8s/README.md "NetworkPolicy"). Kubelet probes originate from the
+# node and are not blocked by pod-level policy on conforming CNIs.
+#
+# Pod labels used (app=...): cassandra, kafka-a, kafka-b, mirrormaker,
+# pharos-ingestion, pharos-consumer, pharos-edge-site-k8s-demo,
+# pharos-dashboard, prometheus, and the one-shot Jobs pharos-migrations,
+# pharos-kafka-topics, pharos-provision-demo-key.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: pharos
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: pharos
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+# ---- Cassandra: CQL from the apps/jobs, internode among its own pods ----
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cassandra
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: cassandra
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: pharos-ingestion
+        - podSelector:
+            matchLabels:
+              app: pharos-consumer
+        - podSelector:
+            matchLabels:
+              app: pharos-dashboard
+        - podSelector:
+            matchLabels:
+              app: pharos-migrations
+        - podSelector:
+            matchLabels:
+              app: pharos-provision-demo-key
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 9042 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 7000 }
+        - { protocol: TCP, port: 7001 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 7000 }
+        - { protocol: TCP, port: 7001 }
+        - { protocol: TCP, port: 9042 }
+# ---- kafka-a: client (SSL) + internal listener + KRaft controller ----
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-a
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka-a
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: kafka-a
+      ports:
+        - { protocol: TCP, port: 19092 }
+        - { protocol: TCP, port: 9092 }
+        - { protocol: TCP, port: 9093 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: pharos-ingestion
+        - podSelector:
+            matchLabels:
+              app: pharos-consumer
+        - podSelector:
+            matchLabels:
+              app: pharos-kafka-topics
+        - podSelector:
+            matchLabels:
+              app: mirrormaker
+      ports:
+        - { protocol: TCP, port: 9092 }
+        - { protocol: TCP, port: 19092 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka-a
+      ports:
+        - { protocol: TCP, port: 19092 }
+        - { protocol: TCP, port: 9092 }
+        - { protocol: TCP, port: 9093 }
+# ---- kafka-b: client (SSL) + internal listener + KRaft controller ----
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kafka-b
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: kafka-b
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: kafka-b
+      ports:
+        - { protocol: TCP, port: 19092 }
+        - { protocol: TCP, port: 9092 }
+        - { protocol: TCP, port: 9093 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: mirrormaker
+      ports:
+        - { protocol: TCP, port: 9092 }
+        - { protocol: TCP, port: 19092 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka-b
+      ports:
+        - { protocol: TCP, port: 19092 }
+        - { protocol: TCP, port: 9092 }
+        - { protocol: TCP, port: 9093 }
+# ---- Application tier ----
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-ingestion
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-ingestion
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: pharos-edge-site-k8s-demo
+        - podSelector:
+            matchLabels:
+              app: pharos-dashboard
+        - podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - { protocol: TCP, port: 8443 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 9042 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka-a
+      ports:
+        - { protocol: TCP, port: 9092 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-consumer
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-consumer
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+        - podSelector:
+            matchLabels:
+              app: pharos-dashboard
+      ports:
+        - { protocol: TCP, port: 9091 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 9042 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka-a
+      ports:
+        - { protocol: TCP, port: 9092 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-edge
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-edge-site-k8s-demo
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pharos-ingestion
+      ports:
+        - { protocol: TCP, port: 8443 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-dashboard
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-dashboard
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 9042 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pharos-ingestion
+      ports:
+        - { protocol: TCP, port: 8443 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pharos-consumer
+      ports:
+        - { protocol: TCP, port: 9091 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: prometheus
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pharos-ingestion
+      ports:
+        - { protocol: TCP, port: 8443 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pharos-consumer
+      ports:
+        - { protocol: TCP, port: 9091 }
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pharos-edge-site-k8s-demo
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mirrormaker
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: mirrormaker
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka-a
+        - podSelector:
+            matchLabels:
+              app: kafka-b
+      ports:
+        - { protocol: TCP, port: 19092 }
+        - { protocol: TCP, port: 9092 }
+# ---- One-shot Jobs ----
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-migrations
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-migrations
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 9042 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-kafka-topics
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-kafka-topics
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: kafka-a
+      ports:
+        - { protocol: TCP, port: 9092 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pharos-provision-demo-key
+  namespace: pharos
+spec:
+  podSelector:
+    matchLabels:
+      app: pharos-provision-demo-key
+  policyTypes: ["Ingress", "Egress"]
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: cassandra
+      ports:
+        - { protocol: TCP, port: 9042 }

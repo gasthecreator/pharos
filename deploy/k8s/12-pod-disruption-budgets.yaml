@@ -1,0 +1,52 @@
+# PodDisruptionBudgets (hardening pass): voluntary disruptions (node drain,
+# cluster upgrade) may take down at most one pod of each replicated
+# workload at a time. Single-replica workloads (cassandra-eu, kafka-b,
+# prometheus, mirrormaker, edge, dashboard) deliberately have NO budget: a
+# minAvailable of 1 on a one-pod workload would block every drain forever.
+# pharos-ingestion and pharos-consumer currently run 1 replica, where
+# maxUnavailable: 1 permits disruption; the budget starts protecting them
+# the moment they are scaled out.
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cassandra
+  namespace: pharos
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: cassandra
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: kafka-a
+  namespace: pharos
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: kafka-a
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pharos-ingestion
+  namespace: pharos
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: pharos-ingestion
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pharos-consumer
+  namespace: pharos
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: pharos-consumer

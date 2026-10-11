@@ -9,6 +9,9 @@
 # EXISTS" ambiguity on which replication strategy wins first, exactly the
 # same reasoning migrations/001_init_schema.cql's own header comment gives
 # for CI).
+# Note: these two Jobs run the upstream cassandra:5.0 and apache/kafka:3.8.0
+# images, whose non-root behavior has not been verified here, so unlike the
+# Go services they keep the images' default user (see deploy/k8s/README.md).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -17,6 +20,9 @@ metadata:
 spec:
   backoffLimit: 3
   template:
+    metadata:
+      labels:
+        app: pharos-migrations
     spec:
       restartPolicy: OnFailure
       containers:
@@ -55,6 +61,9 @@ metadata:
 spec:
   backoffLimit: 3
   template:
+    metadata:
+      labels:
+        app: pharos-kafka-topics
     spec:
       restartPolicy: OnFailure
       containers:
