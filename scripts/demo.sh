@@ -64,7 +64,7 @@ fi
 # deliberately brought up *last*, after Kafka topics exist -- starting it
 # concurrently with everything else has caused real, repeated OOM kills on
 # this host (docker-compose.yml's Kafka section comment, and
-# ARCHITECTURE_PROPOSALS.md's Slice 14 addendum #3): before any topic
+# docs/history/ARCHITECTURE_PROPOSALS.md's Slice 14 addendum #3): before any topic
 # exists, MM2 busy-loops discovery/retry, piling CPU contention on top of
 # 10 other JVMs' own startup work, which delays GC long enough for RSS to
 # balloon past the Docker VM's ceiling. This mirrors .github/workflows/ci.yml

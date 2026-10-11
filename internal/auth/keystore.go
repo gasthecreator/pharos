@@ -1,5 +1,5 @@
 // Package auth implements per-site API key authentication for Central
-// Ingestion (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+// Ingestion (§2.1, §2.2, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
 //
 // A site proves its identity by sending its own key alongside the site_id
 // it's claiming (X-Site-ID + X-API-Key), rather than the server needing a

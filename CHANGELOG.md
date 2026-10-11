@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Full reasoning, live-verification evidence, and implementation detail for
-every item below live in [`WORKLOG.md`](WORKLOG.md) and are tracked in
+every item below live in [`docs/history/WORKLOG.md`](docs/history/WORKLOG.md) and are tracked in
 [`PLAN.md`](PLAN.md)'s own Slice list, the source of truth for scope.
 
 ## [Unreleased]

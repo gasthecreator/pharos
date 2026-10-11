@@ -32,7 +32,7 @@ type EngineConfig struct {
 	IdleTimeout       time.Duration
 	PollTimeout       time.Duration
 	// TLS, if set, encrypts and authenticates the connection to every
-	// broker against this project's own CA (§2.4, ARCHITECTURE_PROPOSALS.md
+	// broker against this project's own CA (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md
 	// "Slice 15: Auth & TLS"). Nil means plaintext.
 	TLS *tlsutil.ClientConfig
 }

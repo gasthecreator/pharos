@@ -38,7 +38,7 @@ func drainForwarder(t *testing.T, ctx context.Context, store *edge.SQLiteStore, 
 }
 
 // TestEdgeInstanceLoss_DiskReplacementDoesNotDropNewEvents is the regression
-// test for the Slice 8 bug (ARCHITECTURE_PROPOSALS.md "Idempotency Key
+// test for the Slice 8 bug (docs/history/ARCHITECTURE_PROPOSALS.md "Idempotency Key
 // Resilience Across Edge Instance Loss"): a trial site's disk failing and
 // being replaced with the same --site-id produces a brand-new, empty edge
 // SQLite file. Before the fix, local_seq restarted at 1 in that fresh file,

@@ -116,7 +116,7 @@ func waitForDCGossipStatus(t *testing.T, wantDown bool, deadline time.Duration) 
 }
 
 // TestRegionalPartition_DcUsLocalQuorumSurvivesDcEuUnreachable is the
-// flagship fault-injection test for Slice 14 (ARCHITECTURE_PROPOSALS.md
+// flagship fault-injection test for Slice 14 (docs/history/ARCHITECTURE_PROPOSALS.md
 // "Multi-Region Cassandra + Kafka (Simulated)"): a real tc-induced network
 // partition cuts all traffic between dc-us and dc-eu's Cassandra containers,
 // and this proves the property PLAN.md's own Slice 7 reasoning was built
@@ -236,7 +236,7 @@ func TestRegionalPartition_DcUsLocalQuorumSurvivesDcEuUnreachable(t *testing.T) 
 	deadline := time.Now().Add(60 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		// Client encryption is on as of Slice 15 (§2.4, ARCHITECTURE_PROPOSALS.md
+		// Client encryption is on as of Slice 15 (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md
 		// "Slice 15: Auth & TLS") -- a plaintext cqlsh call against the CQL
 		// port would fail outright, same as the docker-compose healthchecks.
 		out, err := exec.Command("docker", "exec", "-i", "-e", "SSL_CERTFILE=/tls/ca-cert.pem", dcEUCassandraContainers[0], "cqlsh", "--ssl", "-e",

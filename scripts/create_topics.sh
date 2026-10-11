@@ -11,7 +11,7 @@ BOOTSTRAP_SERVER="${KAFKA_BOOTSTRAP_SERVER:-localhost:9092}"
 echo "Configuring Pharos Kafka topics on ${BOOTSTRAP_SERVER}..."
 
 # In Docker or local environment, locate kafka-topics and kafka-configs binaries.
-# Cluster A's INTERNAL/EXTERNAL listeners are SSL-only (§2.4, ARCHITECTURE_PROPOSALS.md
+# Cluster A's INTERNAL/EXTERNAL listeners are SSL-only (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md
 # "Slice 15: Auth & TLS"), so every invocation needs --command-config pointing
 # at a client properties file trusting the project CA -- the container path
 # when running via docker exec (where scripts/generate_certs.sh's output is

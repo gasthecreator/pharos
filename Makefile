@@ -51,7 +51,7 @@ clean:
 # Bringing every container up at once with a bare `docker compose up -d`
 # starts MirrorMaker 2 before any Kafka topic exists, which makes it
 # busy-loop discovery/retry and has caused real OOM kills on this host
-# (docker-compose.yml's own Kafka section comment, ARCHITECTURE_PROPOSALS.md's
+# (docker-compose.yml's own Kafka section comment, docs/history/ARCHITECTURE_PROPOSALS.md's
 # Slice 14 addendum #3, and .github/workflows/ci.yml's identical sequencing).
 # This target mirrors CI's/scripts/demo.sh's safe order instead: certs,
 # then Cassandra+Kafka+Redis+observability, then wait for healthy, then

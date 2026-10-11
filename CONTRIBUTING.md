@@ -26,17 +26,25 @@ a bug in the code or the doc — flag it, don't silently reconcile it.
 
 `PLAN.md` isn't edited directly to match new code. If building something
 surfaces a reason to deviate from or extend what's already decided, write
-the proposal into [`ARCHITECTURE_PROPOSALS.md`](ARCHITECTURE_PROPOSALS.md)
+the proposal into [`docs/history/ARCHITECTURE_PROPOSALS.md`](docs/history/ARCHITECTURE_PROPOSALS.md)
 instead, with the actual reasoning (what you ran into, what alternatives you
 considered, why this one wins) — not just the conclusion. That gets reviewed
 and either folded into `PLAN.md` as `Resolved: Approved`, or left as
 `Resolved: Rejected` with reasoning. Implementation happens after that
 review, not before it.
 
+## Recording decisions (ADRs)
+
+Write an ADR in [`docs/adr/`](docs/adr/) for any significant or hard-to-reverse
+decision: copy [`0000-template.md`](docs/adr/0000-template.md), take the next
+number, and add it to the index in [`docs/adr/README.md`](docs/adr/README.md).
+The proposal-review protocol above stays the mechanism for deciding;
+the ADR is the short, permanent record of what was decided and why.
+
 ## Logging the work
 
 Every implementation session — what was built, why, how, what was tested —
-gets an entry in [`WORKLOG.md`](WORKLOG.md), regardless of who or what did
+gets an entry in [`docs/history/WORKLOG.md`](docs/history/WORKLOG.md), regardless of who or what did
 the work. Treat it like an engineering log at an actual job: if it's not
 logged there, it didn't happen. Entries are dated and left in permanently,
 including the ones that documented a design going back to the drawing board
@@ -65,7 +73,7 @@ worked on my machine once."
 A slice isn't done when the code compiles or a design looks right on paper —
 it's done when it's verified against real infrastructure (real Cassandra,
 real Kafka, not mocks) and the result of that verification is what's
-described in `PLAN.md` and `WORKLOG.md`. Several entries in `WORKLOG.md`
+described in `PLAN.md` and `docs/history/WORKLOG.md`. Several entries in `docs/history/WORKLOG.md`
 exist specifically because something that looked correct in review turned
 out to have a real bug once checked against live infrastructure — that
 pattern is the point, not an embarrassment to avoid repeating.

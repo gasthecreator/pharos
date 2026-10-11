@@ -727,7 +727,7 @@ func handleArchive(ctx context.Context, args []string, hosts string, port int, k
 }
 
 // handleSite implements the "site" command family for per-site API key
-// management (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+// management (§2.1, §2.2, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
 func handleSite(ctx context.Context, args []string, hosts string, port int, keyspace string, caCert string) {
 	if len(args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: pharos-cli site create-key <site_id>\n       pharos-cli site revoke-key <site_id>\n")

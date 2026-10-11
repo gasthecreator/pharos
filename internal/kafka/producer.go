@@ -39,7 +39,7 @@ type Config struct {
 	WriteTimeout    time.Duration
 	AllowAutoCreate bool
 	// TLS, if set, encrypts and authenticates the connection to every
-	// broker against this project's own CA (§2.4, ARCHITECTURE_PROPOSALS.md
+	// broker against this project's own CA (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md
 	// "Slice 15: Auth & TLS"). Nil means plaintext.
 	TLS *tlsutil.ClientConfig
 }
@@ -52,7 +52,7 @@ func DefaultConfig(brokers []string) Config {
 	var tlsCfg *tlsutil.ClientConfig
 	if caCert := tlsutil.DefaultCACertPath(); caCert != "" {
 		// Real Kafka's client-facing (EXTERNAL) listener requires TLS
-		// (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- see
+		// (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- see
 		// dedup.DefaultCassandraConfig's docs for why this is a default,
 		// not just an opt-in.
 		tlsCfg = &tlsutil.ClientConfig{CACertPath: caCert, ServerName: "localhost"}

@@ -2,7 +2,7 @@
 
 This is a factual account of what each Pharos component can read, what it
 can write, and where its trust boundaries actually are — written the same
-way this project's `WORKLOG.md` entries are: state what was checked, not
+way this project's `docs/history/WORKLOG.md` entries are: state what was checked, not
 what "should" be true. See [SECURITY.md](../SECURITY.md) for the current
 gap list and how to report a vulnerability; this document is about design,
 not process.

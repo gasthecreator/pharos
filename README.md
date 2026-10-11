@@ -49,7 +49,7 @@ them (Slices 7, 14). Bring MirrorMaker 2 up *after* Cassandra/Kafka are
 healthy and topics exist, not concurrently with everything else — starting
 it before any topic exists makes it busy-loop discovery/retry, which has
 caused real OOM kills on a memory-constrained host (see `docker-compose.yml`'s
-own comments and `ARCHITECTURE_PROPOSALS.md`'s Slice 14 addendum).
+own comments and `docs/history/ARCHITECTURE_PROPOSALS.md`'s Slice 14 addendum).
 
 Every Cassandra/Kafka client connection and Central Ingestion's own HTTP
 listener require TLS by default (Slice 15) — `scripts/generate_certs.sh`
@@ -178,7 +178,7 @@ Structured design review across the build caught real correctness bugs before th
 - A Cassandra secondary index for dead-letter lookups that contradicted a partition-key-first modeling principle the project had already established for its other query tables one slice earlier.
 - A Kafka retention policy that was fully documented and reasoned through — but, verified by checking the live broker directly rather than re-reading the code, had never actually been applied.
 
-Every decision, review finding, and fix is in `WORKLOG.md` and `ARCHITECTURE_PROPOSALS.md` — dated, attributed, and left in rather than cleaned up after the fact, on purpose.
+Every decision, review finding, and fix is in `docs/history/WORKLOG.md` and `docs/history/ARCHITECTURE_PROPOSALS.md` — dated, attributed, and left in rather than cleaned up after the fact, on purpose.
 
 ## What's here vs. what's next
 
@@ -204,17 +204,25 @@ loadtest/               k6 load-test script and its own README (Slice 16)
 observability/          Prometheus scrape config + Grafana datasource/dashboard provisioning
 nginx/                  TCP-passthrough load balancer in front of 2+ pharos-ingestion instances (Slice 19)
 kafka/                  MirrorMaker 2 config for the dc-us/dc-eu replication topology
-docs/api/               OpenAPI specs for the edge and Central Ingestion HTTP APIs
-docs/security-threat-model.md   Per-component trust boundaries and known gaps
-docs/benchmark-results.md       Real load-test numbers (Slice 16) and how to reproduce them
-PLAN.md                 Living architecture doc — source of truth for every design decision
-ARCHITECTURE_PROPOSALS.md   Proposal/review trail for every non-trivial design change
-WORKLOG.md              Dated log of every implementation session, by whoever did it
-CHANGELOG.md            What shipped, in product terms — see WORKLOG.md for the full story
-CONTRIBUTING.md         Branch/PR/proposal-review workflow
+docs/                   Architecture decisions, API specs, threat model, benchmarks, project history (see Documentation map)
+PLAN.md                 Roadmap and status: source of truth for scope and every slice's outcome
+CHANGELOG.md            What shipped, in product terms
+CONTRIBUTING.md         Branch/PR/ADR/proposal-review workflow
 CODE_OF_CONDUCT.md      Contributor Covenant
 SECURITY.md             Security policy and known, deliberate gaps
 ```
+
+## Documentation map
+
+| If you want to know... | Read |
+|---|---|
+| Why a design decision was made, and what lost | [`docs/adr/`](docs/adr/) (index and template) |
+| What each service can access and where the trust boundaries are | [`docs/security-threat-model.md`](docs/security-threat-model.md) |
+| Real load-test numbers and how to reproduce them | [`docs/benchmark-results.md`](docs/benchmark-results.md), [`loadtest/README.md`](loadtest/README.md) |
+| The HTTP APIs | [`docs/api/`](docs/api/) (OpenAPI for the edge and Central Ingestion) |
+| How to deploy to Kubernetes | [`deploy/k8s/README.md`](deploy/k8s/README.md) |
+| What is built, what is deferred, and the roadmap | [`PLAN.md`](PLAN.md) |
+| The dated build log and the original proposal/review trail | [`docs/history/`](docs/history/) |
 
 ## License
 

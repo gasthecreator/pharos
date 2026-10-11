@@ -484,7 +484,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	// *different* site. Without this check, an authenticated site could
 	// submit events on another site's behalf just by putting a different
 	// site_id in the payload, defeating the whole point of authenticating
-	// per site (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+	// per site (§2.1, §2.2, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
 	if authenticatedSiteID, ok := auth.SiteIDFromContext(r.Context()); ok && authenticatedSiteID != siteID {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
@@ -629,7 +629,7 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Only the owning site may replay its own rejected event (§2.1, §2.2,
-	// ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- without this, any
+	// docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- without this, any
 	// authenticated site could replay any other site's DLQ record.
 	if authenticatedSiteID, ok := auth.SiteIDFromContext(r.Context()); ok && authenticatedSiteID != rec.SiteID {
 		w.Header().Set("Content-Type", "application/json")

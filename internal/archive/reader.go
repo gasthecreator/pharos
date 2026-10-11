@@ -82,7 +82,7 @@ func (r *Reader) GetEventsBySite(siteID string, minSeq int64) ([]*consumer.Canon
 // Since idempotency_key embeds site_id but the archive is physically laid
 // out by study_id, this scans every known study's archive for a matching
 // key -- slower than a hot-tier lookup, an accepted tradeoff for cold,
-// already-inactive data (see ARCHITECTURE_PROPOSALS.md's Slice 11 entry for
+// already-inactive data (see docs/history/ARCHITECTURE_PROPOSALS.md's Slice 11 entry for
 // why no secondary index was added to avoid this).
 func (r *Reader) GetEvent(idempotencyKey string) (*consumer.CanonicalRecord, error) {
 	studies, err := r.listArchivedStudies()

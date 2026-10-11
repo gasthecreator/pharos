@@ -113,7 +113,7 @@ jobs:
       # certs/ is gitignored (private keys must never be committed), so a
       # fresh checkout has none -- generate the project CA and every
       # service cert/keystore before anything mounts them (§2.4,
-      # ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+      # docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
       - name: Generate TLS materials
         run: ./scripts/generate_certs.sh
 
@@ -168,7 +168,7 @@ jobs:
           docker compose up -d mirrormaker
           sleep 15
 
-      # -p 1 serializes package execution (§2.4, ARCHITECTURE_PROPOSALS.md
+      # -p 1 serializes package execution (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md
       # "Slice 15: Auth & TLS" addendum): running every package's real
       # Cassandra/Kafka integration tests concurrently genuinely OOM-killed a
       # Cassandra node on this project's dev host once TLS was added -- the

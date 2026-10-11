@@ -76,5 +76,5 @@ over multiple hardware profiles or repeated over a longer window. The
 site's 429s, and the Cassandra LWT insert as the dominant cost) is the
 defensible takeaway; the absolute millisecond figures will vary with
 different hardware, network conditions, or cluster sizing. Full detail and
-the raw investigation are in `WORKLOG.md`'s Slice 16 entry and
+the raw investigation are in `docs/history/WORKLOG.md`'s Slice 16 entry and
 `PLAN.md`'s Slice 16 writeup.

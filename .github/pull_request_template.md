@@ -10,5 +10,5 @@
 
 ## Checklist
 
-- [ ] If this changes an architecture decision, it's reflected in `PLAN.md` (or proposed in `ARCHITECTURE_PROPOSALS.md` first)
-- [ ] Logged in `WORKLOG.md`
+- [ ] If this changes an architecture decision, it's reflected in `PLAN.md` (or proposed in `docs/history/ARCHITECTURE_PROPOSALS.md` first), and a significant or hard-to-reverse decision has an ADR in `docs/adr/`
+- [ ] Logged in `docs/history/WORKLOG.md`

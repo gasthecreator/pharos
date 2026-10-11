@@ -7,7 +7,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Describe the problem you're trying to solve. If this changes architecture or a data model, it likely belongs in `ARCHITECTURE_PROPOSALS.md` first — see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+        Describe the problem you're trying to solve. If this changes architecture or a data model, it likely belongs in `docs/history/ARCHITECTURE_PROPOSALS.md` first — see [CONTRIBUTING.md](../../CONTRIBUTING.md).
   - type: textarea
     id: problem
     attributes:
@@ -19,7 +19,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: How should it work? Link to a draft `ARCHITECTURE_PROPOSALS.md` entry if you have one.
+      description: How should it work? Link to a draft `docs/history/ARCHITECTURE_PROPOSALS.md` entry if you have one.
     validations:
       required: true
   - type: textarea

@@ -33,7 +33,7 @@ type CassandraConfig struct {
 	// LocalDC in the replication map.
 	RemoteDCs map[string]int
 	// TLS, if set, encrypts and authenticates the client-to-node connection
-	// against this project's own CA (§2.4, ARCHITECTURE_PROPOSALS.md "Slice
+	// against this project's own CA (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md "Slice
 	// 15: Auth & TLS"). Nil means plaintext, e.g. for tests that don't stand
 	// up TLS-enabled Cassandra.
 	TLS *tlsutil.ClientConfig

@@ -113,7 +113,7 @@ func TestOutOfOrderDelivery_QueryLayerOrdersCorrectlyRegardlessOfArrival(t *test
 
 	// NewKafkaReader (not a raw kafkaGo.NewReader) so the reader's Dialer
 	// picks up engineCfg.TLS -- real Kafka's client-facing listener is
-	// SSL-only as of Slice 15 (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15:
+	// SSL-only as of Slice 15 (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15:
 	// Auth & TLS"), and a plaintext Dialer against it fails with EOF.
 	reader, err := consumer.NewKafkaReader(engineCfg)
 	if err != nil {

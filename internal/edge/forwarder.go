@@ -26,7 +26,7 @@ type ForwarderConfig struct {
 	CentralURL string `json:"central_url"`
 	SiteID     string `json:"site_id"`
 	// APIKey authenticates this site to Central Ingestion (§2.1, §2.2,
-	// ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"). Empty means no
+	// docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"). Empty means no
 	// X-API-Key header is sent -- fine against an ingestion instance
 	// running with --enable-auth=false, rejected otherwise.
 	APIKey         string        `json:"-"`
