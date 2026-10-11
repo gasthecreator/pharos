@@ -44,7 +44,7 @@ func validAdverseEvent() *AdverseEvent {
 		},
 		Study: []Reference{
 			{
-				Reference: "ResearchStudy/LILLY-401",
+				Reference: "ResearchStudy/STUDY-401",
 			},
 		},
 		Location: Reference{

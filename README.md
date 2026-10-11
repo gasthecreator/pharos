@@ -1,8 +1,14 @@
 # Pharos
 
-A distributed adverse-event ingestion pipeline for clinical trials — built to answer one real interview question honestly: *"design a system to track adverse drug events reported from clinical trials across multiple countries and time zones."*
+[![CI](https://github.com/gasthecreator/pharos/actions/workflows/ci.yml/badge.svg)](https://github.com/gasthecreator/pharos/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/gasthecreator/pharos/actions/workflows/codeql.yml/badge.svg)](https://github.com/gasthecreator/pharos/actions/workflows/codeql.yml)
+[![govulncheck](https://github.com/gasthecreator/pharos/actions/workflows/govulncheck.yml/badge.svg)](https://github.com/gasthecreator/pharos/actions/workflows/govulncheck.yml)
+[![License: MIT](https://img.shields.io/github/license/gasthecreator/pharos)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/gasthecreator/pharos)](go.mod)
 
-It's grounded in a verified real interview question from Eli Lilly's Bio-IT / Clinical engineering team, and built out into a working product from there. It's not a broad pharmacovigilance suite competing with Oracle Argus, ArisGlobal, or Veeva Vault Safety — it's a focused answer to one hard piece of that problem: getting federated, multi-region adverse-event data into a central store correctly, with partition tolerance, exactly-once processing, and correct multi-timezone ordering, under real failure conditions.
+A distributed adverse-event ingestion pipeline for clinical trials: it reliably collects, orders, deduplicates and stores reports of adverse drug reactions arriving from trial sites across many countries and time zones, without losing or duplicating a record, even when a site is offline for hours or days.
+
+The hard part is correctness under failure, not feature breadth: partition tolerance, exactly-once processing, per-site isolation, and correct multi-timezone event ordering, demonstrated against real Cassandra and Kafka rather than mocks. Pharos is deliberately not a broad pharmacovigilance suite competing with Oracle Argus, ArisGlobal, or Veeva Vault Safety; it is a focused answer to one hard piece of that problem, getting federated, multi-region adverse-event data into a central store correctly. All example data in this repository is synthetic.
 
 ## The four problems this actually solves
 
@@ -54,7 +60,7 @@ own comments and `docs/history/ARCHITECTURE_PROPOSALS.md`'s Slice 14 addendum).
 Every Cassandra/Kafka client connection and Central Ingestion's own HTTP
 listener require TLS by default (Slice 15) — `scripts/generate_certs.sh`
 issues a project-owned CA and every service certificate into `certs/`
-(gitignored; regenerate any time). Central Ingestion also requires per-site
+(gitignored; regenerating replaces the CA, so only do it with the stack stopped). Central Ingestion also requires per-site
 API key auth by default (`--enable-auth` defaults `true`) — a site must be
 provisioned with `pharos-cli site create-key` before its edge collector can
 submit anything.
@@ -106,7 +112,7 @@ curl -X POST http://localhost:8080/api/v1/adverse-events \
     "date": "2026-08-28T09:00:00+01:00",
     "recordedDate": "2026-08-30T05:13:00Z",
     "severity": {"coding": [{"code": "severe"}]},
-    "study": [{"reference": "ResearchStudy/LILLY-401"}],
+    "study": [{"reference": "ResearchStudy/STUDY-401"}],
     "location": {"reference": "Location/SITE-DEMO-NG"}
   }'
 # {"status":"QUEUED","idempotency_key":"SITE-DEMO-NG:1758...", "local_seq":1758..., ...}
@@ -120,12 +126,12 @@ Ingestion, Cassandra, Kafka — not the on-site capture endpoint). The
 `idempotency_key` from your own response for the next step rather than
 assuming `SITE-DEMO-NG:1`.
 
-A few seconds later, query it back through the full pipeline (edge → Central Ingestion → Kafka → consumer → Cassandra) using the `idempotency_key` from the response above:
+A few seconds later, query it back through the full pipeline (edge → Central Ingestion → Kafka → consumer → Cassandra) using the `idempotency_key` from the response above. Real (non-`--memory`) `query` and `dlq` commands require `--operator`: every read of adverse-event data is recorded in the access-audit trail under that name.
 
 ```bash
-./bin/pharos-cli query event SITE-DEMO-NG:1758... --ca-cert certs/ca-cert.pem
-./bin/pharos-cli query site SITE-DEMO-NG --ca-cert certs/ca-cert.pem
-./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem
+./bin/pharos-cli --operator you@example.org query event SITE-DEMO-NG:1758... --ca-cert certs/ca-cert.pem
+./bin/pharos-cli --operator you@example.org query site SITE-DEMO-NG --ca-cert certs/ca-cert.pem
+./bin/pharos-cli --operator you@example.org query study STUDY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem
 ```
 
 Now submit something invalid (missing `subject` and `event`) — the edge still buffers it durably (it never validates, by design), Central Ingestion rejects it with a structured reason, and it lands somewhere you can actually see it:
@@ -135,7 +141,7 @@ curl -X POST http://localhost:8080/api/v1/adverse-events \
   -H "Content-Type: application/json" \
   -d '{"resourceType":"AdverseEvent","actuality":"actual","date":"2026-08-28T09:00:00Z","recordedDate":"2026-08-30T05:14:00Z","location":{"reference":"Location/SITE-DEMO-NG"}}'
 
-./bin/pharos-cli dlq list --site SITE-DEMO-NG --ca-cert certs/ca-cert.pem
+./bin/pharos-cli --operator you@example.org dlq list --site SITE-DEMO-NG --ca-cert certs/ca-cert.pem
 # SITE-DEMO-NG:1758...  ...  subject reference is required (e.g., 'Patient/<id>')  PUBLISHED
 ```
 
@@ -220,6 +226,7 @@ SECURITY.md             Security policy and known, deliberate gaps
 | What each service can access and where the trust boundaries are | [`docs/security-threat-model.md`](docs/security-threat-model.md) |
 | Real load-test numbers and how to reproduce them | [`docs/benchmark-results.md`](docs/benchmark-results.md), [`loadtest/README.md`](loadtest/README.md) |
 | The HTTP APIs | [`docs/api/`](docs/api/) (OpenAPI for the edge and Central Ingestion) |
+| Every flag, default and helper-script variable | [`docs/configuration.md`](docs/configuration.md), [`.env.example`](.env.example) |
 | How to deploy to Kubernetes | [`deploy/k8s/README.md`](deploy/k8s/README.md) |
 | What is built, what is deferred, and the roadmap | [`PLAN.md`](PLAN.md) |
 | The dated build log and the original proposal/review trail | [`docs/history/`](docs/history/) |

@@ -154,7 +154,7 @@ RESP=$(curl -s -X POST "http://localhost:$EDGE_PORT/api/v1/adverse-events" \
     \"date\": \"2026-08-28T09:00:00+01:00\",
     \"recordedDate\": \"2026-08-30T05:13:00Z\",
     \"severity\": {\"coding\": [{\"code\": \"severe\"}]},
-    \"study\": [{\"reference\": \"ResearchStudy/LILLY-401\"}],
+    \"study\": [{\"reference\": \"ResearchStudy/STUDY-401\"}],
     \"location\": {\"reference\": \"Location/$SITE_ID\"}
   }")
 info "Edge response: $RESP"
@@ -197,7 +197,7 @@ log "Querying by site (answers: all events from site Z)"
 ./bin/pharos-cli query site "$SITE_ID" --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
 
 log "Querying by study and date range (answers: all events for trial X in range Y)"
-./bin/pharos-cli query study LILLY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
+./bin/pharos-cli query study STUDY-401 --from 2026-08-01T00:00:00Z --to 2026-08-31T23:59:59Z --ca-cert certs/ca-cert.pem --operator "$SITE_ID"
 
 log "Submitting a malformed event (missing subject and event fields)"
 info "The edge buffers it durably anyway — it never validates, by design (PLAN.md §2.3)."

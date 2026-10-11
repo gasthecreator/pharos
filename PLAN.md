@@ -17,14 +17,12 @@ arriving from clinical trial sites across many countries and time zones, and get
 them into a central store without losing or duplicating data — even when a site
 loses connectivity for hours or days.
 
-**This is a real product, grounded in a verified real interview question from
-Eli Lilly's Bio-IT / Clinical engineering team:** *"design a system to track
-adverse drug events reported from clinical trials across multiple countries
-and time zones."* That question names a genuine, documented industry pain
-point — federated pharmacovigilance data collection under partition and
-failure — and this project is a working answer to it, engineered and
-documented to be presented and evaluated as a product, not a classroom
-exercise.
+**This is a real product.** It addresses a genuine, documented industry pain
+point: *how do you track adverse drug events reported from clinical trials
+across multiple countries and time zones* (federated pharmacovigilance data
+collection under partition and failure). Pharos is a working answer to that
+question, engineered and documented to be presented and evaluated as a
+product, not a classroom exercise.
 
 **What this project deliberately is NOT:**
 - Not a domain-science project. Earlier concepts for this product slot (an ML
@@ -2124,8 +2122,7 @@ lands — do not mark anything done based on a plan or a stub.
    the fault-injection tests. Considered ScyllaDB as a lighter-footprint,
    CQL-wire-compatible alternative, but its license changed from open-source
    (AGPL) to source-available with a 10TB free-usage cap — Cassandra's Apache 2.0
-   license is unconditionally free and more universally recognized in an
-   interview context, so staying with Cassandra.
+   license is unconditionally free and more universally recognized, so staying with Cassandra.
    - **RESOLVED 2026-08-30 — query pattern fit.** The two named queries ("all
      events for trial X in date range Y" vs. "all events from site Z") did
      need different partition keys, exactly as flagged — resolved with two
