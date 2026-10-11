@@ -60,18 +60,19 @@ assumed from README/PLAN.md's descriptions of intent.
    `--enable-chaos` to anything but a local/demo instance," not any
    in-app authentication** — a deployment that flips this flag in a
    reachable environment has no further gate behind it.
-4. **The Kubernetes deployment (`deploy/k8s/`) currently grants no
-   narrower RBAC than the cluster's own defaults.** There is no
-   `ServiceAccount`, `Role`, `ClusterRole`, `RoleBinding`, or
-   `NetworkPolicy` manifest anywhere under `deploy/k8s/` — confirmed by
-   grepping the whole directory, not assumed. Every pod runs under its
-   namespace's (`pharos`) default `ServiceAccount` with whatever the
-   cluster grants that identity, and nothing restricts which pods in the
-   `pharos` namespace (or beyond, absent a cluster-wide default-deny
-   policy) can reach which other pods on which ports. This is a real,
-   current gap, not a "someone forgot to write a doc" situation — no code
-   or manifest anywhere implements pod-level network or RBAC restriction
-   for this deployment target.
+4. **Kubernetes pod and network isolation is written but not yet proven on
+   a running cluster.** `deploy/k8s/11-network-policies.yaml` applies
+   default-deny ingress and egress to the `pharos` namespace with explicit
+   allows derived from each workload's actual connections, and the Go-service
+   pods run as non-root with dropped capabilities, a read-only root
+   filesystem and the `RuntimeDefault` seccomp profile. These are validated
+   statically (kubeconform and CI assertions) but **have not been observed
+   running or enforced**, and `NetworkPolicy` only has effect on a CNI that
+   enforces it. There is still no `ServiceAccount`, `Role`, `ClusterRole` or
+   `RoleBinding` manifest: every pod runs under the namespace's default
+   `ServiceAccount` with whatever the cluster grants it, and the Cassandra,
+   Kafka, MirrorMaker 2 and Prometheus pods and the two upstream-image Jobs
+   keep their images' default users.
 5. **Cassandra internode and Kafka inter-broker traffic is TLS in the
    Docker Compose deployment, but plaintext in the Kubernetes deployment.**
    The two deployment targets have genuinely diverged on this point (see
@@ -89,10 +90,10 @@ restated here in trust-boundary terms:
   `deploy/k8s/certs/` (gitignored, not committed). A compromise of the
   host or cluster filesystem exposes every private key at once — there is
   no per-key rotation or least-privilege scoping today.
-- **No Kubernetes RBAC or NetworkPolicy**, per trust boundary 4 above —
-  the single largest concrete gap between this project's current
-  Kubernetes manifests and a deployment a security-conscious buyer would
-  accept as-is.
+- **No Kubernetes RBAC manifests, and NetworkPolicy/pod hardening not yet
+  verified on a cluster**, per trust boundary 4 above — the largest
+  concrete gap between this project's Kubernetes manifests and a
+  deployment a security-conscious buyer would accept as-is.
 - **The dashboard has no real authentication**, per trust boundary 2 —
   whoever can reach it on the network can read adverse-event data; the
   self-declared operator cookie is an audit-trail convenience, not a

@@ -1,0 +1,146 @@
+# Prometheus alert rules for Pharos, as code.
+#
+# Every expression uses only metrics the services actually register
+# (internal/metrics/{edge,ingestion,consumer}metrics) plus Prometheus's own
+# `up`; scripts/check_alert_rules.py enforces that in CI, and CI also runs
+# `promtool check rules` against this file.
+#
+# Not alertable today: Cassandra node and Kafka broker health. No exporter
+# for either is deployed, so there is no metric to alert on; detection is the
+# container healthchecks / `kubectl get pods` (see the Cassandra and Kafka
+# runbooks). Thresholds are starting points derived from
+# docs/benchmark-results.md and docs/slo.md, not tuned values.
+groups:
+  - name: pharos-ingestion
+    rules:
+      - alert: PharosIngestionDown
+        expr: up{job="pharos-ingestion"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "Central Ingestion is not being scraped / is down"
+          description: "Prometheus cannot scrape job pharos-ingestion ({{ $labels.instance }}) for 2 minutes. Edges will queue locally and retry; no data is lost, but nothing is accepted."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/ingestion-5xx-or-stalled.md"
+
+      - alert: PharosIngestion5xxRatioHigh
+        expr: |
+          sum(rate(pharos_ingestion_requests_total{status_code=~"5.."}[5m]))
+            / sum(rate(pharos_ingestion_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "More than 5% of ingestion batch requests return 5xx"
+          description: "5xx ratio over 5m is {{ $value | humanizePercentage }}. Cassandra or Kafka is most likely unavailable to Central Ingestion."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/ingestion-5xx-or-stalled.md"
+
+      - alert: PharosIngestionLatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(pharos_ingestion_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Ingestion p99 request latency above 500ms"
+          description: "p99 over 5m is {{ $value | humanizeDuration }}. The benchmarked baseline is p95 about 101ms (docs/benchmark-results.md); the Cassandra LWT outbox insert is the known dominant cost."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/ingestion-5xx-or-stalled.md"
+
+      - alert: PharosSiteRateLimited
+        expr: sum by (site_id) (increase(pharos_ingestion_rate_limit_rejections_total[10m])) > 100
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Site {{ $labels.site_id }} is being rate limited"
+          description: "{{ $value }} requests from {{ $labels.site_id }} were rejected with 429 in 10m. Either the site is misbehaving or its legitimate volume exceeds its bucket (default 100 burst, 10/s)."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/rate-limiter-rejecting-site.md"
+
+      - alert: PharosDLQWriteSpike
+        expr: increase(pharos_ingestion_dlq_writes_total[15m]) > 20
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Rejected events are landing in the dead-letter queue faster than usual"
+          description: "{{ $value }} events were dead-lettered in the last 15m. A site is likely sending malformed or unsupported-schema payloads."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/dlq-growth-spike.md"
+
+  - name: pharos-consumer
+    rules:
+      - alert: PharosConsumerDown
+        expr: up{job="pharos-consumer"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "pharos-consumer is not being scraped / is down"
+          description: "Events keep accumulating in Kafka (7-day retention) but are not reaching the canonical tables."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/consumer-lag-growing.md"
+
+      - alert: PharosConsumerLagHigh
+        expr: pharos_consumer_kafka_lag > 1000
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Consumer group lag above 1000 messages for 10 minutes"
+          description: "Aggregate lag is {{ $value }}. The consumer is slow or stuck."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/consumer-lag-growing.md"
+
+      - alert: PharosConsumerErrors
+        expr: rate(pharos_consumer_errors_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "The consumer engine is recording errors"
+          description: "Errors in the fetch/save/commit loop have been continuous for 10 minutes. Offsets are only committed after a durable write, so no data is lost, but progress is blocked."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/consumer-lag-growing.md"
+
+      - alert: PharosConsumerNotConsuming
+        expr: |
+          sum(rate(pharos_ingestion_dedup_outcomes_total{outcome="new_claim"}[15m])) > 0
+            and sum(rate(pharos_consumer_events_consumed_total[15m])) == 0
+        for: 15m
+        labels:
+          severity: page
+        annotations:
+          summary: "Ingestion is accepting events but the consumer is consuming none"
+          description: "New claims are being published to Kafka but pharos_consumer_events_consumed_total is flat for 15m."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/consumer-lag-growing.md"
+
+      - alert: PharosCassandraWriteP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (rate(pharos_consumer_cassandra_write_duration_seconds_bucket{outcome="success"}[5m]))) > 1
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "Canonical-table write p99 above 1s"
+          description: "The consumer's parallel upsert is slow ({{ $value | humanizeDuration }} p99); suspect a degraded Cassandra node."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/cassandra-node-down-or-dc-partition.md"
+
+  - name: pharos-edge
+    rules:
+      - alert: PharosEdgeDown
+        expr: up{job=~"pharos-edge.*"} == 0
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "An edge collector is not being scraped"
+          description: "{{ $labels.job }} has been unreachable for 5 minutes. Check the site's host; the local queue survives restarts (SQLite WAL)."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/edge-queue-backlog-after-outage.md"
+
+      - alert: PharosEdgeQueueBacklog
+        expr: pharos_edge_queue_oldest_pending_age_seconds > 900
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "An edge's oldest unforwarded record is older than 15 minutes"
+          description: "{{ $labels.job }} has held a pending record for {{ $value | humanizeDuration }}: the site is effectively partitioned from Central Ingestion or being throttled."
+          runbook_url: "https://github.com/gasthecreator/pharos/blob/main/docs/runbooks/edge-queue-backlog-after-outage.md"

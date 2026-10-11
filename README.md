@@ -228,6 +228,9 @@ SECURITY.md             Security policy and known, deliberate gaps
 | The HTTP APIs | [`docs/api/`](docs/api/) (OpenAPI for the edge and Central Ingestion) |
 | Every flag, default and helper-script variable | [`docs/configuration.md`](docs/configuration.md), [`.env.example`](.env.example) |
 | How to deploy to Kubernetes | [`deploy/k8s/README.md`](deploy/k8s/README.md) |
+| What to do when something breaks | [`docs/runbooks/`](docs/runbooks/) (one per failure mode); alert rules in [`observability/prometheus/alerts.yml`](observability/prometheus/alerts.yml) |
+| The reliability targets | [`docs/slo.md`](docs/slo.md) (proposed SLOs and the metrics that measure them) |
+| How wire format, schema and dependency upgrades are handled | [`docs/upgrade-and-compat-policy.md`](docs/upgrade-and-compat-policy.md) |
 | What is built, what is deferred, and the roadmap | [`PLAN.md`](PLAN.md) |
 | The dated build log and the original proposal/review trail | [`docs/history/`](docs/history/) |
 

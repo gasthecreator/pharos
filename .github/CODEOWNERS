@@ -1,2 +1,11 @@
 # Default owner for all paths. Update when the maintainer team grows.
 * @gasthecreator
+
+# Security-, release- and data-model-sensitive paths: listed explicitly so
+# they stay visible if the default owner is ever broadened.
+/.github/workflows/ @gasthecreator
+/deploy/ @gasthecreator
+/migrations/ @gasthecreator
+/SECURITY.md @gasthecreator
+/docs/security-threat-model.md @gasthecreator
+/internal/auth/ @gasthecreator

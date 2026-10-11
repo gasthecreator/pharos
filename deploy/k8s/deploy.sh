@@ -111,6 +111,11 @@ else
   kubectl rollout status deployment/pharos-edge-site-k8s-demo -n "${NAMESPACE}" --timeout=120s
 fi
 
+log "Creating prometheus-alerts ConfigMap (alert rules as code)"
+kubectl create configmap prometheus-alerts -n "${NAMESPACE}" \
+  --from-file=alerts.yml="${ROOT_DIR}/observability/prometheus/alerts.yml" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 log "Deploying Prometheus"
 kubectl apply -f "${K8S_DIR}/08-observability.yaml"
 kubectl rollout status deployment/prometheus -n "${NAMESPACE}" --timeout=120s
