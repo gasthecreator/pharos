@@ -175,22 +175,23 @@ func (f *Forwarder) Step(ctx context.Context) (int, error) {
 
 		for _, r := range records {
 			res, found := resultsByKey[r.IdempotencyKey]
-			if found && res.Status == wire.StatusRejected {
+			switch {
+			case found && res.Status == wire.StatusRejected:
 				reason := res.Error
 				if reason == "" {
 					reason = "rejected by central ingestion"
 				}
 				rejectedByReason[reason] = append(rejectedByReason[reason], r.ID)
-			} else if found && res.Status == wire.StatusAccepted {
+			case found && res.Status == wire.StatusAccepted:
 				ackIDs = append(ackIDs, r.ID)
-			} else if found && res.Status == wire.StatusFailed {
+			case found && res.Status == wire.StatusFailed:
 				reason := res.Error
 				if reason == "" {
 					reason = "infrastructure failure during ingestion"
 				}
 				retryAfter := f.CalculateBackoff(r.Attempts)
 				failedRecords = append(failedRecords, failedRecord{id: r.ID, reason: reason, retryAfter: retryAfter})
-			} else {
+			default:
 				// Fallback if not found in results map
 				switch resp.StatusCode {
 				case http.StatusUnprocessableEntity:

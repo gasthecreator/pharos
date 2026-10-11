@@ -16,6 +16,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -187,7 +188,7 @@ func (s *CassandraKeyStore) VerifyKey(ctx context.Context, siteID, plaintextKey 
 	err := s.session.Query(
 		`SELECT key_hash, revoked FROM pharos.site_api_keys WHERE site_id = ?;`, siteID,
 	).WithContext(ctx).Scan(&storedHash, &revoked)
-	if err == gocql.ErrNotFound {
+	if errors.Is(err, gocql.ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {

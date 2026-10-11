@@ -55,18 +55,22 @@ after the fact.
 
 ```bash
 make fmt-check   # gofmt
-make lint        # go vet
+make vet         # go vet
+make lint        # golangci-lint, installed into ./bin at the version CI uses
 make build       # confirms everything compiles
+make coverage    # unit tests that need no infrastructure, with -race and a per-package table
 make up          # brings up Cassandra/Kafka/Redis in the safe order CI uses -- see its own comment
-make test        # full suite against real Cassandra + Kafka
+make test        # full suite against real Cassandra + Kafka (-p 1, chaos run last, RAPID_CHECKS=5000)
 ```
 
 `make up` matters here, not just `docker compose up -d`: starting every
 container (including MirrorMaker 2) at once has caused real OOM kills on
 this host, so `up` brings services up in the same safe order
-`.github/workflows/ci.yml` uses. CI runs the same checks as `make test` —
-see `.github/workflows/ci.yml`. A green run there is the bar, not "it
-worked on my machine once."
+`.github/workflows/ci.yml` uses. CI runs these same checks (lint, build,
+unit tests, then the real-infrastructure suite) plus `go mod tidy` drift,
+`govulncheck`, CodeQL and the container/manifest hardening checks; see
+`.github/workflows/ci.yml`. A green run there is the bar, not "it worked on
+my machine once."
 
 ## What "done" means for a slice
 

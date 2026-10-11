@@ -17,7 +17,7 @@ jobs:
   lint-and-build:
     name: Vet, format, build
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -44,6 +44,34 @@ jobs:
 
       - name: go build
         run: go build ./...
+
+      # go.mod/go.sum must already be what `go mod tidy` would produce.
+      - name: go mod tidy drift check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      # `make lint` installs golangci-lint at the Makefile's pinned version;
+      # the action above pins its own. They must agree or local and CI lint drift.
+      - name: golangci-lint version matches the Makefile
+        run: |
+          make_ver=$(sed -n 's/^GOLANGCI_LINT_VERSION ?= //p' Makefile)
+          ci_ver=$(sed -n 's/^ *version: \(v[0-9][0-9.]*\).*/\1/p' .github/workflows/ci.yml | head -1)
+          echo "Makefile: ${make_ver}  ci.yml: ${ci_ver}"
+          test -n "$make_ver" && test "$make_ver" = "$ci_ver"
+
+      # Fast feedback before the heavy real-infrastructure job: the tests that
+      # need no Cassandra/Kafka (internal/chaos is excluded; four packages mix
+      # unit and real-infra tests, so those are excluded by name -- see
+      # UNIT_SKIP in the Makefile). Race detector on; coverage is a signal
+      # for finding untested code, not a gate.
+      - name: Unit tests (no infrastructure), race, coverage
+        run: make coverage
+
+      - name: Per-package coverage summary
+        if: always()
+        run: |
+          if [ -f coverage.log ]; then ./scripts/coverage_summary.sh coverage.log >> "$GITHUB_STEP_SUMMARY"; fi
 
   # Static + build-time checks for the hardening in deploy/ (non-root images,
   # schema-valid manifests). Runs on the GitHub runner because these need a

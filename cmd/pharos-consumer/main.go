@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -70,13 +71,14 @@ func main() {
 	checkpointCtx, checkpointCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	checkpoint, err := store.LoadWatermarkCheckpoint(checkpointCtx, *kafkaGroup)
 	checkpointCancel()
-	if err != nil {
+	switch {
+	case err != nil:
 		log.Printf("[pharos-consumer] WARNING: failed to load watermark checkpoint: %v (starting with an empty tracker)", err)
-	} else if checkpoint != nil {
+	case checkpoint != nil:
 		tracker.Restore(*checkpoint)
 		log.Printf("[pharos-consumer] Watermark tracker restored from checkpoint (group: %s, previous_emitted: %s)",
 			*kafkaGroup, checkpoint.PreviousEmitted.Format(time.RFC3339))
-	} else {
+	default:
 		log.Printf("[pharos-consumer] No prior watermark checkpoint for group %s (fresh consumer group)", *kafkaGroup)
 	}
 	log.Printf("[pharos-consumer] Watermark tracker initialized (lateness: %s, idle timeout: %s)", *latenessTolerance, *idleTimeout)
@@ -111,7 +113,7 @@ func main() {
 	// 4. Start consumption worker
 	go func() {
 		log.Println("[pharos-consumer] Consumer engine listening for adverse event messages...")
-		if err := engine.Run(ctx); err != nil && err != context.Canceled {
+		if err := engine.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Fatalf("[pharos-consumer] Engine failed: %v", err)
 		}
 	}()

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -93,7 +94,7 @@ func main() {
 	forwarder := edge.NewForwarder(store, chaosClient, fwdCfg)
 	go func() {
 		log.Printf("[pharos-edge] Forwarder worker active -> streaming to %s", *centralURL)
-		if err := forwarder.Run(ctx); err != nil && err != context.Canceled {
+		if err := forwarder.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("[pharos-edge] Forwarder worker error: %v", err)
 		}
 	}()

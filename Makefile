@@ -1,4 +1,6 @@
-.PHONY: build test lint fmt fmt-check clean up down ps
+SHELL := bash
+
+.PHONY: build test coverage lint vet fmt fmt-check clean up down ps
 
 BIN_DIR := bin
 EDGE_BIN := $(BIN_DIR)/pharos-edge
@@ -33,8 +35,39 @@ test:
 	RAPID_CHECKS=5000 go test -buildvcs=false -v -race -count=1 -p 1 $$(go list ./... | grep -v '/internal/chaos$$')
 	go test -buildvcs=false -v -race -count=1 ./internal/chaos/...
 
-lint:
+# golangci-lint is installed into ./bin at the same version CI uses, so a
+# local `make lint` and CI's lint step can't drift (ci.yml's golangci-lint
+# step must be bumped together with this; CI asserts they match).
+GOLANGCI_LINT_VERSION ?= v2.13.2
+GOLANGCI_LINT := $(BIN_DIR)/golangci-lint
+
+$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION):
+	@mkdir -p $(BIN_DIR)
+	GOBIN=$(CURDIR)/$(BIN_DIR)/.install go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	mv -f $(BIN_DIR)/.install/golangci-lint $@
+	rmdir $(BIN_DIR)/.install
+
+$(GOLANGCI_LINT): $(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)
+	ln -sf golangci-lint-$(GOLANGCI_LINT_VERSION) $@
+
+lint: $(GOLANGCI_LINT)
+	$(GOLANGCI_LINT) run ./...
+
+vet:
 	go vet -buildvcs=false ./...
+
+# Unit tests that need no infrastructure (tests that need Cassandra/Kafka/Redis/
+# Docker skip themselves when those are unreachable), with a per-package
+# coverage table. Coverage is a signal for finding untested code, not a target.
+#
+# Four packages mix pure unit tests with real-infrastructure tests that FAIL (not
+# skip) when Cassandra/Kafka are unreachable, so those tests are excluded by
+# name here; the real-infrastructure CI job runs them for real. internal/chaos
+# is excluded entirely (it acts on real containers, see ci.yml).
+UNIT_SKIP := TestCassandra(CanonicalStore|OutboxStore)_|TestConsumerEngine_RealEndToEnd|TestKafkaProducer_Real|TestEnsureTopics_Real|TestArchivalLifecycle_Real|TestQueryService_RealCassandra
+coverage:
+	@set -o pipefail; go test -race -count=1 -p 1 -covermode=atomic -coverprofile=coverage.out -skip '$(UNIT_SKIP)' $$(go list ./... | grep -v '/internal/chaos$$') 2>&1 | tee coverage.log
+	@./scripts/coverage_summary.sh coverage.log
 
 fmt:
 	gofmt -w .
@@ -46,7 +79,7 @@ fmt-check:
 	fi
 
 clean:
-	rm -f $(EDGE_BIN) $(INGESTION_BIN) $(CONSUMER_BIN) $(CLI_BIN) $(DASHBOARD_BIN) *.db *.db-wal *.db-shm *.db-journal coverage.out
+	rm -f $(EDGE_BIN) $(INGESTION_BIN) $(CONSUMER_BIN) $(CLI_BIN) $(DASHBOARD_BIN) *.db *.db-wal *.db-shm *.db-journal coverage.out coverage.log
 
 # Bringing every container up at once with a bare `docker compose up -d`
 # starts MirrorMaker 2 before any Kafka topic exists, which makes it

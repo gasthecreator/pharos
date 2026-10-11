@@ -973,7 +973,7 @@ func seedSampleData(svc *query.MemoryService) {
 	baseTime := time.Now().UTC().Add(-2 * time.Hour)
 
 	// Canonical event
-	svc.CanonicalStore().SaveEvent(ctx, &consumer.CanonicalRecord{
+	if err := svc.CanonicalStore().SaveEvent(ctx, &consumer.CanonicalRecord{
 		IdempotencyKey: "SITE-US-01:1",
 		SiteID:         "SITE-US-01",
 		StudyID:        "STUDY-001",
@@ -990,7 +990,10 @@ func seedSampleData(svc *query.MemoryService) {
 		KafkaPartition: 0,
 		KafkaOffset:    101,
 		IsLate:         false,
-	})
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to seed sample data: %v\n", err)
+		os.Exit(1)
+	}
 
 	// DLQ event
 	svc.SaveDLQEvent(&query.DLQRecord{
