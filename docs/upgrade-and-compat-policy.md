@@ -65,7 +65,7 @@ As pinned in this repository; versions not listed here have not been exercised.
 
 | Component | Pinned version | Where |
 |---|---|---|
-| Go | 1.25 (`go 1.25.0` in `go.mod`; CI uses 1.25) | `go.mod`, `.github/workflows/ci.yml` |
+| Go | `go 1.25.0` in `go.mod` is the minimum language version; CI and the image builder use the 1.26 toolchain (1.25.x stdlib has unfixed `net/http` advisories GO-2026-6611 to 6617, fixed in 1.26.9) | `go.mod`, `.github/workflows/ci.yml` |
 | Cassandra | 5.0 | `docker-compose.yml`, `deploy/k8s/01-cassandra.yaml` |
 | Kafka | `apache/kafka` 3.8.0 (KRaft) | `docker-compose.yml`, `deploy/k8s/02-kafka.yaml` |
 | Redis | 7.4 (optional, distributed rate limiter) | `docker-compose.yml` |

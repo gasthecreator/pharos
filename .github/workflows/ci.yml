@@ -23,7 +23,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
 
       - name: go vet
         run: go vet ./...
@@ -86,7 +86,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
 
       - name: Dockerfile base images are digest-pinned
         run: |
@@ -142,7 +142,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.25"
+          go-version: "1.26"
 
       # generate_certs.sh needs `keytool` (to build Cassandra/Kafka's JKS
       # keystores/truststores) -- ubuntu-latest doesn't guarantee a JDK on

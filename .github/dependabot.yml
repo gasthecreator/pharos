@@ -27,7 +27,7 @@ updates:
         update-types: ["minor", "patch"]
         exclude-patterns: ["github/codeql-action/*"]
 
-  # The Dockerfiles in deploy/docker/ share golang:1.25-alpine as their
+  # The Dockerfiles in deploy/docker/ share golang:1.26-alpine as their
   # builder stage; Dependabot only sees tags there, so the digest pin is
   # refreshed alongside the tag.
   - package-ecosystem: "docker"
