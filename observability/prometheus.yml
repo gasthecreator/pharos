@@ -1,6 +1,11 @@
 global:
   scrape_interval: 10s
 
+# Alert rules as code; mounted by docker-compose.yml. Runbooks are in
+# docs/runbooks/ and referenced from each rule's runbook_url annotation.
+rule_files:
+  - /etc/prometheus/alerts.yml
+
 # All three Pharos services run as host binaries (see README's "Running it
 # locally"), not as containers, so Prometheus scrapes them via
 # host.docker.internal (Docker Desktop's bridge back to the host). If you run
@@ -9,6 +14,12 @@ global:
 # discovery (that's deployment-automation territory, PLAN.md Slice 10).
 scrape_configs:
   - job_name: "pharos-ingestion"
+    # Ingestion serves HTTPS (TLS is on by default, PLAN.md Slice 15) on the
+    # same port as /metrics; the project CA is not mounted into this
+    # container, so verification is skipped, as in deploy/k8s/08-observability.yaml.
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true
     static_configs:
       # 8091, not the --port flag's own default of 8081, to match the exact
       # commands in README.md's "Running it locally" (chosen there to dodge

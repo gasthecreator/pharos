@@ -1,5 +1,5 @@
 // Package tlsutil builds shared TLS configuration for every Pharos service
-// (§2.1, §2.2, §2.4, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") from
+// (§2.1, §2.2, §2.4, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") from
 // this project's own CA (scripts/generate_certs.sh) -- one place that knows
 // how to turn a CA cert path (and, for a server, a cert/key pair) into the
 // stdlib crypto/tls.Config, gocql.SslOptions, and kafka-go dialer/transport
@@ -91,7 +91,7 @@ func (c ClientConfig) GocqlSslOptions() (*gocql.SslOptions, error) {
 // gate on an empty result to mean "no default CA available here" -- e.g. a
 // compiled binary running somewhere outside this project's own checkout,
 // where an explicit --ca-cert flag is the correct way to point at a
-// deployment-provisioned CA instead (§2.4, ARCHITECTURE_PROPOSALS.md
+// deployment-provisioned CA instead (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md
 // "Slice 15: Auth & TLS"). This exists specifically so real Cassandra/Kafka
 // connections default to using this project's own TLS the same way
 // LocalDC/RemoteDCs became defaults in Slice 14 -- the real dev/CI

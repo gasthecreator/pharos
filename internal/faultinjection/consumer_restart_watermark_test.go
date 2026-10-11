@@ -63,7 +63,7 @@ func publishFaultInjectionEvent(t *testing.T, ctx context.Context, producer kafk
 }
 
 // TestConsumerRestart_WatermarkCheckpointPreventsRegression is the flagship
-// fault-injection test for Slice 13 (ARCHITECTURE_PROPOSALS.md "Consumer
+// fault-injection test for Slice 13 (docs/history/ARCHITECTURE_PROPOSALS.md "Consumer
 // Crash/Restart Watermark Continuity"): a real pharos-consumer engine
 // processes a real event via real Kafka and real Cassandra, advancing its
 // watermark well past baseline; a periodic checkpoint (the same call

@@ -1,5 +1,5 @@
 // Package auth implements per-site API key authentication for Central
-// Ingestion (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+// Ingestion (§2.1, §2.2, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
 //
 // A site proves its identity by sending its own key alongside the site_id
 // it's claiming (X-Site-ID + X-API-Key), rather than the server needing a
@@ -16,6 +16,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -187,7 +188,7 @@ func (s *CassandraKeyStore) VerifyKey(ctx context.Context, siteID, plaintextKey 
 	err := s.session.Query(
 		`SELECT key_hash, revoked FROM pharos.site_api_keys WHERE site_id = ?;`, siteID,
 	).WithContext(ctx).Scan(&storedHash, &revoked)
-	if err == gocql.ErrNotFound {
+	if errors.Is(err, gocql.ErrNotFound) {
 		return false, nil
 	}
 	if err != nil {

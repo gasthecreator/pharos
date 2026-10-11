@@ -73,7 +73,7 @@ func EnsureTopics(ctx context.Context, brokers []string, configs []TopicConfig) 
 }
 
 // EnsureTopicsTLS is EnsureTopics with an optional TLS config for the admin
-// connection (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"). Nil
+// connection (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"). Nil
 // means plaintext, matching EnsureTopics' existing behavior exactly.
 func EnsureTopicsTLS(ctx context.Context, brokers []string, configs []TopicConfig, tlsCfg *tlsutil.ClientConfig) error {
 	if len(brokers) == 0 {

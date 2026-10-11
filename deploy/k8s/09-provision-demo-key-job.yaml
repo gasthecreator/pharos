@@ -12,12 +12,30 @@ metadata:
 spec:
   backoffLimit: 3
   template:
+    metadata:
+      labels:
+        app: pharos-provision-demo-key
     spec:
       restartPolicy: OnFailure
+      securityContext:
+        # Non-root, matching the image's numeric USER 65532 (deploy/docker/).
+        # fsGroup makes mounted volumes (PVC, TLS Secret) group-readable by
+        # that user without opening them to world.
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: pharos-cli
           image: pharos-cli:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
           args:
             - "--hosts=cassandra-us-0.cassandra.pharos.svc.cluster.local"
             - "--ca-cert=/tls/ca-cert.pem"
@@ -32,6 +50,9 @@ spec:
         - name: tls
           secret:
             secretName: pharos-tls
+            # Group-readable only (via fsGroup); the ingestion private key
+            # must not be world-readable inside the pod.
+            defaultMode: 0440
             items:
               - key: ca-cert.pem
                 path: ca-cert.pem

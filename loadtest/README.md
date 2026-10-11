@@ -37,7 +37,7 @@ whole run; a 10th, separate site stays idle for the first 30s, then for 15s
 receives a genuine 30 req/s arrival rate (`burst_site` scenario, via k6's
 `constant-arrival-rate` executor -- a sequential single-VU loop doesn't
 actually stress the rate limiter, since real backend latency paces it
-below the refill rate on its own; see WORKLOG.md for that finding), well
+below the refill rate on its own; see docs/history/WORKLOG.md for that finding), well
 past its own 100-token bucket + 10/s refill.
 
 ## What to look at
@@ -58,7 +58,7 @@ past its own 100-token bucket + 10/s refill.
   how to find the actual bottleneck rather than assuming one (PLAN.md's own
   framing for this slice).
 
-Real numbers from an actual run are recorded in WORKLOG.md and PLAN.md's
+Real numbers from an actual run are recorded in docs/history/WORKLOG.md and PLAN.md's
 Slice 16 entry, not reproduced here -- this file documents how to
 reproduce them, not what they were on one particular machine on one
 particular day.

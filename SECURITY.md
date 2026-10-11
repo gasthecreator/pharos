@@ -22,6 +22,13 @@ As of this writing:
   backup/restore drill (Slice 18), and 2+ `pharos-consumer` instances
   sharing one Kafka consumer group (Slice 19) are all built and verified,
   not just proposed.
+- The five Go-service images run as the non-root numeric user `65532:65532` on a
+  digest-pinned builder base, and the Kubernetes manifests for them set
+  `runAsNonRoot`, dropped capabilities, a read-only root filesystem, the
+  `RuntimeDefault` seccomp profile, and default-deny NetworkPolicies. CI asserts the
+  image user and validates the manifests against the Kubernetes schemas; **the pod
+  settings and NetworkPolicies have not yet been exercised on a running cluster**.
+  Releases publish keylessly signed images with SBOM and provenance.
 - Cassandra internode traffic and Kafka inter-broker traffic are also TLS
   (Docker Compose deployment) — re-enabled and verified live 2026-09-06
   after an earlier attempt had narrowed this to client-facing connections
@@ -78,10 +85,33 @@ personal or clinical data.
 
 ## Reporting a vulnerability
 
-This is a solo-maintained repository. If you find a genuine
-security issue in the code itself (not the already-documented gaps above —
-those are known and tracked in `PLAN.md`), please open a GitHub issue or
-reach out to the maintainer directly rather than a public disclosure, so
-there's time to assess it before it's public. Given the project's current
-scope (no production deployment, no real data), response time is
-best-effort, not SLA-bound.
+Please report suspected vulnerabilities **privately**, not in a public issue or
+pull request:
+
+- Preferred: GitHub's private vulnerability reporting for this repository
+  (Security tab, "Report a vulnerability").
+- Alternatively, email **gideonsanni2023@gmail.com** with "Pharos security" in
+  the subject.
+
+Include the affected component and commit or image tag, steps to reproduce,
+and the impact you believe it has. Please do not include real patient or
+clinical-trial data. Findings that are already documented as known gaps below
+and in [`PLAN.md`](PLAN.md) and [`docs/security-threat-model.md`](docs/security-threat-model.md)
+are tracked work, but a new angle on one is still welcome.
+
+This is a solo-maintained project, so timelines are targets, not an SLA:
+
+| Stage | Target |
+|---|---|
+| Acknowledge your report | within 3 business days |
+| Triage (confirm, assess severity, tell you the plan) | within 7 days |
+| Fix or mitigation | within 90 days of the report, sooner for critical issues |
+| Coordinated disclosure | we agree on a date with you; by default after a fix or mitigation is available, and no later than 90 days after the report |
+
+We will credit you in the advisory and `CHANGELOG.md` if you wish (tell us how
+you would like to be named, or that you prefer to stay anonymous). If a fix is
+delayed past 90 days we will tell you why and agree on the next step with you
+rather than going silent.
+
+Given the project's current scope (no production deployment, no real data),
+there is no bug bounty.

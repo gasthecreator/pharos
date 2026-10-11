@@ -5,13 +5,17 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Full reasoning, live-verification evidence, and implementation detail for
-every item below live in [`WORKLOG.md`](WORKLOG.md) and are tracked in
+every item below live in [`docs/history/WORKLOG.md`](docs/history/WORKLOG.md) and are tracked in
 [`PLAN.md`](PLAN.md)'s own Slice list, the source of truth for scope.
 
 ## [Unreleased]
 
-Everything below is implemented and verified against real infrastructure
-(real Cassandra, real Kafka, real Docker/Kubernetes) since `v0.2.0`.
+## [0.3.0] - 2026-10-11
+
+Everything in Slices 8-23 below was implemented and verified against real
+infrastructure (real Cassandra, real Kafka, real Docker) since `v0.2.0`; the
+supply-chain, container and operations items are called out where they are
+statically validated only.
 
 ### Added
 
@@ -39,6 +43,38 @@ Everything below is implemented and verified against real infrastructure
 - Signed container image publishing for every service
   (`.github/workflows/publish-image.yml`): cosign keyless signatures, SBOM,
   and SLSA provenance, published to GHCR.
+
+- Architecture decision records (`docs/adr/`, 25 records distilled from the
+  proposal trail), runbooks for nine failure modes (`docs/runbooks/`), Prometheus
+  alert rules as code (`observability/prometheus/alerts.yml`), proposed SLOs
+  (`docs/slo.md`), an upgrade and compatibility policy, and a configuration
+  reference (`docs/configuration.md`).
+- Release automation: `release.yml` builds a GitHub Release from the matching
+  CHANGELOG section and publishes the signed images by digest; OpenSSF Scorecard
+  workflow; per-package coverage summary and `go mod tidy` drift check in CI.
+- Kubernetes `NetworkPolicy` (default-deny plus explicit allows) and
+  `PodDisruptionBudget` manifests.
+- Go fuzz tests for the idempotency-key parser/constructor, event validation,
+  schema-version dispatch, the batch envelope, the HTTP intake handler and the
+  watermark tracker (with seed corpora); micro-benchmarks for validation,
+  idempotency keys, the rate limiter, the in-memory outbox and the intake path;
+  table-driven failure-path tests for the sweeper, consumer engine, edge
+  forwarder loop and in-memory outbox.
+
+### Changed
+
+- The five Go-service images run as non-root (`65532:65532`) on a digest-pinned base, and
+  their Kubernetes workloads set `securityContext` (non-root, no privilege
+  escalation, dropped capabilities, read-only root filesystem, `RuntimeDefault`
+  seccomp). Statically validated in CI; not yet run on a cluster.
+- Every GitHub Action is pinned to a commit SHA; Dependabot groups updates and
+  covers Dockerfiles.
+- `make test` now mirrors CI (serialized packages, separate chaos run,
+  `RAPID_CHECKS=5000`); `make lint` runs golangci-lint at CI's pinned version;
+  `make up` brings the stack up in the safe order.
+- Compose Prometheus scrapes Central Ingestion over HTTPS (it serves TLS by default).
+- Project history moved to `docs/history/` (`WORKLOG.md`, `ARCHITECTURE_PROPOSALS.md`);
+  `CODEOWNERS` moved to `.github/`; sample study ID is `STUDY-401`.
 
 ### Fixed
 
@@ -80,3 +116,8 @@ Everything below is implemented and verified against real infrastructure
 - Fault-injection test suite against the real stack (network partition,
   asymmetric partition healing, out-of-order delivery).
 - README, working demo (`scripts/demo.sh`), and initial repo scaffolding.
+
+[Unreleased]: https://github.com/gasthecreator/pharos/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/gasthecreator/pharos/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/gasthecreator/pharos/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/gasthecreator/pharos/releases/tag/v0.1.0

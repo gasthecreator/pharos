@@ -25,6 +25,9 @@ real against a local `kind` cluster, not just written and assumed correct.
 - `10-dashboard.yaml` -- the web dashboard (Slice 21), `--enable-chaos` left
   off (Slice 23's own safety guard) and `--grafana-url` empty since Grafana
   itself isn't part of this K8s deployment, only Docker Compose's.
+- `11-network-policies.yaml`, `12-pod-disruption-budgets.yaml` -- default-deny
+  network isolation with explicit allows, and drain budgets (see "Pod
+  hardening, NetworkPolicy, and PodDisruptionBudgets" below).
 - `generate_k8s_certs.sh` -- generates TLS materials with SANs covering
   these StatefulSets' headless-Service DNS names, using the same project
   CA as the Docker Compose flow (`scripts/generate_certs.sh` with extra
@@ -40,6 +43,61 @@ real against a local `kind` cluster, not just written and assumed correct.
 kind create cluster --name pharos
 kubectl config use-context kind-pharos
 ./deploy/k8s/deploy.sh
+```
+
+## Pod hardening, NetworkPolicy, and PodDisruptionBudgets
+
+Status: **statically validated** (YAML parse, `kubeconform` in CI);
+**runtime verification pending** a kind run -- see the commands at the end
+of this section. Nothing below has been observed running on a cluster yet.
+
+- **Non-root.** The five Go-service images (`deploy/docker/Dockerfile.*`)
+  run as numeric `USER 65532:65532`. Their Deployments/Jobs set pod
+  `runAsNonRoot`, `runAsUser/Group`, `fsGroup: 65532`,
+  `seccompProfile: RuntimeDefault`, and container
+  `allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`,
+  `readOnlyRootFilesystem: true`. The only writable path any of them needs
+  is the edge collector's SQLite queue on its PVC at `/data`
+  (`fsGroup` makes it writable); ingestion, consumer, and dashboard write
+  nothing to disk (checked by grepping `cmd/` and `internal/` for file
+  creation). The TLS Secret volume uses `defaultMode: 0440`, so the
+  ingestion private key is readable only via the pod's `fsGroup`.
+- **Not changed:** Cassandra, Kafka, MirrorMaker 2, Prometheus, and the two
+  `pharos-migrations`/`pharos-kafka-topics` Jobs (which run the upstream
+  `cassandra:5.0` / `apache/kafka:3.8.0` images) keep their images' default
+  users; their non-root support was not verified. No `HEALTHCHECK` is
+  added to the images (a static `scratch` binary cannot run one); the
+  httpGet probes above are the health mechanism.
+- **`11-network-policies.yaml`:** default-deny ingress+egress for the
+  namespace, a DNS egress allow, then per-workload allows derived from each
+  manifest's actual connections (apps -> Cassandra 9042 / Kafka 9092;
+  edge/dashboard/Prometheus -> ingestion 8443; Prometheus -> metrics
+  ports; Cassandra 7000/7001 and Kafka 19092/9092/9093 among their own
+  pods; MirrorMaker 2 -> both Kafka clusters). **A CNI that enforces
+  NetworkPolicy is required**; otherwise these objects are inert. Whether a
+  stock `kind` cluster's default CNI enforces them was not verified in this
+  repo -- the sibling cascade-operator project found its kind cluster did
+  not and layered Calico in policy-only mode.
+- **`12-pod-disruption-budgets.yaml`:** `maxUnavailable: 1` for Cassandra,
+  Kafka cluster A, ingestion, and consumer. Single-replica workloads have
+  none (it would block drains forever).
+
+### Runtime verification to run when you have the resources
+
+```bash
+kind create cluster --name pharos        # use a CNI that enforces NetworkPolicy
+./deploy/k8s/deploy.sh
+# non-root: UID of each Go-service pod must be 65532
+for p in pharos-ingestion pharos-consumer pharos-dashboard pharos-edge-site-k8s-demo; do
+  kubectl -n pharos get deploy $p -o jsonpath='{.spec.template.spec.securityContext.runAsUser}{"\n"}'
+done
+kubectl -n pharos get pods -o wide
+# end to end: submit an event through the edge, then query it back
+kubectl -n pharos port-forward svc/pharos-edge-site-k8s-demo 8080:8080 &
+# (use the README "Watch it work" event payload against http://localhost:8080)
+# NetworkPolicy block: an unlisted pod must not reach Cassandra
+kubectl -n pharos run np-test --rm -it --restart=Never --image=busybox:1.36 \
+  --labels=app=np-test -- nc -zv -w 3 cassandra-us-0.cassandra.pharos.svc.cluster.local 9042   # expect timeout
 ```
 
 ## Real bugs found and fixed while verifying this against `kind`

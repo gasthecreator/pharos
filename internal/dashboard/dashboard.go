@@ -515,17 +515,18 @@ func (h *Handler) handleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, statusCode, err := h.replayDLQRecord(r.Context(), key, siteID, apiKey)
-	if err != nil {
+	switch {
+	case err != nil:
 		data.ReplayResult = "Replay request failed: " + err.Error()
 		data.ReplayError = true
-	} else if statusCode == http.StatusOK {
+	case statusCode == http.StatusOK:
 		data.ReplayResult = fmt.Sprintf("REPLAYED: %s is now %s", key, result.Status)
 		// Re-fetch: the record this page shows is now REPLAYED, and the
 		// "PUBLISHED only" replay form should disappear on this render.
 		if refreshed, refreshErr := h.svc.GetDLQEvent(r.Context(), key); refreshErr == nil {
 			data.Record = refreshed
 		}
-	} else {
+	default:
 		data.ReplayResult = fmt.Sprintf("Still rejected (HTTP %d): %s", statusCode, result.Error)
 		data.ReplayError = true
 	}

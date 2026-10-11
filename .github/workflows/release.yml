@@ -1,0 +1,92 @@
+# Release automation for `vX.Y.Z` tags: refuse to release a version that has
+# no CHANGELOG section, publish and sign every service image through the
+# reusable publish-image.yml, then create the GitHub Release whose notes are
+# that CHANGELOG section plus the image digests.
+#
+# Cut a release by pushing a tag after moving CHANGELOG's [Unreleased]
+# content into a `## [X.Y.Z] - date` section:
+#   git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions: {}
+
+jobs:
+  notes:
+    name: Extract CHANGELOG section
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract the section for this tag (fail if missing or empty)
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "CHANGELOG.md has no non-empty '## [${version}]' section; refusing to release." >&2
+            exit 1
+          fi
+          cat release-notes.md
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 7
+
+  publish:
+    name: Publish and sign images
+    needs: notes
+    permissions:
+      contents: read
+      packages: write
+      id-token: write # keyless cosign signing
+    uses: ./.github/workflows/publish-image.yml
+
+  release:
+    name: Create GitHub Release
+    needs: [notes, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # only job allowed to create a release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-notes
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          {
+            cat release-notes.md
+            printf '\n## Container images\n\n'
+            printf 'Every image is keylessly signed with cosign (GitHub Actions OIDC) and carries an SBOM and SLSA provenance attestation. Verify before use:\n\n'
+            printf '```\ncosign verify <image@digest> \\\n  --certificate-identity-regexp '"'"'https://github.com/%s/.github/workflows/(publish-image|release).yml@.*'"'"' \\\n  --certificate-oidc-issuer https://token.actions.githubusercontent.com\n```\n\n' "${GITHUB_REPOSITORY}"
+            printf '| Image (by digest) |\n|---|\n'
+            for f in digests/*.txt; do printf '| `%s` |\n' "$(cat "$f")"; done
+          } > final-notes.md
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file final-notes.md --verify-tag $prerelease

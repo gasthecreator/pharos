@@ -11,7 +11,7 @@ info:
     §2.3) before anything reaches Kafka.
 servers:
   - url: http://localhost:8091
-    description: Default local Central Ingestion instance (--port 8091; see WORKLOG.md for why this port was chosen over the flag's own 8081 default)
+    description: Default local Central Ingestion instance (--port 8091; see docs/history/WORKLOG.md for why this port was chosen over the flag's own 8081 default)
 
 security:
   - siteAuth: []

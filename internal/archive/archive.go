@@ -7,7 +7,7 @@
 // hot storage.
 //
 // Archived data is never deleted -- only moved from Cassandra to these
-// files. See ARCHITECTURE_PROPOSALS.md's Slice 11 entry for the full
+// files. See docs/history/ARCHITECTURE_PROPOSALS.md's Slice 11 entry for the full
 // reasoning, including why event_outbox/pending_outbox are deliberately
 // excluded (operational bookkeeping, not the data-of-record) and why there's
 // no secondary index over the archive files (cold-tier point lookups are

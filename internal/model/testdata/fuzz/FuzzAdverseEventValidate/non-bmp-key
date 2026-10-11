@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"resourceType\":\"AdverseEvent\",\"actuality\":\"actual\",\"identifier\":[{\"system\":\"urn:pharos:idempotency-key\",\"value\":\"\xe6\x97\xa5\xe6\x9c\xac:\\u0000:9\"}],\"subject\":{\"reference\":\"Patient/P-1\"},\"event\":{\"text\":\"Nausea\"},\"date\":\"2026-08-28T09:00:00+01:00\",\"recordedDate\":\"2026-08-30T05:13:00Z\",\"severity\":{\"coding\":[{\"code\":\"severe\"}]},\"study\":[{\"reference\":\"ResearchStudy/STUDY-1\"}],\"location\":{\"reference\":\"Location/SITE-1\"}}")

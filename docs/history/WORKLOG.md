@@ -40,6 +40,22 @@ especially for anything touching partition handling, dedup, or ordering)
 
 ## Log
 
+## [2026-10-11] Claude Code: Repo-standards pass (supply chain, container hardening, ADRs, runbooks, release automation, fuzz tests)
+
+**Author:** Claude Code
+
+**What:** Seven commits on branch `chore/repo-standards`: (1) every GitHub Action pinned to a commit SHA, Dependabot grouped and extended to Dockerfiles, job timeouts and concurrency; (2) Go-service images run as non-root `65532:65532` on a digest-pinned base, pod/container `securityContext` on the Go-service workloads, `11-network-policies.yaml` and `12-pod-disruption-budgets.yaml`, and a CI `container-hardening` job; (3) `docs/adr/` (25 ADRs distilled from the resolved proposals and slice write-ups), `WORKLOG.md`/`ARCHITECTURE_PROPOSALS.md` moved to `docs/history/`, `CODEOWNERS` to `.github/`, all references rewritten; (4) README reframed as a product, `LILLY-401` -> `STUDY-401`, `docs/configuration.md`, `.env.example`, badges; (5) nine runbooks, alert rules as code, SLOs, upgrade/compatibility policy, `SECURITY.md` timelines; (6) Scorecard, `release.yml`, coverage summary, `go mod tidy` drift check, `make lint` at CI's pinned version, an expanded `.golangci.yml` and the 0.3.0 CHANGELOG section; (7) fuzz tests, benchmarks and failure-path tests.
+
+**Why:** A read-only audit found the engineering strong but the supply-chain, container, ADR, operations and release practices below the bar of a professionally run repository.
+
+**How:** Constraint for this session: no Docker, kind or any container/JVM on the machine (very low disk and CPU), so container and cluster verification is delegated to CI and to the commands in `deploy/k8s/README.md`; local verification was `go build/vet`, `gofmt`, `golangci-lint`, `actionlint`, `kubeconform` (strict, Kubernetes 1.30.0: 42 resources valid), YAML parsing, Markdown link checking, and `go test -race -p 1 GOMAXPROCS=2` with no infrastructure. Findings along the way: (a) running the suite with nothing up showed 12 tests skip cleanly but 13 tests in `internal/consumer`, `internal/dedup`, `internal/kafka` and `internal/query` fail instead of skipping, so the fast CI job excludes them by name (`UNIT_SKIP`); (b) the Compose Prometheus scraped Central Ingestion over plain HTTP although it serves TLS, so its `up` could never be 1 (fixed to https with `insecure_skip_verify`, not verified live); (c) the README's manual `pharos-cli query/dlq list` examples omitted the mandatory `--operator`; (d) lint surfaced real defects, fixed without behavior change: `==`/`!=` on wrapped errors, an unchecked error seeding sample data, unclosed response bodies in tests; (e) a failure-path hypothesis that is **not verified and not changed**: when `Engine.Step` fails after `FetchMessage`, `Run` retries by calling `FetchMessage` again, which in kafka-go returns the next message rather than the failed one, so a later successful commit could advance the group offset past a message that was never durably written. The engine's own unit test only proves the offset is not committed for the failed message. Needs a check against real Kafka before anyone relies on "uncommitted offset means redelivery" for in-process retries (it is true after a restart or rebalance).
+
+**Files/modules touched:** `.github/**`, `deploy/**`, `docs/**`, `observability/**`, `scripts/{check_alert_rules.py,coverage_summary.sh}`, `Makefile`, `.golangci.yml`, `.gitignore`, `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md`, `PLAN.md` (goal text and links only), and small lint-driven edits in `cmd/` and `internal/` (see commit 6).
+
+**Tests added/updated:** fuzz targets with seed corpora, benchmarks, and table-driven failure-path tests (sweeper, consumer engine, edge forwarder `Run`, in-memory outbox `FetchStaleClaims`).
+
+**Follow-ups / left open:** runtime verification on kind of the pod security settings, NetworkPolicies and PDBs (`deploy/k8s/README.md` has the commands); first real runs of `release.yml` and `scorecard.yml`; `archive.Run*` take concrete Cassandra types, so their failure paths cannot be unit tested without a production change; branch protection and the other repository settings are for the owner (see the PR description).
+
 ## [2026-09-06] Claude Code: Independent review of PR #39/#40 — real factual error found and fixed, plus polish
 
 **Author:** Claude Code

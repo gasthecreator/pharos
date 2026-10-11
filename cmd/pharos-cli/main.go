@@ -727,7 +727,7 @@ func handleArchive(ctx context.Context, args []string, hosts string, port int, k
 }
 
 // handleSite implements the "site" command family for per-site API key
-// management (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+// management (§2.1, §2.2, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
 func handleSite(ctx context.Context, args []string, hosts string, port int, keyspace string, caCert string) {
 	if len(args) < 2 {
 		fmt.Fprintf(os.Stderr, "Usage: pharos-cli site create-key <site_id>\n       pharos-cli site revoke-key <site_id>\n")
@@ -973,7 +973,7 @@ func seedSampleData(svc *query.MemoryService) {
 	baseTime := time.Now().UTC().Add(-2 * time.Hour)
 
 	// Canonical event
-	svc.CanonicalStore().SaveEvent(ctx, &consumer.CanonicalRecord{
+	if err := svc.CanonicalStore().SaveEvent(ctx, &consumer.CanonicalRecord{
 		IdempotencyKey: "SITE-US-01:1",
 		SiteID:         "SITE-US-01",
 		StudyID:        "STUDY-001",
@@ -990,7 +990,10 @@ func seedSampleData(svc *query.MemoryService) {
 		KafkaPartition: 0,
 		KafkaOffset:    101,
 		IsLate:         false,
-	})
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to seed sample data: %v\n", err)
+		os.Exit(1)
+	}
 
 	// DLQ event
 	svc.SaveDLQEvent(&query.DLQRecord{

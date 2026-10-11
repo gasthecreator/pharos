@@ -17,7 +17,7 @@ import (
 )
 
 // projectEpochUnix anchors the instance-epoch component of local_seq (§2.2,
-// ARCHITECTURE_PROPOSALS.md "Slice 8: Idempotency Key Resilience Across Edge
+// docs/history/ARCHITECTURE_PROPOSALS.md "Slice 8: Idempotency Key Resilience Across Edge
 // Instance Loss") to 2026-01-01T00:00:00Z rather than the Unix epoch. Encoding
 // minutes since *this* epoch in 31 bits gives ~4,083 years of headroom before
 // wrapping; encoding raw Unix seconds in the same 31 bits would wrap in
@@ -57,7 +57,7 @@ func NewSQLiteStore(dbPath string) (*SQLiteStore, error) {
 }
 
 // RestoreFromBackupIfMissing copies backupPath over dbPath when dbPath does
-// not yet exist and backupPath does (§2.1, ARCHITECTURE_PROPOSALS.md "Slice
+// not yet exist and backupPath does (§2.1, docs/history/ARCHITECTURE_PROPOSALS.md "Slice
 // 12: Edge Collector Durability Hardening"). Callers must invoke this before
 // NewSQLiteStore/NewSQLiteStoreWithEpochSource: opening a nonexistent path in
 // WAL mode immediately creates an empty file, at which point it's too late to
@@ -559,7 +559,7 @@ func (s *SQLiteStore) GetStats(ctx context.Context) (QueueStats, error) {
 
 // Backup writes a complete, transactionally-consistent snapshot of the
 // current database to path via SQLite's own VACUUM INTO (§2.1,
-// ARCHITECTURE_PROPOSALS.md "Slice 12: Edge Collector Durability Hardening")
+// docs/history/ARCHITECTURE_PROPOSALS.md "Slice 12: Edge Collector Durability Hardening")
 // -- safe to call while the database is being actively written to, unlike a
 // raw copy of a live WAL-mode database file, which can capture an
 // inconsistent mid-write state.

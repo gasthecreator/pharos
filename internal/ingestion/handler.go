@@ -388,12 +388,11 @@ func (h *Handler) processOneEvent(ctx context.Context, raw json.RawMessage, site
 			} else {
 				_ = h.outboxStore.MarkPublished(ctx, keyStr, claim.ClaimedAt, kafka.MainTopic, 0, 0)
 			}
-		} else {
-			// Duplicate or concurrent in-flight
-			if claim.Status == dedup.StatusPublished {
-				atomic.AddUint64(&h.dedupHits, 1)
-				ingestionmetrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
-			}
+		} else if claim.Status == dedup.StatusPublished {
+			// Duplicate (already published); a concurrent in-flight claim
+			// is neither counted nor re-published.
+			atomic.AddUint64(&h.dedupHits, 1)
+			ingestionmetrics.DedupOutcomesTotal.WithLabelValues("duplicate_hit").Inc()
 		}
 		unlock()
 	}
@@ -484,7 +483,7 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	// *different* site. Without this check, an authenticated site could
 	// submit events on another site's behalf just by putting a different
 	// site_id in the payload, defeating the whole point of authenticating
-	// per site (§2.1, §2.2, ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
+	// per site (§2.1, §2.2, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS").
 	if authenticatedSiteID, ok := auth.SiteIDFromContext(r.Context()); ok && authenticatedSiteID != siteID {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
@@ -559,25 +558,26 @@ func (h *Handler) HandleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	// 5. Determine HTTP response code
-	if failedCount > 0 && (acceptedCount > 0 || rejectedCount > 0) {
+	switch {
+	case failedCount > 0 && (acceptedCount > 0 || rejectedCount > 0):
 		// Mixed outcome with failures: some events were successfully processed (accepted or rejected),
 		// while others hit infrastructure failures. Return 207 Multi-Status so the edge forwarder inspects
 		// per-event results, acknowledging successes and retrying failed events (§2.1, §2.2).
 		resp.Error = fmt.Sprintf("%d of %d events encountered infrastructure failures and require retry", failedCount, len(rawEvents))
 		w.WriteHeader(http.StatusMultiStatus)
-	} else if failedCount > 0 && acceptedCount == 0 && rejectedCount == 0 {
+	case failedCount > 0 && acceptedCount == 0 && rejectedCount == 0:
 		// Every event in the batch hit an infrastructure failure with nothing else to report:
 		// Return 503 Service Unavailable so edge forwarder retries the entire batch with backoff (§2.1).
 		resp.Error = fmt.Sprintf("%d of %d events encountered infrastructure failures and require retry", failedCount, len(rawEvents))
 		w.WriteHeader(http.StatusServiceUnavailable)
-	} else if acceptedCount == 0 && rejectedCount > 0 {
+	case acceptedCount == 0 && rejectedCount > 0:
 		// All events failed validation: return 422 Unprocessable Entity with structured rejection details
 		resp.Error = "all events in batch failed FHIR validation"
 		w.WriteHeader(http.StatusUnprocessableEntity)
-	} else if acceptedCount > 0 && rejectedCount > 0 {
+	case acceptedCount > 0 && rejectedCount > 0:
 		// Partial validation failure: return 207 Multi-Status
 		w.WriteHeader(http.StatusMultiStatus)
-	} else {
+	default:
 		// All valid: return 200 OK
 		w.WriteHeader(http.StatusOK)
 	}
@@ -629,7 +629,7 @@ func (h *Handler) HandleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Only the owning site may replay its own rejected event (§2.1, §2.2,
-	// ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- without this, any
+	// docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") -- without this, any
 	// authenticated site could replay any other site's DLQ record.
 	if authenticatedSiteID, ok := auth.SiteIDFromContext(r.Context()); ok && authenticatedSiteID != rec.SiteID {
 		w.Header().Set("Content-Type", "application/json")

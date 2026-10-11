@@ -17,14 +17,12 @@ arriving from clinical trial sites across many countries and time zones, and get
 them into a central store without losing or duplicating data — even when a site
 loses connectivity for hours or days.
 
-**This is a real product, grounded in a verified real interview question from
-Eli Lilly's Bio-IT / Clinical engineering team:** *"design a system to track
-adverse drug events reported from clinical trials across multiple countries
-and time zones."* That question names a genuine, documented industry pain
-point — federated pharmacovigilance data collection under partition and
-failure — and this project is a working answer to it, engineered and
-documented to be presented and evaluated as a product, not a classroom
-exercise.
+**This is a real product.** It addresses a genuine, documented industry pain
+point: *how do you track adverse drug events reported from clinical trials
+across multiple countries and time zones* (federated pharmacovigilance data
+collection under partition and failure). Pharos is a working answer to that
+question, engineered and documented to be presented and evaluated as a
+product, not a classroom exercise.
 
 **What this project deliberately is NOT:**
 - Not a domain-science project. Earlier concepts for this product slot (an ML
@@ -89,8 +87,8 @@ that's expected, not a problem to solve.
 Sequenced so each slice is reviewable on its own and later slices can lean on
 earlier ones (observability before load testing, multi-node infra before
 scaling/backup-restore drills). Each slice follows the exact same discipline
-as Slices 1-5: feature branch, PR, WORKLOG.md entry, and anything not already
-resolved here goes through ARCHITECTURE_PROPOSALS.md before implementation —
+as Slices 1-5: feature branch, PR, docs/history/WORKLOG.md entry, and anything not already
+resolved here goes through docs/history/ARCHITECTURE_PROPOSALS.md before implementation —
 Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
 
 - **Slice 6 — Observability & metrics.** Closes the one item Phase 1 left
@@ -201,7 +199,7 @@ Phase 2 does not get a lower bar than Phase 1 just because it's bigger.
   directly rather than going through a proxying coordinator. Full detail,
   including a real OOM root-caused to a *different* project's Kubernetes
   cluster competing for the same Docker Desktop memory, in
-  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet` clean;
+  [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). `go vet` clean;
   `go test -race -count=1 ./...` passed twice against the real 3-node
   Cassandra / 3-broker Kafka cluster, including `internal/faultinjection`.
   `nodetool status` confirms all 3 nodes `UN`; both Kafka topics confirmed
@@ -262,7 +260,7 @@ with no change to their own content or intent.
   already-existing rows default `instance_epoch` to 0, making their
   `local_seq` numerically identical to today. Full reasoning, the bit-width
   derivation, and rejected alternatives in
-  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). New
+  [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). New
   fault-injection test (still needed, unchanged from the original plan):
   wipe/replace an edge's SQLite file mid-stream, confirm subsequent
   genuinely-new submissions land as `new_claim`, never `duplicate_hit`.
@@ -307,7 +305,7 @@ with no change to their own content or intent.
   rejection path unchanged. The edge stamps `CurrentSchemaVersion` at
   capture time (mirroring the idempotency-key stamp), never overriding a
   caller-set value. Full reasoning in
-  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet`,
+  [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). `go vet`,
   `go build`, `gofmt`, `golangci-lint` (0 issues) all clean; full suite
   passed twice against the real multi-node cluster.
 
@@ -345,7 +343,7 @@ with no change to their own content or intent.
   simulate "the issue was fixed," and confirmed replay then accepts and
   publishes to the main topic while the original DLQ record shows
   `REPLAYED` with its original rejection reason preserved. Full reasoning
-  in [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet`,
+  in [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). `go vet`,
   `go build`, `gofmt`, `golangci-lint` (0 issues) all clean; full suite
   passed twice against the real multi-node cluster.
 
@@ -377,7 +375,7 @@ with no change to their own content or intent.
   `event_outbox`/`pending_outbox` deliberately excluded — operational
   claim/lease bookkeeping, not the data-of-record; noted as a real,
   separate follow-up, not silently dropped. Full reasoning in
-  [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). `go vet`,
+  [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). `go vet`,
   `go build`, `gofmt`, `golangci-lint` (0 issues) all clean; full suite
   passed twice against the real multi-node cluster, including a flagship
   integration test proving the whole lifecycle (seed old data → confirm
@@ -448,7 +446,7 @@ with no change to their own content or intent.
   restart's first replayed message (Kafka resumes from the last *committed*
   offset, not "wherever the in-memory watermark had gotten to") silently
   regress the externally observed `pharos_consumer_watermark_seconds` gauge.
-  Fixed rather than merely tested around, per ARCHITECTURE_PROPOSALS.md's
+  Fixed rather than merely tested around, per docs/history/ARCHITECTURE_PROPOSALS.md's
   Slice 13 entry: a `consumer_watermark_checkpoints` Cassandra table (one row
   per consumer group, `map<int, timestamp>` columns matching the tracker's
   own shape) persists `previousEmitted` + per-partition high-watermark/
@@ -515,7 +513,7 @@ with no change to their own content or intent.
 
   **Done 2026-09-05.** Cassandra converted to `NetworkTopologyStrategy`
   across `dc-us` (3 nodes, RF=3, unchanged) and `dc-eu` (2 nodes, RF=2, not
-  the originally-planned 3 — see ARCHITECTURE_PROPOSALS.md's Slice 14
+  the originally-planned 3 — see docs/history/ARCHITECTURE_PROPOSALS.md's Slice 14
   addendum: 6+6+MirrorMaker2 genuinely OOM-killed on this 8GB host even
   after heap tuning, and dc-eu is the DC nothing in this project's own
   application logic ever coordinates `LOCAL_QUORUM` against, so it's the
@@ -600,7 +598,7 @@ verified against real infrastructure the same way every earlier slice was.
   authenticates or encrypts anything today — any process that can reach the
   HTTP ports can submit or read adverse event data, which is disqualifying
   for anything claiming production-readiness with clinical data. Needs a
-  proposal in ARCHITECTURE_PROPOSALS.md before implementation (genuinely
+  proposal in docs/history/ARCHITECTURE_PROPOSALS.md before implementation (genuinely
   open: per-site API keys vs. mTLS for edge→ingestion; TLS termination
   approach for Cassandra/Kafka inter-node and client traffic, now across
   two simulated regions per Slice 14) — this is exactly the kind of
@@ -611,7 +609,7 @@ verified against real infrastructure the same way every earlier slice was.
   itself is a 256-bit random value, not a human password), verified via new
   `internal/auth` (`KeyStore`/`CassandraKeyStore`/`MemoryKeyStore`,
   `RequireAPIKey` HTTP middleware) rather than mTLS — see
-  ARCHITECTURE_PROPOSALS.md's Slice 15 entry for the full reasoning (mTLS's
+  docs/history/ARCHITECTURE_PROPOSALS.md's Slice 15 entry for the full reasoning (mTLS's
   per-site certificate lifecycle doesn't fit this project's "resource-
   constrained trial site" deployment model). `internal/tlsutil` provides one
   project-owned self-signed CA (`scripts/generate_certs.sh`) trusted by
@@ -625,7 +623,7 @@ verified against real infrastructure the same way every earlier slice was.
 
   TLS scope was narrowed twice against real, repeated OOM kills (`docker
   inspect`: `OOMKilled: true`) that survived Slice 14's own heap tuning — see
-  ARCHITECTURE_PROPOSALS.md's Slice 15 addendum for the full sequence.
+  docs/history/ARCHITECTURE_PROPOSALS.md's Slice 15 addendum for the full sequence.
   Summary of what shipped then: Cassandra's `client_encryption_options` only
   (internode stayed plaintext, since port 7000 never leaves the private
   Docker network); Kafka's `EXTERNAL` listener only (inter-broker
@@ -1582,7 +1580,7 @@ passed cleanly twice in a row.
 ### Slice 23 — Chaos Control Panel (extends Slice 21's dashboard)
 
 Scoped 2026-08-31. Today, "this system survives a network partition" is a
-claim a reader has to take on faith from `WORKLOG.md`. This slice makes it
+claim a reader has to take on faith from `docs/history/WORKLOG.md`. This slice makes it
 something they can watch happen: real chaos actions, triggered from
 `pharos-dashboard` (Slice 21), acting on the actual live multi-node
 cluster, next to a live panel proving the system is still correct while
@@ -1762,7 +1760,7 @@ queue. Chosen over a custom file WAL (reinvents crash recovery/indexing for no
 benefit) or an embedded Kafka-compatible log like Redpanda (too heavy for an
 edge agent, complicates deployment on site workstations). Resolves former Open
 Questions 2 and 5 — full comparison in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+[docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md).
 
 **Resolved 2026-08-29 — topology:** the edge collector never connects directly
 to Kafka brokers. Trial-site network policies routinely block raw broker ports,
@@ -1789,7 +1787,7 @@ additionally floored at 100ms (never a literal zero-length sleep, which
 Jitter (not plain exponential backoff) specifically to avoid every site's
 retries synchronizing into a thundering herd when Central Ingestion recovers
 from an outage. Full detail in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+[docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md).
 
 ### 2.2 Exactly-once processing semantics
 
@@ -1839,7 +1837,7 @@ the gap that got caught in review. Both `event_outbox.payload` and
 `dead_letter_events.payload` store the *raw JSON bytes* Central Ingestion
 received, never a re-serialized Go struct, per the Slice 2 fix. Full schemas,
 CQL, and the lifecycle walkthrough are in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). An in-process
+[docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). An in-process
 per-key mutex may be layered on top purely to avoid redundant same-process
 Cassandra round-trips — it is never the actual correctness mechanism, since
 it wouldn't hold across a process restart or multiple instances; the
@@ -1885,7 +1883,7 @@ Since the edge forwarder batches up to `BatchSize` (50) events per request
 throughput up to `refill_rate × BatchSize` (500 events/sec at the default 10
 tokens/sec). This is a request-level throttle on the HTTP intake layer, not a
 precise per-event budget — full detail and the alternatives considered in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+[docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md).
 
 **Reasoning:** A single misbehaving site (bad clock, buggy client, malformed FHIR)
 must not be able to degrade ingestion for every other site, and must not silently
@@ -1906,7 +1904,7 @@ succeeds does `status` flip to `PUBLISHED` — with the same background sweeper
 and lease-expiry CAS as the accept path as the resumption backstop. Central
 Ingestion only responds 422/207 to the edge after the Cassandra write
 durably succeeds. Full schema and lifecycle in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md).
+[docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md).
 
 **Resolved 2026-08-30 — batch response status codes are per-event-aware, not
 all-or-nothing.** A batch can have a genuine mix of outcomes: some events
@@ -1943,7 +1941,7 @@ this project's purpose), Pharos targets a deliberately scoped, named subset:
 an ad hoc shape — means it reads as a deliberate scoping decision rather than an
 incomplete FHIR implementation in a technical walkthrough. Resolves former Open
 Question 4; full field list in
-[ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md). (`schemaVersion` is a
+[docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md). (`schemaVersion` is a
 separate, later addition — see Slice 9 below.)
 
 **Resolved 2026-08-30 — DLQ inspection & query tooling:** Surfaced through
@@ -2124,8 +2122,7 @@ lands — do not mark anything done based on a plan or a stub.
    the fault-injection tests. Considered ScyllaDB as a lighter-footprint,
    CQL-wire-compatible alternative, but its license changed from open-source
    (AGPL) to source-available with a 10TB free-usage cap — Cassandra's Apache 2.0
-   license is unconditionally free and more universally recognized in an
-   interview context, so staying with Cassandra.
+   license is unconditionally free and more universally recognized, so staying with Cassandra.
    - **RESOLVED 2026-08-30 — query pattern fit.** The two named queries ("all
      events for trial X in date range Y" vs. "all events from site Z") did
      need different partition keys, exactly as flagged — resolved with two
@@ -2137,7 +2134,7 @@ lands — do not mark anything done based on a plan or a stub.
    mandatory transactional-outbox pattern to the Kafka publish step (not a bare
    check-then-publish). See §2.2. Approved with this one required modification
    to Gemini's original proposal — see
-   [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md) for the full review.
+   [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md) for the full review.
 4. ~~Exact FHIR resource profile to target.~~ **RESOLVED 2026-08-29** — scoped
    named subset of FHIR R4 `AdverseEvent`. See §2.3.
 5. ~~One Go binary per site vs. shared multi-tenant edge service.~~
@@ -2161,13 +2158,13 @@ lands — do not mark anything done based on a plan or a stub.
   but everything from here forward uses branches.
 - **This file (`PLAN.md`) is not edited directly by Antigravity/Gemini.** If
   building surfaces a reason to deviate from or extend what's recorded here,
-  Gemini writes the proposal into [ARCHITECTURE_PROPOSALS.md](ARCHITECTURE_PROPOSALS.md)
+  Gemini writes the proposal into [docs/history/ARCHITECTURE_PROPOSALS.md](docs/history/ARCHITECTURE_PROPOSALS.md)
   instead — never edits this file to match new code. Gideon then tells Claude Code
   to review that file. Claude either approves (and folds the accepted decision
   into this file itself, marking the proposal resolved) or rejects with reasoning
   written back into the proposals file. This happens *before* Gemini implements
   the change, not after.
-- **Every implementation session gets logged in [WORKLOG.md](WORKLOG.md)** —
+- **Every implementation session gets logged in [docs/history/WORKLOG.md](docs/history/WORKLOG.md)** —
   what was built, why, how, files/tests touched — regardless of whether Gemini or
   Claude did the work. Treat this like an actual engineering log at a job: if it's
   not in the worklog, it didn't happen.

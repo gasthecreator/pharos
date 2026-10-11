@@ -37,6 +37,7 @@ data/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 *.pem
 *.key
 
@@ -57,3 +58,4 @@ data/
 # Slice 18 Cassandra backup output (local, per-deployment, not project
 # content -- same reasoning as /archive/ above)
 /backup/
+coverage.log

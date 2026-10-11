@@ -21,7 +21,7 @@ func SiteIDFromContext(ctx context.Context) (string, bool) {
 }
 
 // RequireAPIKey wraps next with per-site API key authentication (§2.1, §2.2,
-// ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"): a request must carry
+// docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS"): a request must carry
 // both X-Site-ID (the site it's claiming to be) and X-API-Key (proof of
 // that claim). VerifyKey does a single point lookup keyed by the claimed
 // site_id, so there's no separate reverse index from key to site to keep

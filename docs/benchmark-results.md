@@ -68,6 +68,37 @@ segment that failed FHIR validation (422, not the intended 429) until
 caught by checking `pharos_ingestion_validation_failures_total` directly
 rather than trusting the load-test tool's own "got a response" check.
 
+## Micro-benchmarks (application code only)
+
+These measure the application's own CPU and allocation cost with the in-memory
+stores and a mock Kafka producer. They contain **no** Cassandra or Kafka, so
+they do not replace the end-to-end load test above and say nothing about
+infrastructure latency; the benchmarked end-to-end cost is dominated by the
+Cassandra LWT outbox insert, which none of these include.
+
+Single run, 2026-10-11, Apple M2, `go1.27.0 darwin/arm64`, `GOMAXPROCS=2`
+(the `-2` suffix), on a machine that was also doing other work, so treat
+the numbers as order-of-magnitude. Reproduce one package at a time with
+`go test -run '^$' -bench . -benchmem ./internal/<pkg>/`.
+
+| Benchmark | Package | ns/op | B/op | allocs/op |
+|---|---|---|---|---|
+| `BenchmarkValidate` (profile validation of a decoded event) | `internal/model` | 84 | 32 | 1 |
+| `BenchmarkDecodeAndValidate` (JSON decode + validate, about 208 MB/s) | `internal/model` | 2,324 | 616 | 10 |
+| `BenchmarkNewIdempotencyKey` | `internal/model` | 3.7 | 0 | 0 |
+| `BenchmarkIdempotencyKeyStringAndParse` | `internal/model` | 133 | 80 | 4 |
+| `BenchmarkTokenBucketAllow_SingleSite` | `internal/ratelimit` | 74 | 0 | 0 |
+| `BenchmarkTokenBucketAllow_ManySites` (1,000 sites) | `internal/ratelimit` | 69 | 0 | 0 |
+| `BenchmarkTokenBucketAllow_ParallelSameSite` | `internal/ratelimit` | 106 | 0 | 0 |
+| `BenchmarkMemoryOutbox_ClaimAndPublish` (insert claim + finalize) | `internal/dedup` | 460 | 295 | 3 |
+| `BenchmarkMemoryOutbox_DuplicateHit` (retry of a published key) | `internal/dedup` | 88 | 194 | 2 |
+| `BenchmarkHandleEvents_Batch50` (whole intake path for 50 events) | `internal/ingestion` | 298,983 per batch (about 6 us/event) | 216,911 | 1,274 |
+
+Takeaway: the application's own per-event cost is on the order of microseconds,
+so the roughly 50-100 ms end-to-end latency in the load test is infrastructure
+(Cassandra Paxos and Kafka publish), not Go code. A regression here would show as
+a change in these figures on the same machine.
+
 ## Caveats (read before citing these numbers)
 
 This ran on one machine, against one topology, on one day — not averaged
@@ -76,5 +107,5 @@ over multiple hardware profiles or repeated over a longer window. The
 site's 429s, and the Cassandra LWT insert as the dominant cost) is the
 defensible takeaway; the absolute millisecond figures will vary with
 different hardware, network conditions, or cluster sizing. Full detail and
-the raw investigation are in `WORKLOG.md`'s Slice 16 entry and
+the raw investigation are in `docs/history/WORKLOG.md`'s Slice 16 entry and
 `PLAN.md`'s Slice 16 writeup.

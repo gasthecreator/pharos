@@ -130,7 +130,7 @@ func TestWatermarkTracker_CompleteToRevisedLifecycle(t *testing.T) {
 }
 
 // TestWatermarkTracker_RestoreFromCheckpointPreventsRegression is the
-// unit-level core of Slice 13 (ARCHITECTURE_PROPOSALS.md "Consumer
+// unit-level core of Slice 13 (docs/history/ARCHITECTURE_PROPOSALS.md "Consumer
 // Crash/Restart Watermark Continuity"): a brand-new tracker (standing in for
 // a freshly restarted process) that Restores a checkpoint saved by a prior
 // tracker must never report a watermark below what that prior tracker had

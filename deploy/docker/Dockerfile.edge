@@ -2,16 +2,30 @@
 # See Dockerfile.ingestion for why scratch + CGO_ENABLED=0 is genuinely
 # sufficient here (modernc.org/sqlite is pure Go, no cgo needed for the
 # embedded durability queue either).
-FROM golang:1.25-alpine AS builder
+# Builder base is pinned by digest as well as tag (supply-chain: a tag can be
+# re-pushed, a digest cannot); Dependabot's docker ecosystem refreshes both.
+FROM golang:1.26-alpine@sha256:3082400e369fa24d5fc60bca20edab3f6d604e0c5a690ec66b295eff4dd87ade AS builder
 RUN apk add --no-cache ca-certificates
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+# Writable working directory for the one binary-local path this service
+# creates files in (edge: its SQLite WAL queue and backups; cli: the
+# `archive run` cold-tier directory). In Kubernetes the edge mounts a PVC
+# here; scratch has no shell, so ownership is set up in the builder stage.
+RUN mkdir -p /out/data && chown -R 65532:65532 /out/data
 RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -o /out/pharos-edge ./cmd/pharos-edge
 
 FROM scratch
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=builder /out/pharos-edge /pharos-edge
+COPY --from=builder --chown=65532:65532 /out/data /data
+WORKDIR /data
+# Numeric non-root user: scratch has no /etc/passwd, so a name would not
+# resolve. No HEALTHCHECK: a static binary cannot run one without a shell or
+# a second client binary; liveness/readiness are the Kubernetes httpGet
+# probes (deploy/k8s/) and the Compose healthchecks.
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/pharos-edge"]

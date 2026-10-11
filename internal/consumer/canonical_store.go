@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -783,7 +784,7 @@ func (s *CassandraCanonicalStore) LoadWatermarkCheckpoint(ctx context.Context, g
 	err := session.Query(query, groupID).WithContext(ctx).Scan(
 		&cp.PreviousEmitted, &cp.PartitionHighWatermark, &cp.PartitionLastActivity,
 	)
-	if err == gocql.ErrNotFound {
+	if errors.Is(err, gocql.ErrNotFound) {
 		return nil, nil
 	}
 	if err != nil {

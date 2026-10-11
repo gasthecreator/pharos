@@ -34,7 +34,7 @@ services:
   # was built to prove and that this slice's own tests depend on.
   #
   # Bumped again, 176M/176M -> 208M heap / 224M direct memory, once TLS
-  # (ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") was enabled -- and TLS
+  # (docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") was enabled -- and TLS
   # scope was itself narrowed to client_encryption_options only, NOT
   # internode_encryption, after real, repeated OOM kills (docker inspect:
   # OOMKilled=true, hitting different nodes on different runs -- both a
@@ -254,7 +254,7 @@ services:
   # this project's scale) so these brokers fit the same host that used to
   # run untuned ones.
   #
-  # TLS (ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") was originally
+  # TLS (docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15: Auth & TLS") was originally
   # scoped to the EXTERNAL listener only -- INTERNAL (inter-broker) stayed
   # PLAINTEXT after real, repeated OOM kills on the 10-node topology that
   # predated this file's later node-count reductions (see the Cassandra
@@ -517,6 +517,7 @@ services:
       - "9090:9090"
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy > /dev/null 2>&1 || exit 1"]
@@ -553,7 +554,7 @@ services:
   # configured limit independently, silently multiplying a site's real
   # limit by the instance count. No auth/TLS here (unlike Cassandra/Kafka,
   # Slice 15): Redis never leaves this private Docker network, and this
-  # project's own threat model (§2.1, ARCHITECTURE_PROPOSALS.md "Slice 15:
+  # project's own threat model (§2.1, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 15:
   # Auth & TLS") is external/untrusted access, not intra-cluster traffic on
   # an already-isolated bridge network.
   redis:

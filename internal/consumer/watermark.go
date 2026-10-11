@@ -14,7 +14,7 @@ type PartitionWatermarkStat struct {
 }
 
 // WatermarkCheckpoint is a persistable snapshot of a WatermarkTracker's state
-// (§2.4, ARCHITECTURE_PROPOSALS.md "Slice 13: Consumer Crash/Restart Watermark
+// (§2.4, docs/history/ARCHITECTURE_PROPOSALS.md "Slice 13: Consumer Crash/Restart Watermark
 // Continuity") -- without this, a process restart resets PreviousEmitted to
 // zero, and the strict monotonic guard's own zero-value escape hatch lets the
 // externally observed watermark regress below what was already reported

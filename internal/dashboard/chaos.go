@@ -248,13 +248,14 @@ func (h *Handler) handleChaosEdgePartition(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := chaosCtx(r)
 	defer cancel()
 	status, _, err := h.edgeAdminRequest(ctx, adminURL, "/admin/chaos/partition")
-	if err != nil {
+	switch {
+	case err != nil:
 		data.Result = "Could not reach edge admin at " + adminURL + ": " + err.Error()
 		data.ResultError = true
-	} else if status != http.StatusOK {
+	case status != http.StatusOK:
 		data.Result = fmt.Sprintf("Edge returned HTTP %d (is --enable-chaos set on that pharos-edge?)", status)
 		data.ResultError = true
-	} else {
+	default:
 		data.Result = "Site partitioned: this edge can no longer reach Central Ingestion until healed (its store-and-forward queue keeps buffering locally, §2.1)."
 	}
 	h.render(w, "chaos.html", data)
@@ -282,13 +283,14 @@ func (h *Handler) handleChaosEdgeHeal(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := chaosCtx(r)
 	defer cancel()
 	status, _, err := h.edgeAdminRequest(ctx, adminURL, "/admin/chaos/heal")
-	if err != nil {
+	switch {
+	case err != nil:
 		data.Result = "Could not reach edge admin at " + adminURL + ": " + err.Error()
 		data.ResultError = true
-	} else if status != http.StatusOK {
+	case status != http.StatusOK:
 		data.Result = fmt.Sprintf("Edge returned HTTP %d", status)
 		data.ResultError = true
-	} else {
+	default:
 		data.Result = "Site healed: this edge's forwarder will resume draining its buffered queue."
 	}
 	h.render(w, "chaos.html", data)

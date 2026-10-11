@@ -26,6 +26,7 @@ func TestChaosClient_DefaultsToPassThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected pass-through by default, got error: %v", err)
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("expected 200 from the wrapped client, got %d", resp.StatusCode)
 	}
@@ -43,8 +44,9 @@ func TestChaosClient_PartitionedBlocksRequests(t *testing.T) {
 	client.SetPartitioned(true)
 
 	req := httptest.NewRequest(http.MethodPost, "http://example.invalid/x", nil)
-	_, err := client.Do(req)
+	resp, err := client.Do(req)
 	if err == nil {
+		resp.Body.Close()
 		t.Fatalf("expected an error while partitioned")
 	}
 	if stub.calls != 0 {
@@ -62,9 +64,11 @@ func TestChaosClient_HealRestoresPassThrough(t *testing.T) {
 	client.SetPartitioned(false)
 
 	req := httptest.NewRequest(http.MethodPost, "http://example.invalid/x", nil)
-	if _, err := client.Do(req); err != nil {
+	resp, err := client.Do(req)
+	if err != nil {
 		t.Fatalf("expected pass-through after healing, got error: %v", err)
 	}
+	defer resp.Body.Close()
 	if stub.calls != 1 {
 		t.Errorf("expected the real client to be called once after healing, got %d", stub.calls)
 	}
