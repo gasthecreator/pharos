@@ -24,6 +24,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
+          # Take the newest 1.26.x patch, not the runner image's cached one:
+          # stdlib fixes (GO-2026-6611..6617 landed in 1.26.9) arrive as patches.
+          check-latest: true
 
       - name: go vet
         run: go vet ./...
@@ -87,6 +90,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
+          # Take the newest 1.26.x patch, not the runner image's cached one:
+          # stdlib fixes (GO-2026-6611..6617 landed in 1.26.9) arrive as patches.
+          check-latest: true
 
       - name: Dockerfile base images are digest-pinned
         run: |
@@ -143,6 +149,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: "1.26"
+          # Take the newest 1.26.x patch, not the runner image's cached one:
+          # stdlib fixes (GO-2026-6611..6617 landed in 1.26.9) arrive as patches.
+          check-latest: true
 
       # generate_certs.sh needs `keytool` (to build Cassandra/Kafka's JKS
       # keystores/truststores) -- ubuntu-latest doesn't guarantee a JDK on
